@@ -109,8 +109,13 @@ the same as `NONE`:
 
 ## Troubleshooting
 
-If a control stops working, check the log for these lines at boot — each one is a
-hook arming itself:
+To start over, delete `config.txt` — it is rebuilt with the defaults on next boot.
+
+**Release builds write no log.** `DEBUG_LOG` is commented out in `source/config.h`,
+which compiles `debugPrintf()` down to a no-op, so there is no log file to check on
+a normal build. If you are building from source and want to see what the input hooks
+are doing, uncomment `DEBUG_LOG` and rebuild; each hook then announces itself at
+boot:
 
 ```
 ZOOM:    gamepad sniper/camera zoom
@@ -119,7 +124,5 @@ HORN:    dedicated horn button
 FREEAIM: R + D-pad Down combo
 ```
 
-`HORN:` only appears if some `key_*` is set to `HORN`. If you set every button
-away from `HORN`, the hook is skipped and the horn stays on the D-pad only.
-
-To start over, delete `config.txt` — it is rebuilt with the defaults on next boot.
+`HORN:` only appears if some `key_*` is set to `HORN`. If you set every button away
+from `HORN`, the hook is skipped and the horn stays on the D-pad only.
