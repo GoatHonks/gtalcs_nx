@@ -176,6 +176,11 @@ Enter during gameplay, by shape (see the table above):
 | Triangle, R, L, Down, Down, R, R, Triangle |
 | L, R, L, R, Up, Down, L, R |
 
+### Support the developer
+
+This is **NaGaa95's** Ko-fi, the developer of the port — not mine. I only changed the
+controls, so if you want to support the work, support him.
+
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/D1D1P2MOG)
 
 ### Legal
