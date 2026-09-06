@@ -56,11 +56,11 @@ another button.
 | `X` | Square — jump, brake / reverse |
 | `Y` | Triangle — enter vehicle, skip phone call |
 | `L1` | L — answer phone, collect pickup, sub-mission |
-| `R1` | R — target / scope view, hand brake |
+| `R1` | R — target / scope view, hand brake (Controller Setups 1-2) |
 | `DPAD_UP` / `DPAD_DOWN` | cycle camera, scope zoom, horn |
 | `DPAD_LEFT` / `DPAD_RIGHT` | cycle weapon / target, cycle radio stations |
 | `START` | pause menu |
-| `HORN` | sound the horn, and nothing else |
+| `HORN` | sound the horn, and nothing else (in a vehicle — there is no horn on foot) |
 | `CAM_CENTER` | recentre the camera behind a car |
 | `BACK` | open the pause menu (Minus's default) |
 | `NONE` | disable this button |

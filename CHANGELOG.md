@@ -25,10 +25,11 @@ The port was sending physical d-pad Up/Down as ids 12/13, which land on fields n
 code reads — so they did nothing — while ZL/ZR were sending ids 8/9 *on top of*
 their trigger axes, driving the d-pad actions by accident.
 
-This is confirmed three independent ways: the field table itself, the fact that ZR
-audibly sounded the horn while looking right, and `CPad::DoCheats()`, which emits a
-named character per button (`U`p, `D`own, `T`riangle, `C`ircle, `S`quare, `X` =
-Cross, `1` = L, `2` = R) and so names every field for certain.
+This is confirmed three independent ways: the field table itself, the observed
+behaviour (ZR audibly sounded the horn while looking right), and `CPad::DoCheats()`,
+which emits one named character per button — T for Triangle, C for Circle, S for
+Square, X for Cross, U/D/L/R for the d-pad, 1 for L, 2 for R — so the game names
+every field itself.
 
 ## Fixed
 
@@ -61,7 +62,8 @@ Cross, `1` = L, `2` = R) and so names every field for certain.
 * **`HORN` action, default L3.** The horn shares its field with the d-pad, so no
   button id can sound it alone; a hook on `CPad::GetHorn` gives it a dedicated
   button. The d-pad horn still works. Matches the PS2 release, which puts the horn
-  on L3. Mappable to any button with `key_* HORN`.
+  on L3. Mappable to any button with `key_* HORN`. Vehicles only — `CPad::GetHorn`
+  is called from the vehicle control code, so it does nothing on foot.
 * **R3 recentres the camera behind a car**, using an id that had a reader but no
   button.
 * **[CONFIG.md](CONFIG.md)** — full `config.txt` reference: every setting, every
@@ -92,6 +94,7 @@ Not bugs — the engine has no code behind them:
   L3; this build is the PSP/mobile one and has neither binding.
 * **Some in-game hint text uses PS2 button names** ("Press R2 to look behind").
   On a Switch that is ZR.
-* **Controller Setup (in-game options) rebinds things.** The hand brake moves to an
-  A + Y combo on setups 3 and 4, and the horn swaps between d-pad Up and Down by
-  setup. That is the engine's own option, not the port's.
+* **Controller Setup (in-game options) rebinds things by itself.** On Setups 3 and 4
+  the hand brake becomes a B + Y combo (Cross + Square) instead of R, and the horn
+  swaps between d-pad Up and Down depending on the setup. That is the engine's own
+  option, not the port's.

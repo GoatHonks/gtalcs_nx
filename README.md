@@ -25,7 +25,7 @@ it, and the code comments explain what was found in the game binary and why.
 If you hit the same problems I did — the d-pad doing nothing, cheat codes not
 working, ZR sounding the horn while looking right — this should fix them.
 
-**This release contains no game files.** You still need your own legally obtained
+**This fork contains no game files.** You still need your own legally obtained
 copy of the Android APK (version 2.4.379); see the install instructions below.
 
 ### How to install
@@ -58,10 +58,11 @@ differ from the defaults, so a stock file is four lines.
 
 ## Controls
 
-The PSP layout, verified against the engine rather than guessed: `CPad::DoCheats()`
-feeds a character to `CPad::AddToCheatString()` for each button, which names every
-`CControllerState` field for certain (`T`riangle, `C`ircle, `S`quare, `X` = Cross,
-`U`p, `D`own, `L`eft, `R`ight, `1` = L, `2` = R).
+The PSP layout, checked against the engine rather than guessed. `CPad::DoCheats()`
+feeds one character to `CPad::AddToCheatString()` per button pressed — T for
+Triangle, C for Circle, S for Square, X for Cross, U/D/L/R for the d-pad, 1 for L
+and 2 for R — so the game itself names which button each controller field belongs
+to. The mapping below follows those names.
 
 Face buttons are positional by default (`psp_layout 1`), so the shapes sit where a
 PSP player expects them and printed cheat codes can be entered by shape:
@@ -77,18 +78,14 @@ This is the default and needs no config.txt entry. Set `psp_layout 0` if you wan
 the Nintendo confirm/cancel convention instead (A = Cross, B = Circle). The old
 name `xbox_layout` still parses and means the same thing.
 
-config.txt only ever lists settings that differ from the defaults, so a stock file
-has no `psp_layout` line and none of the sixteen `key_*` lines. Add any of them by
-hand to remap a button and the line is kept; delete a line to go back to default.
-
 | Switch | On foot | In vehicle |
 |---|---|---|
 | Left stick | Move | Steer |
 | Right stick | Look around | Horizontal camera |
-| B (Cross) | Sprint | Accelerate |
-| Y (Square) | Jump | Brake / reverse |
 | A (Circle) | Attack / fire weapon | Car weapon |
+| B (Cross) | Sprint | Accelerate |
 | X (Triangle) | Enter vehicle / skip phone call | Enter / exit vehicle |
+| Y (Square) | Jump | Brake / reverse |
 | L | Answer phone / pickup / sub-mission | Sub-mission |
 | R | Target / scope view | Hand brake |
 | ZL | -- | Look left |
@@ -97,7 +94,7 @@ hand to remap a button and the line is kept; delete a line to go back to default
 | D-pad Up / Down | Cycle camera, scope zoom | Cycle camera, horn |
 | D-pad Left / Right | Cycle weapon / cycle target | Cycle radio stations |
 | R + D-pad Down | Toggle free aim | -- |
-| L3 | Horn | Horn / toggle siren |
+| L3 | -- | Horn / toggle siren |
 | R3 | -- | Recentre camera behind car |
 | Plus | Pause menu | Pause menu |
 | Minus | Pause menu (back action) | Pause menu (back action) |
@@ -115,17 +112,23 @@ Deviations from the PSP original, and why:
 * **Minus = pause** — the PSP's Select is Camera Modes, but
   `CPad::CycleCameraModeJustDown()` has zero callers in this build, so Select would
   do nothing. Set `key_minus SELECT` if you want it faithful-but-dead.
-* **Hand brake** moves to an A + Y combo on Controller Setups 3 and 4, and the horn
-  swaps between d-pad Up and Down by setup. That is the engine's own option, not
-  the port's.
+* **Controller Setup** (in the in-game options) rebinds some of this by itself. On
+  Setups 3 and 4 the hand brake becomes a B + Y combo (Cross + Square) instead of
+  R, and the horn swaps between d-pad Up and Down depending on the setup. That is
+  the engine's own option, not something the port changes.
 
 ### Cheats
 
-All 46 cheats are decoded straight out of the binary and every button they need is
-reachable, so they can be entered on a Switch pad. Note that cheats using Up or
-Down were impossible in earlier builds, because the d-pad ids were mis-mapped.
+These are the 46 cheat sequences decoded out of the game binary itself. Every button
+they need is reachable on a Switch pad. Cheats containing Up or Down could not be
+entered at all in earlier builds, because the d-pad ids were mis-mapped.
 
-Enter during gameplay, by shape (see the table above):
+They are listed **without labels** — the sequences are read straight from the
+binary, but working out which effect each one triggers is a separate job I have not
+done. Cross-reference a published LCS cheat list to find the one you want; the point
+of this list is that these are the sequences this build actually accepts.
+
+Enter them during normal gameplay, by shape (see the table above):
 
 | Sequence |
 |---|
@@ -178,8 +181,8 @@ Enter during gameplay, by shape (see the table above):
 
 ### Support the developer
 
-This is **NaGaa95's** Ko-fi, the developer of the port — not mine. I only changed the
-controls, so if you want to support the work, support him.
+The Ko-fi below belongs to **NaGaa95**, who made this port — it is not mine. I only
+changed the controls, so if you would like to support the work, support him.
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/D1D1P2MOG)
 
