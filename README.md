@@ -17,7 +17,7 @@ and to Andy Nguyen and fgsfds, whose loader it is built on. I did not write the 
 — this fork only changes how controller input reaches the engine.
 
 I am not a developer and know very little programming. The changes here were made
-entirely with [Claude Code](https://claude.com/claude-code); my part was describing
+entirely with [Claude Code](https://claude.com/claude-code). My part was describing
 the problems I ran into while playing and testing the results on hardware. The
 reasoning behind each change is in [CHANGELOG.md](CHANGELOG.md) so anyone can check
 it, and the code comments explain what was found in the game binary and why.
