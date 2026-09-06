@@ -112,72 +112,73 @@ Deviations from the PSP original, and why:
 * **Minus = pause** — the PSP's Select is Camera Modes, but
   `CPad::CycleCameraModeJustDown()` has zero callers in this build, so Select would
   do nothing. Set `key_minus SELECT` if you want it faithful-but-dead.
-* **Controller Setup** (in the in-game options) rebinds some of this by itself. On
-  Setups 3 and 4 the hand brake becomes a B + Y combo (Cross + Square) instead of
-  R, and the horn swaps between d-pad Up and Down depending on the setup. That is
-  the engine's own option, not something the port changes.
+* **Alternate control schemes exist in the engine but are unreachable.** `CPad`
+  keeps a control-scheme number that `CPad::GetHandBrake` and `CPad::GetHorn` branch
+  on, and on some values the hand brake becomes a Cross + Square combo instead of R.
+  This build exposes no Controller Setup option in its menus, so that value never
+  changes: the hand brake is R, confirmed on hardware.
 
 ### Cheats
 
-These are the 46 cheat sequences decoded out of the game binary itself. Every button
-they need is reachable on a Switch pad. Cheats containing Up or Down could not be
-entered at all in earlier builds, because the d-pad ids were mis-mapped.
+The 46 cheat sequences below are decoded out of the game binary itself, and the
+effects are matched against the [GTA Wiki cheat list](https://gta.fandom.com/wiki/Cheats_in_GTA_Liberty_City_Stories).
+Every button they need is reachable on a Switch pad — cheats containing Up or Down
+could not be entered at all in earlier builds, because the d-pad ids were mis-mapped.
 
-They are listed **without labels** — the sequences are read straight from the
-binary, but working out which effect each one triggers is a separate job I have not
-done. Cross-reference a published LCS cheat list to find the one you want; the point
-of this list is that these are the sequences this build actually accepts.
+Enter them during normal gameplay, by shape (see the controls table above).
 
-Enter them during normal gameplay, by shape (see the table above):
+Three sequences are recognised by the game but do nothing: their handler clears the
+input buffer and returns without calling anything, so they appear to be leftovers
+disabled in this build. They are listed for completeness.
 
-| Sequence |
-|---|
-| Up, Square, Square, Down, Left, Square, Square, Right |
-| Up, Circle, Circle, Down, Left, Circle, Circle, Right |
-| Up, Cross, Cross, Down, Left, Cross, Cross, Right |
-| L, R, Triangle, L, R, Circle, L, R |
-| L, R, Circle, L, R, Cross, L, R |
-| L, R, Cross, L, R, Square, L, R |
-| L, R, Square, L, R, Triangle, L, R |
-| L, L, Triangle, R, R, Cross, Square, Circle |
-| L, L, Circle, R, R, Square, Triangle, Cross |
-| Up, Down, Circle, Up, Down, Square, L, R |
-| Up, Down, Cross, Up, Down, Triangle, L, R |
-| Up, Down, Square, Up, Down, Circle, L, R |
-| Up, Down, Triangle, Up, Down, Cross, L, R |
-| L, L, Left, L, L, Right, Triangle, Circle |
-| L, L, Left, L, L, Right, Circle, Cross |
-| L, L, Left, L, L, Right, Cross, Square |
-| L, L, Left, L, L, Right, Square, Triangle |
-| L, L, R, L, L, R, Left, Square |
-| L, L, R, L, L, R, Up, Triangle |
-| R, R, L, R, R, L, Right, Circle |
-| R, R, L, R, R, L, Down, Cross |
-| R, Triangle, Cross, R, Square, Circle, Left, Right |
-| R, Square, Circle, R, Triangle, Cross, Up, Down |
-| L, Up, Left, R, Triangle, Circle, Down, Cross |
-| L, Up, Right, R, Triangle, Square, Down, Cross |
-| L, Down, Right, R, Cross, Square, Up, Triangle |
-| L, Down, Left, R, Cross, Circle, Up, Triangle |
-| Triangle, Triangle, R, Square, Square, L, Cross, Cross |
-| Square, Square, R, Cross, Cross, L, Circle, Circle |
-| Cross, Cross, R, Circle, Circle, L, Triangle, Triangle |
-| Circle, Circle, R, Triangle, Triangle, L, Square, Square |
-| Triangle, Circle, Down, Triangle, Circle, Up, L, L |
-| Circle, Cross, Down, Circle, Cross, Up, L, L |
-| Cross, Square, Down, Cross, Square, Up, R, R |
-| Square, Triangle, Down, Square, Triangle, Up, R, R |
-| Down, Down, Down, Triangle, Triangle, Circle, L, R |
-| Down, Down, Down, Circle, Circle, Cross, L, R |
-| Down, Down, Down, Cross, Cross, Square, R, L |
-| Cross, Cross, Cross, Down, Down, Right, L, R |
-| Up, Up, Up, Square, Square, Triangle, R, L |
-| Up, Up, Up, Circle, Circle, Cross, L, R |
-| Up, Up, Up, Cross, Cross, Square, R, L |
-| Up, Up, Up, Triangle, Triangle, Circle, L, R |
-| Circle, Right, Cross, Up, Right, Cross, L, Square |
-| Triangle, R, L, Down, Down, R, R, Triangle |
-| L, R, L, R, Up, Down, L, R |
+| Effect | Sequence |
+|---|---|
+| Aggressive Drivers | Square, Square, R, Cross, Cross, L, Circle, Circle |
+| All Green Lights | Triangle, Triangle, R, Square, Square, L, Cross, Cross |
+| All peds have big heads | Down, Down, Down, Circle, Circle, Cross, L, R |
+| All Vehicles Chrome Plated | Triangle, R, L, Down, Down, R, R, Triangle |
+| Armor | L, R, Circle, L, R, Cross, L, R |
+| Black Traffic | Circle, Circle, R, Triangle, Triangle, L, Square, Square |
+| Cars Drive On Water | Circle, Cross, Down, Circle, Cross, Up, L, L |
+| Certain peds follow you | Down, Down, Down, Triangle, Triangle, Circle, L, R |
+| Change Bike Tire Size | Circle, Right, Cross, Up, Right, Cross, L, Square |
+| Clear Weather | Up, Down, Circle, Up, Down, Square, L, R |
+| Commit Suicide | L, Down, Left, R, Cross, Circle, Up, Triangle |
+| Destroy All Cars | L, L, Left, L, L, Right, Cross, Square |
+| Display Game Credits | L, R, L, R, Up, Down, L, R |
+| Faster Clock | L, L, Left, L, L, Right, Circle, Cross |
+| Faster Gameplay | R, R, L, R, R, L, Down, Cross |
+| Foggy Weather | Up, Down, Triangle, Up, Down, Cross, L, R |
+| Get $250,000 | L, R, Triangle, L, R, Circle, L, R |
+| Health | L, R, Cross, L, R, Square, L, R |
+| Media Attention Meter | L, Up, Right, R, Triangle, Square, Down, Cross |
+| Nearest ped enters your car | Cross, Square, Down, Cross, Square, Up, R, R |
+| Never Wanted | L, L, Triangle, R, R, Cross, Square, Circle |
+| Overcast Weather | Up, Down, Cross, Up, Down, Triangle, L, R |
+| Peds Attack You | L, L, R, L, L, R, Up, Triangle |
+| Peds Have Weapons | R, R, L, R, R, L, Right, Circle |
+| Peds Riot | L, L, R, L, L, R, Left, Square |
+| Perfect Traction (Down = car hop) | L, Up, Left, R, Triangle, Circle, Down, Cross |
+| Play as Pedestrian | L, L, Left, L, L, Right, Square, Triangle |
+| Rainy Weather | Up, Down, Square, Up, Down, Circle, L, R |
+| Raise Wanted Level (by 2 stars) | L, R, Square, L, R, Triangle, L, R |
+| Slower Gameplay | R, Triangle, Cross, R, Square, Circle, Left, Right |
+| Spawn Rhino | L, L, Left, L, L, Right, Triangle, Circle |
+| Spawn Trashmaster | Triangle, Circle, Down, Triangle, Circle, Up, L, L |
+| Sunny Weather | L, L, Circle, R, R, Square, Triangle, Cross |
+| Unlock All Multiplayer Stuff | Up, Up, Up, Triangle, Triangle, Circle, L, R |
+| Unlock Multiplayer Stuff 1 | Up, Up, Up, Square, Square, Triangle, R, L |
+| Unlock Multiplayer Stuff 2 | Up, Up, Up, Circle, Circle, Cross, L, R |
+| Unlock Multiplayer Stuff 3 | Up, Up, Up, Cross, Cross, Square, R, L |
+| Upside Down | Down, Down, Down, Cross, Cross, Square, R, L |
+| Upside Down (alternate) | Cross, Cross, Cross, Down, Down, Right, L, R |
+| Weapon Set 1 | Up, Square, Square, Down, Left, Square, Square, Right |
+| Weapon Set 2 | Up, Circle, Circle, Down, Left, Circle, Circle, Right |
+| Weapon Set 3 | Up, Cross, Cross, Down, Left, Cross, Cross, Right |
+| White Traffic | Cross, Cross, R, Circle, Circle, L, Triangle, Triangle |
+| *(recognised, but does nothing in this build)* | R, Square, Circle, R, Triangle, Cross, Up, Down |
+| *(recognised, but does nothing in this build)* | L, Down, Right, R, Cross, Square, Up, Triangle |
+| *(recognised, but does nothing in this build)* | Square, Triangle, Down, Square, Triangle, Up, R, R |
 
 ### Support the developer
 

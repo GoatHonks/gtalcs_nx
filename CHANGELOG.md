@@ -94,7 +94,11 @@ Not bugs — the engine has no code behind them:
   L3; this build is the PSP/mobile one and has neither binding.
 * **Some in-game hint text uses PS2 button names** ("Press R2 to look behind").
   On a Switch that is ZR.
-* **Controller Setup (in-game options) rebinds things by itself.** On Setups 3 and 4
-  the hand brake becomes a B + Y combo (Cross + Square) instead of R, and the horn
-  swaps between d-pad Up and Down depending on the setup. That is the engine's own
-  option, not the port's.
+* **Alternate control schemes exist in the engine but cannot be selected.**
+  `CPad::GetHandBrake` and `CPad::GetHorn` branch on a stored control-scheme number,
+  and on some values the hand brake becomes a Cross + Square combo instead of R.
+  This build has no Controller Setup option in its menus, so the value never changes
+  and the hand brake stays on R (confirmed on hardware).
+* **Three cheat sequences do nothing.** They are recognised, but their handler
+  clears the buffer and returns without calling anything — leftovers disabled in
+  this build. They are listed in the README for completeness.
