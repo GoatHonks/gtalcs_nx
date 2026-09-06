@@ -1,0 +1,13 @@
+# build output
+build/
+*.nro
+*.elf
+*.nacp
+*.map
+
+# Game files -- NEVER commit these. They belong to Rockstar and must be
+# supplied by each user from their own copy of the APK.
+*.so
+*.wad
+*.m4v
+*.apk

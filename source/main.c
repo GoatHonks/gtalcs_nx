@@ -12,6 +12,7 @@
  */
 
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -46,6 +47,8 @@ volatile int g_hide_saves = 0;         // libc_shim.c: New Game hides save slots
 int g_hide_saves_frames = 0;           // auto-clear countdown
 volatile int g_zoom_dir = 0;           // hooks/game.c: d-pad up=+1/down=-1 -> sniper/camera zoom
 volatile int g_freeaim_combo = 0;      // hooks/game.c: R + D-pad Down -> free-aim toggle
+extern volatile uint8_t *g_swap_nipple_dpad;  // hooks/game.c: touch-only d-pad selector
+volatile int g_horn_btn = 0;           // hooks/game.c: dedicated horn button held (key_* = HORN)
 
 // provide replacement heap init function to separate newlib heap from the .so
 void __libnx_initheap(void) {
@@ -130,24 +133,9 @@ static void set_screen_size(int w, int h) {
 
 // gamepad: input is pushed through the GTAJNIlib JNI entry points.
 // onJoyButtonDown/Up take a button index 0..15 (engine bounds-checks #0xf and
-// indexes a button-state array); these indices map Switch buttons to engine actions.
-
-#define GPAD_BUTTON_A 0
-#define GPAD_BUTTON_B 1
-#define GPAD_BUTTON_X 2
-#define GPAD_BUTTON_Y 3
-#define GPAD_BUTTON_START 4
-#define GPAD_BUTTON_SELECT 5
-#define GPAD_BUTTON_L1 6
-#define GPAD_BUTTON_R1 7
-#define GPAD_BUTTON_L2 8
-#define GPAD_BUTTON_R2 9
-#define GPAD_BUTTON_DPAD_LEFT 10
-#define GPAD_BUTTON_DPAD_RIGHT 11
-#define GPAD_BUTTON_DPAD_UP 12
-#define GPAD_BUTTON_DPAD_DOWN 13
-#define GPAD_BUTTON_THUMBL 14
-#define GPAD_BUTTON_THUMBR 15
+// indexes a button-state array); these indices map Switch buttons to engine
+// actions. The GPAD_BUTTON_* ids themselves live in config.h since config.c
+// needs them too (to parse/print key_* config.txt lines by name).
 
 // joypad axis indices (setJoyAxis writes axisValues[axis]): lx, ly, rx, ry, lt, rt
 #define GPAD_AXIS_LX 0
@@ -162,40 +150,32 @@ typedef struct {
   int button;
 } PadMap;
 
-// Face buttons are the only part that differs between the two layouts (chosen by
-// config.xbox_layout):
-//   0 (default) "Nintendo": the Switch's labelled button drives the engine's
-//     same-letter button (Switch A -> engine A, ...), so the on-screen A/B/X/Y
-//     prompts match the physical Switch labels.
-//   1 "Xbox"/positional: match by physical position (Switch bottom B -> engine
-//     A, etc.) -- the original mapping, kept for players who prefer it.
-static const PadMap pad_face_nintendo[] = {
-  { HidNpadButton_A, GPAD_BUTTON_A },
-  { HidNpadButton_B, GPAD_BUTTON_B },
-  { HidNpadButton_X, GPAD_BUTTON_X },
-  { HidNpadButton_Y, GPAD_BUTTON_Y },
-};
-static const PadMap pad_face_xbox[] = {
-  { HidNpadButton_B, GPAD_BUTTON_A },
-  { HidNpadButton_A, GPAD_BUTTON_B },
-  { HidNpadButton_Y, GPAD_BUTTON_X },
-  { HidNpadButton_X, GPAD_BUTTON_Y },
-};
+// Built once from config.key_* after config is loaded (see build_pad_map()
+// below).
+#define NUM_PAD_MAP 16
+static PadMap pad_map[NUM_PAD_MAP];
 
-// shared across both layouts. Minus is handled via onBackButtonPressed below.
-static const PadMap pad_map[] = {
-  { HidNpadButton_L, GPAD_BUTTON_L1 },
-  { HidNpadButton_R, GPAD_BUTTON_R1 },
-  { HidNpadButton_ZL, GPAD_BUTTON_L2 },
-  { HidNpadButton_ZR, GPAD_BUTTON_R2 },
-  { HidNpadButton_Up, GPAD_BUTTON_DPAD_UP },
-  { HidNpadButton_Down, GPAD_BUTTON_DPAD_DOWN },
-  { HidNpadButton_Left, GPAD_BUTTON_DPAD_LEFT },
-  { HidNpadButton_Right, GPAD_BUTTON_DPAD_RIGHT },
-  { HidNpadButton_StickL, GPAD_BUTTON_THUMBL },
-  { HidNpadButton_StickR, GPAD_BUTTON_THUMBR },
-  { HidNpadButton_Plus, GPAD_BUTTON_START },
-};
+static void build_pad_map(void) {
+  const PadMap m[NUM_PAD_MAP] = {
+    { HidNpadButton_A, config.key_a },
+    { HidNpadButton_B, config.key_b },
+    { HidNpadButton_X, config.key_x },
+    { HidNpadButton_Y, config.key_y },
+    { HidNpadButton_L, config.key_l },
+    { HidNpadButton_R, config.key_r },
+    { HidNpadButton_ZL, config.key_zl },
+    { HidNpadButton_ZR, config.key_zr },
+    { HidNpadButton_Up, config.key_up },
+    { HidNpadButton_Down, config.key_down },
+    { HidNpadButton_Left, config.key_left },
+    { HidNpadButton_Right, config.key_right },
+    { HidNpadButton_StickL, config.key_lstick },
+    { HidNpadButton_StickR, config.key_rstick },
+    { HidNpadButton_Plus, config.key_plus },
+    { HidNpadButton_Minus, config.key_minus },
+  };
+  memcpy(pad_map, m, sizeof(pad_map));
+}
 
 // JNI entry points of libGame.so (extern "C"; com.rockstargames.gtalcs.*).
 
@@ -446,9 +426,28 @@ static u64 pad_prev = 0;
 
 // drive one button table into the engine on the press/release edges
 static void send_pad_buttons(const PadMap *map, unsigned n, u64 down, u64 changed) {
+  int horn = 0;
   for (unsigned i = 0; i < n; i++) {
+    if (map[i].button == GPAD_BUTTON_NONE)
+      continue; // disabled via key_* = NONE in config.txt
+    if (map[i].button == GPAD_BUTTON_HORN) {
+      // held state, not an edge, and read straight by the CPad::GetHorn hook --
+      // no joybutton id sounds the horn without also driving the d-pad
+      if (down & map[i].hid)
+        horn = 1;
+      continue;
+    }
     if (!(changed & map[i].hid))
       continue;
+    if (map[i].button == GPAD_BUTTON_BACK) {
+      // discrete action, not a held button in the engine's state array --
+      // only fires on the press edge, same as the old hardcoded Minus path
+      if (down & map[i].hid) {
+        implOnBackButtonPressed(fake_env, NULL);
+        movie_skip();
+      }
+      continue;
+    }
     if (down & map[i].hid) {
       implOnJoyButtonDown(fake_env, NULL, 0, map[i].button);
       movie_skip(); // the game ignores input while waiting for a movie
@@ -456,6 +455,7 @@ static void send_pad_buttons(const PadMap *map, unsigned n, u64 down, u64 change
       implOnJoyButtonUp(fake_env, NULL, 0, map[i].button);
     }
   }
+  g_horn_btn = horn;
 }
 
 static void update_gamepad(void) {
@@ -463,14 +463,7 @@ static void update_gamepad(void) {
   const u64 down = padGetButtons(&pad);
   const u64 changed = down ^ pad_prev;
 
-  // face buttons follow the layout config; everything else is shared
-  send_pad_buttons(config.xbox_layout ? pad_face_xbox : pad_face_nintendo, 4, down, changed);
-  send_pad_buttons(pad_map, sizeof(pad_map) / sizeof(*pad_map), down, changed);
-  // Minus -> the engine's back/pause handler, on the press edge
-  if ((changed & HidNpadButton_Minus) && (down & HidNpadButton_Minus)) {
-    implOnBackButtonPressed(fake_env, NULL);
-    movie_skip();
-  }
+  send_pad_buttons(pad_map, NUM_PAD_MAP, down, changed);
   pad_prev = down;
 
   // D-pad up/down = zoom in/out for scoped weapons (sniper) and the camera. The
@@ -484,6 +477,12 @@ static void update_gamepad(void) {
   // (CPad::EnterFreeAim) doesn't fire on our input, so detect it directly and
   // feed it to the EnterFreeAim hook (hooks/game.c).
   g_freeaim_combo = (down & HidNpadButton_R) && (down & HidNpadButton_Down);
+
+  // keep the touch-overlay d-pad selector cleared -- LoadSaveData() restores it
+  // from the save file, and if it is ever set the whole d-pad reads fields the
+  // gamepad path never fills (see g_swap_nipple_dpad in hooks/game.c)
+  if (g_swap_nipple_dpad)
+    *g_swap_nipple_dpad = 0;
 
   const float scale = 1.f / 32767.0f;
   const HidAnalogStickState ls = padGetStickPos(&pad, 0);
@@ -521,9 +520,10 @@ int main(void) {
   setenv("GALLIUM_THREAD", "0", 1);
 
   // load config (defaults if absent), then write it back so newly-added keys
-  // like xbox_layout always show up in config.txt for editing
+  // like psp_layout always show up in config.txt for editing
   read_config(CONFIG_NAME);
   write_config(CONFIG_NAME);
+  build_pad_map();
 
   check_syscalls();
   check_data();

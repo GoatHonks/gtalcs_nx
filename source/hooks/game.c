@@ -25,6 +25,7 @@
 #include <pthread.h>
 #include <switch.h>
 
+#include "../config.h"
 #include "../util.h"
 #include "../so_util.h"
 #include "../hooks.h"
@@ -479,6 +480,40 @@ extern volatile int g_zoom_dir;   // main.c: +1 = d-pad up (in), -1 = down (out)
 static int sniper_zoom_in_hook(void *cpad)  { (void)cpad; return g_zoom_dir > 0; }
 static int sniper_zoom_out_hook(void *cpad) { (void)cpad; return g_zoom_dir < 0; }
 
+// The on-screen-controls option CPad::m_bSwapNippleAndDPad picks WHICH pair of
+// CControllerState fields every d-pad accessor reads: cleared it is the 0x12/0x14/
+// 0x16/0x18 set that CPad::Update() actually fills from the gamepad, set it is the
+// 0x1a/0x1c/0x1e/0x20 set that only the Android touch overlay ever writes. A save
+// made on a phone with that option on would therefore kill the whole d-pad here --
+// camera distance, horn, weapon cycling, radio and menu navigation at once. There
+// is no touch nipple on a Switch, so pin it cleared; LoadSaveData() rewrites it
+// from the save file on every load, hence the per-frame re-assert from main.c.
+volatile uint8_t *g_swap_nipple_dpad = NULL;   // main.c clears this every frame
+
+// Dedicated horn button. There is no joybutton id that means "horn": CPad::GetHorn
+// reads the same logical d-pad fields the camera cycling does, so any id that
+// reaches the horn also cycles the camera (that is exactly why ZR used to honk
+// while looking right). Hook GetHorn instead -- its only callers are
+// CAutomobile/CBike::ProcessControl, CVehicle::FlyingControl and the script
+// opcodes, all horn-specific -- and OR in our own button. The fallback is a
+// faithful copy of the original: bail on @0xa2, then a jump table on the
+// Controller Setup at @0x9e (setups 1 and 3 use d-pad down, 2 and 4 use d-pad
+// up), with the field pair picked by m_bSwapNippleAndDPad as everywhere else.
+extern volatile int g_horn_btn;   // main.c: a button mapped to HORN is held
+static int get_horn_hook(void *cpad) {
+  if (g_horn_btn)
+    return 1;
+  const uint8_t *p = cpad;
+  if (*(const uint16_t *)(p + 0xa2) != 0) return 0;
+  const uint16_t setup = *(const uint16_t *)(p + 0x9e);
+  if (setup > 3) return 0;
+  const int swapped = (g_swap_nipple_dpad && *g_swap_nipple_dpad != 0);
+  // odd setups put the horn on d-pad up, even ones on d-pad down
+  const int off = (setup & 1) ? (swapped ? 0x1a : 0x12)
+                              : (swapped ? 0x1c : 0x14);
+  return *(const uint16_t *)(p + off) != 0;
+}
+
 // Free-aim toggle. CPad::EnterFreeAim (polled by CPlayerPed::ProcessPlayerWeapon)
 // detects the R + D-pad Down combo by reading CControllerState action fields, but
 // our gamepad input doesn't populate them the way the Android build expects, so
@@ -529,6 +564,36 @@ void patch_game(void) {
     hook_arm64(so_find_addr(&game_mod, "_ZN4CPad12SniperZoomInEv"), (uintptr_t)sniper_zoom_in_hook);
     hook_arm64(so_find_addr(&game_mod, "_ZN4CPad13SniperZoomOutEv"), (uintptr_t)sniper_zoom_out_hook);
     debugPrintf("ZOOM: gamepad sniper/camera zoom enabled (d-pad up/down)\n");
+  }
+
+  // pin the touch-overlay d-pad selector off (see g_swap_nipple_dpad)
+  // Two aliases, and which one is live depends on when you ask. patch_game() runs
+  // before so_finalize(), so right now load_base (so_find_addr) is the mapped,
+  // writable image and load_virtbase is only reserved address space. finalize()
+  // then svcMapProcessCodeMemory()s load_base -> load_virtbase, after which
+  // load_virtbase (so_try_find_addr_rx) is the only addressable alias. So: write
+  // the initial value through load_base now, but cache the load_virtbase address
+  // for the per-frame re-assert -- caching the load_base one faults on frame 1.
+  if (so_try_find_addr_rx(&game_mod, "_ZN4CPad20m_bSwapNippleAndDPadE")) {
+    *(volatile uint8_t *)so_find_addr(&game_mod, "_ZN4CPad20m_bSwapNippleAndDPadE") = 0;
+    g_swap_nipple_dpad =
+        (volatile uint8_t *)so_try_find_addr_rx(&game_mod, "_ZN4CPad20m_bSwapNippleAndDPadE");
+    debugPrintf("PAD: m_bSwapNippleAndDPad pinned off (gamepad d-pad fields)\n");
+  }
+
+  // dedicated horn button (see get_horn_hook) -- only armed if something is
+  // actually mapped to HORN, so the stock d-pad horn is untouched otherwise
+  if ((config.key_a == GPAD_BUTTON_HORN || config.key_b == GPAD_BUTTON_HORN ||
+       config.key_x == GPAD_BUTTON_HORN || config.key_y == GPAD_BUTTON_HORN ||
+       config.key_l == GPAD_BUTTON_HORN || config.key_r == GPAD_BUTTON_HORN ||
+       config.key_zl == GPAD_BUTTON_HORN || config.key_zr == GPAD_BUTTON_HORN ||
+       config.key_up == GPAD_BUTTON_HORN || config.key_down == GPAD_BUTTON_HORN ||
+       config.key_left == GPAD_BUTTON_HORN || config.key_right == GPAD_BUTTON_HORN ||
+       config.key_lstick == GPAD_BUTTON_HORN || config.key_rstick == GPAD_BUTTON_HORN ||
+       config.key_plus == GPAD_BUTTON_HORN || config.key_minus == GPAD_BUTTON_HORN) &&
+      so_try_find_addr_rx(&game_mod, "_ZN4CPad7GetHornEv")) {
+    hook_arm64(so_find_addr(&game_mod, "_ZN4CPad7GetHornEv"), (uintptr_t)get_horn_hook);
+    debugPrintf("HORN: dedicated horn button enabled\n");
   }
 
   // detect the R + D-pad Down free-aim combo from our pad state (see enter_free_aim_hook)
