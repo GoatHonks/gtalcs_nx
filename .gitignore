@@ -1,0 +1,23 @@
+# build output
+build/
+*.nro
+*.elf
+*.nacp
+*.map
+
+# Game files -- NEVER commit these. They belong to Rockstar and must be
+# supplied by each user from their own copy of the APK.
+*.so
+*.wad
+*.m4v
+*.apk
+
+# Local working directories -- none of this belongs in the repo.
+# PORT/ is a copy of the SD card (game WADs, libGame.so: ~2GB, Rockstar's).
+# MOD/  is the CLEO mod pack it was originally built against: someone else's
+#       work, kept only as reference while the menu was being reimplemented
+#       natively, and no longer used by the build at all.
+# NRO/  is a built binary.
+PORT/
+MOD/
+NRO/
