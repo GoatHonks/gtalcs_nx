@@ -52,9 +52,12 @@ This will not work in applet/album mode. Use a game override (hold R on a title)
 Save games and settings are stored in `/switch/gtalcs/`.
 
 The port has an extra config file at `/switch/gtalcs/config.txt`, created the first
-time you run the game. See **[CONFIG.md](CONFIG.md)** for the full list of `config.txt` settings, every
-action name, and examples. config.txt is optional and only records settings that
-differ from the defaults, so a stock file is four lines.
+time you run the game. It is written out with a comment above every setting, so the
+file documents itself: every option, every action name and what each one does is
+in there, with no separate reference to look up.
+
+config.txt is rewritten on every launch: your values are kept, but any comments you
+add yourself are not.
 
 ## Controls
 

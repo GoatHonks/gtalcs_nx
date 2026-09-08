@@ -146,15 +146,6 @@ static void config_resolve_faces(Config *c) {
   if (c->key_y == KEY_UNSET) c->key_y = c->psp_layout ? GPAD_BUTTON_X : GPAD_BUTTON_Y;
 }
 
-// The defaults, resolved the same way read_config() resolves them, so
-// write_config() can leave out every line that just restates one.
-static void config_defaults_for_compare(Config *d, int psp_layout) {
-  memset(d, 0, sizeof(*d));
-  config_set_defaults(d);
-  d->psp_layout = psp_layout;   // compare against the layout actually in use
-  config_resolve_faces(d);
-}
-
 int read_config(const char *file) {
   char line[1024] = { 0 };
 
@@ -198,31 +189,91 @@ int write_config(const char *file) {
   if (f == NULL)
     return -1;
 
-  // Anything that just restates a default is left out, so a stock config.txt has
-  // no psp_layout line and none of the sixteen key_* lines. A remap somebody
-  // actually chose differs from the default, so it still survives the rewrite.
-  Config d;
-  config_defaults_for_compare(&d, config.psp_layout);
-  Config dl;
-  config_defaults_for_compare(&dl, 1);
-  d.psp_layout = dl.psp_layout;   // psp_layout itself is written only if != 1
-
-  #define CONFIG_VAR_INT(var) fprintf(f, "%s %d\n", #var, config.var)
-  #define CONFIG_VAR_OPT_INT(var) if (config.var != d.var) fprintf(f, "%s %d\n", #var, config.var)
-  #define CONFIG_VAR_FLOAT(var) fprintf(f, "%s %g\n", #var, config.var)
-  #define CONFIG_VAR_STR(var) if (config.var[0]) fprintf(f, "%s %s\n", #var, config.var)
-  #define CONFIG_VAR_BUTTON(var) do { \
-    if (config.var != d.var) { \
-      const char *nm = button_token_name(config.var); \
-      if (nm) fprintf(f, "%s %s\n", #var, nm); else fprintf(f, "%s %d\n", #var, config.var); \
-    } \
+  // Every setting is written out with a comment describing it, so config.txt
+  // documents itself and there is nothing to look up elsewhere. read_config()
+  // skips any line starting with '#'.
+  //
+  // The file is rewritten on every launch: your values are kept, but any
+  // comments you add yourself are not.
+  #define CONFIG_BUTTON_LINE(var) do { \
+    const char *nm = button_token_name(config.var); \
+    if (nm) fprintf(f, "%s %s\n", #var, nm); \
+    else fprintf(f, "%s %d\n", #var, config.var); \
   } while (0)
-  CONFIG_VARS
-  #undef CONFIG_VAR_INT
-  #undef CONFIG_VAR_OPT_INT
-  #undef CONFIG_VAR_FLOAT
-  #undef CONFIG_VAR_STR
-  #undef CONFIG_VAR_BUTTON
+
+  // key_a/b/x/y have no fixed default: they follow psp_layout unless config.txt
+  // names them. Writing them out unconditionally would pin them to whatever the
+  // layout resolved to this boot, and psp_layout would then appear to do nothing
+  // on the next one. So while a face button still matches its layout default the
+  // line is written commented out -- visible and ready to edit, but not binding.
+  // A remap actually chosen differs from the default, so it is written for real.
+  #define CONFIG_FACE_LINE(var, dflt) do { \
+    const char *nm = button_token_name(config.var); \
+    const char *pfx = (config.var == (dflt)) ? "#" : ""; \
+    if (nm) fprintf(f, "%s%s %s\n", pfx, #var, nm); \
+    else fprintf(f, "%s%s %d\n", pfx, #var, config.var); \
+  } while (0)
+
+  fprintf(f, "# gtalcs_nx configuration\n");
+
+  fprintf(f, "\n# Render size. -1 = auto: 720p handheld, 1080p docked.\n");
+  fprintf(f, "screen_width %d\n", config.screen_width);
+  fprintf(f, "screen_height %d\n", config.screen_height);
+
+  fprintf(f, "\n# Trilinear texture filtering. 0 is slightly sharper and slightly\n"
+             "# faster, 1 is smoother.\n");
+  fprintf(f, "trilinear_filter %d\n", config.trilinear_filter);
+
+  fprintf(f, "\n# Small FPS counter in the top-left corner. 1 = on.\n");
+  fprintf(f, "show_fps %d\n", config.show_fps);
+
+  fprintf(f, "\n# Face button layout.\n"
+             "#   1 = positional, matching the PSP: X = Triangle (top), Y = Square\n"
+             "#       (left), A = Circle (right), B = Cross (bottom). A printed PSP\n"
+             "#       cheat code can then be entered by shape.\n"
+             "#   0 = Nintendo confirm/cancel convention: A = Cross, B = Circle.\n");
+  fprintf(f, "psp_layout %d\n", config.psp_layout);
+
+  fprintf(f, "\n# Button mapping. One entry per physical Switch button; the value is an\n"
+             "# engine ACTION, not another button, so several buttons may share one.\n"
+             "# Valid actions:\n"
+             "#   A           Cross    - sprint on foot, accelerate in a vehicle\n"
+             "#   B           Circle   - attack / fire weapon, car weapon\n"
+             "#   X           Square   - jump, brake / reverse\n"
+             "#   Y           Triangle - enter vehicle, skip phone call\n"
+             "#   L1                   - answer phone, collect pickup, sub-mission\n"
+             "#   R1                   - target / scope view, hand brake\n"
+             "#   DPAD_UP DPAD_DOWN    - cycle camera, scope zoom, horn\n"
+             "#   DPAD_LEFT DPAD_RIGHT - cycle weapon / target, radio stations\n"
+             "#   START                - pause menu\n"
+             "#   BACK                 - back / pause (Minus's default)\n"
+             "#   HORN                 - horn only, without the d-pad side effects\n"
+             "#   CAM_CENTER           - recentre the camera behind the car\n"
+             "#   NONE                 - button does nothing\n");
+
+  fprintf(f, "\n# The four face buttons follow psp_layout above. These lines show what it\n"
+             "# resolved to; uncomment one to pin that button regardless of the layout.\n");
+  CONFIG_FACE_LINE(key_a, config.psp_layout ? GPAD_BUTTON_B : GPAD_BUTTON_A);
+  CONFIG_FACE_LINE(key_b, config.psp_layout ? GPAD_BUTTON_A : GPAD_BUTTON_B);
+  CONFIG_FACE_LINE(key_x, config.psp_layout ? GPAD_BUTTON_Y : GPAD_BUTTON_X);
+  CONFIG_FACE_LINE(key_y, config.psp_layout ? GPAD_BUTTON_X : GPAD_BUTTON_Y);
+
+  fprintf(f, "\n# Shoulders, d-pad, stick clicks and Plus/Minus.\n");
+  CONFIG_BUTTON_LINE(key_l);
+  CONFIG_BUTTON_LINE(key_r);
+  CONFIG_BUTTON_LINE(key_zl);
+  CONFIG_BUTTON_LINE(key_zr);
+  CONFIG_BUTTON_LINE(key_up);
+  CONFIG_BUTTON_LINE(key_down);
+  CONFIG_BUTTON_LINE(key_left);
+  CONFIG_BUTTON_LINE(key_right);
+  CONFIG_BUTTON_LINE(key_lstick);
+  CONFIG_BUTTON_LINE(key_rstick);
+  CONFIG_BUTTON_LINE(key_plus);
+  CONFIG_BUTTON_LINE(key_minus);
+
+  #undef CONFIG_FACE_LINE
+  #undef CONFIG_BUTTON_LINE
 
   fclose(f);
 

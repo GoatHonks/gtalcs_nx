@@ -6,7 +6,36 @@ All findings below came from disassembling the retail `libGame.so` (ARM64) and
 cross-referencing the engine's own functions. Nothing here is guesswork about what
 the buttons "should" do — each claim is traced to a specific function and field.
 
-## The root cause
+## 1.0.3+r2
+
+### Changed
+
+* **config.txt documents itself.** Every setting is now written out with a comment
+  above it explaining what it does, and the button section lists every valid action
+  name inline. Editing the file by hand no longer means looking anything up.
+  `read_config()` already skipped `#` lines, so only the writer changed.
+
+  This replaces r1's behaviour of recording only settings that differ from the
+  defaults. An option that is never written cannot be commented, so the full list is
+  written out instead. Existing values are preserved on first launch; the file just
+  gets longer.
+
+* **The four face buttons are written commented out** while they still match what
+  `psp_layout` resolved to, for example `#key_a B`. They have no fixed default —
+  `config_resolve_faces()` only fills them when config.txt does not name them — so
+  writing them as live lines would pin them and make `psp_layout` appear to stop
+  working on the next launch. Commented, they show what the layout chose and are
+  ready to uncomment; a remap actually chosen differs from the default and is
+  written as a live line.
+
+### Removed
+
+* **CONFIG.md.** Its contents now live in config.txt itself, so the reference and
+  the file being described can no longer drift apart.
+
+## 1.0.3+r1
+
+### The root cause
 
 `CPad::Update()` copies the JNI gamepad button ids into `CControllerState` fields
 using a fixed table, and that table does **not** match the id names the port
@@ -31,7 +60,7 @@ which emits one named character per button — T for Triangle, C for Circle, S f
 Square, X for Cross, U/D/L/R for the d-pad, 1 for L, 2 for R — so the game names
 every field itself.
 
-## Fixed
+### Fixed
 
 * **D-pad Up/Down now work.** They reach the engine's logical d-pad fields. This
   alone restores camera cycling, the horn, sniper/scope zoom, `GuiUp`/`GuiDown`,
@@ -50,7 +79,7 @@ every field itself.
   exactly that. It is re-asserted each frame, since `LoadSaveData()` restores it
   from the save file.
 
-## Added
+### Added
 
 * **Per-button remapping.** Every physical Switch button can be pointed at any
   engine action from `config.txt` (`key_a`, `key_zl`, `key_lstick`, ...). Upstream
@@ -66,10 +95,8 @@ every field itself.
   is called from the vehicle control code, so it does nothing on foot.
 * **R3 recentres the camera behind a car**, using an id that had a reader but no
   button.
-* **[CONFIG.md](CONFIG.md)** — full `config.txt` reference: every setting, every
-  action name, examples, and which action names are dead ends.
 
-## Changed
+### Changed
 
 * **Config action names corrected.** `key_up DPAD_UP` instead of the misleading
   `key_up L2`. `L2`/`R2` still parse as the old spellings and are rewritten to the
@@ -81,7 +108,7 @@ every field itself.
   mapping. The old name is still parsed, but is no longer written back — an old
   config would otherwise keep pinning the Nintendo layout with no way to notice.
 
-## Known limitations
+### Known limitations
 
 Not bugs — the engine has no code behind them:
 
