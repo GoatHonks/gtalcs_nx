@@ -83,18 +83,23 @@ static ped_teleport_fn ped_teleport = NULL;
 // Zone names are GXT keys, so rather than shipping a guessed English list the
 // menu asks the game for them and falls back only where a key is missing. As a
 // side effect the names arrive in whatever language the game is set to.
-typedef void *(*the_text_fn)(void);
+// Reached through CText::msInstance rather than through TheText(). TheText() is
+// a weak symbol and a lazy constructor -- if the slot is empty it allocates a
+// brand new, empty CText and installs it, which would answer every key with a
+// miss and quietly replace the game's real text object. Reading the pointer is
+// both safer and the same thing the game's own inlined accessors do:
+// TheText()'s adrp/ldr lands on a GOT entry relocated to CText::msInstance.
 typedef char (*text_exists_fn)(void *self, const char *key);
 typedef void *(*text_get_utf8_fn)(void *self, const char *key, char *out, int len);
-static the_text_fn the_text = NULL;
+static void **ctext_instance = NULL;
 static text_exists_fn text_exists = NULL;
 static text_get_utf8_fn text_get_utf8 = NULL;
 
 // Fills `out` from the GXT key, or leaves it untouched and returns 0.
 static int gxt_lookup(const char *key, char *out, int len) {
-  if (!key || !the_text || !text_exists || !text_get_utf8)
+  if (!key || !ctext_instance || !text_exists || !text_get_utf8)
     return 0;
-  void *t = the_text();
+  void *t = *ctext_instance;
   if (!t || !text_exists(t, key))
     return 0;
   out[0] = 0;
@@ -580,6 +585,8 @@ static void menu_resolve_vehicles(void) {
       continue;
     }
 
+    debugPrintf("MENU: name \"%s\" (%s) -> model %d, %s\n",
+                label, model, id, veh_kind_name[kind]);
     veh_add(id, (veh_kind)kind, label);
   }
 
@@ -1135,7 +1142,7 @@ void menu_init(void) {
   find_player_ped = (find_player_ped_fn)need_sym("_Z13FindPlayerPedv");
   ped_teleport = (ped_teleport_fn)need_sym("_ZN4CPed8TeleportE7CVector");
 
-  the_text = (the_text_fn)need_sym("_Z7TheTextv");
+  ctext_instance = (void **)need_sym("_ZN5CText10msInstanceE");
   text_exists = (text_exists_fn)need_sym("_ZN5CText6ExistsEPKc");
   text_get_utf8 = (text_get_utf8_fn)need_sym("_ZN5CText7GetUTF8EPKcPci");
 

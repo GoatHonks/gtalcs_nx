@@ -176,10 +176,13 @@ at an `END_THREAD` stub instead and let the game retire it.
 
 ## Outstanding
 
-- **Zone names never resolve.** `0/29` GXT keys hit, so the list runs on its
-  built-in English fallbacks. A probe with `CHEAT1` (a key `VehicleCheat` itself
-  passes to `CText::Get`) is logged next to the vehicle count: if the probe hits,
-  the zone keys are wrong for LCS; if it misses, the lookup or its timing is.
+- **Zone names never resolve.** `0/29` GXT keys hit, *and* a probe with `CHEAT1`
+  -- a key `VehicleCheat` itself passes to `CText::Get` and which visibly works
+  in game -- also missed. So the keys are not the problem; the lookup is. First
+  suspect was `TheText()`: it is a weak symbol *and* a lazy constructor that
+  installs a fresh empty `CText` when the slot is null, which would answer every
+  key with a miss. Now read `CText::msInstance` directly (`TheText()`'s GOT entry
+  is relocated to it) and log the pointer next to the probe.
 - **Naming the numbered vehicles.** The spawn list is built by walking
   `CModelInfo::msNumModelInfos` and classifying every id, so completeness does
   not depend on the name table — unknown vehicles appear as `Car 173` and spawn
