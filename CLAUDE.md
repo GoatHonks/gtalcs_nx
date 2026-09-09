@@ -137,12 +137,18 @@ up silently.
   builds row0 `(cos,sin,0)`, row1 `(-sin,cos,0)`, and GTA faces `+y`. Copying a
   ped's 48 rotation bytes onto a vehicle is an easy way to face it correctly.
 - **`CVehicle::operator new` sizes**: `0x7b0` `CAutomobile`, `0x6a0` `CBike`,
-  `0x610` `CBoat`. Read them off the callers of each constructor.
-- **Model ids are resolved by name.** `CModelInfo::GetModelInfo(name, &id)`
-  hashes with `CKeyGen::GetUppercaseKey` and searches; the model info stores only
-  the hash, so there is **no name table to enumerate** — not in the binary and
-  not in the wads. A spelled-out name list is unavoidable, so resolve at runtime
-  and drop what does not match rather than trusting it.
+  `0x610` `CBoat`, `0x490` `CHeli`, `0x420` `CTrain`. Read them off the callers of
+  each constructor. **`CPlane` has no callers at all** in this build — LCS has no
+  flyable plane — so there is no size to read and planes are not spawnable.
+- **Names are gone, but ids are enumerable.** `CBaseModelInfo::SetModelName`
+  stores only a CRC-32 of the uppercased name (`CKeyGen::GetUppercaseKey`,
+  standard reflected table at `0x24532c`, no final complement) and `strcpy`s the
+  string **only when chunk files are off**, which they are not — so no name
+  survives, in the binary or the wads, and a name can only be tested by asking
+  the running game via `GetModelInfo(name, &id)`. Do not go looking for a name
+  table; there isn't one. **What you can do is walk ids `0..msNumModelInfos` and
+  classify each with the `Is*Model` predicates** — that gives a complete vehicle
+  list with no names involved, which is how the spawn menu is built.
 - **Zone names come from the game.** `TheText()` + `CText::Exists` /
   `CText::GetUTF8(key, buf, len)` resolve GXT keys, so names arrive localised.
   `CText` is not loaded at `patch_game` time — look them up lazily.
@@ -174,10 +180,11 @@ at an `END_THREAD` stub instead and let the game retire it.
   built-in English fallbacks. A probe with `CHEAT1` (a key `VehicleCheat` itself
   passes to `CText::Get`) is logged next to the vehicle count: if the probe hits,
   the zone keys are wrong for LCS; if it misses, the lookup or its timing is.
-- **Vehicle name list** — 57 names, all confirmed present in this build. Seven
-  guesses (`phobos`, `deimos`, `hellenbach`, `sindacco`, `forelli`, `diablo`,
-  `wintrgrn`) did not resolve and were removed; LCS may still have those vehicles
-  under other names.
+- **Naming the numbered vehicles.** The spawn list is built by walking
+  `CModelInfo::msNumModelInfos` and classifying every id, so completeness does
+  not depend on the name table — unknown vehicles appear as `Car 173` and spawn
+  fine. The name table only supplies labels. `debug.log` prints every unnamed id
+  and its class; match them in game and add names.
 - **Bodyguard weapon** — `BODYGUARD_WEAPON` is a guessed `eWeaponType` (17). The
   spawn logs the number it used; adjust once it is clear what they are holding.
   Ped type is `PEDTYPE_GANG1` (7) with `CPopulation::ChooseGangOccupation(0)`

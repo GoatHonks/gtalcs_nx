@@ -366,8 +366,15 @@ static void menu_label_places(void) {
 #define VEH_SIZE_AUTO 0x7b0
 #define VEH_SIZE_BIKE 0x6a0
 #define VEH_SIZE_BOAT 0x610
+#define VEH_SIZE_HELI 0x490
 
-typedef enum { VEH_AUTO = 0, VEH_BIKE, VEH_BOAT } veh_kind;
+// Planes and trains are deliberately absent. `CPlane::CPlane` exists but nothing
+// in this build ever calls it -- LCS has no flyable plane -- so its allocation
+// size cannot be read off a caller the way the others can, and guessing the size
+// of a heap allocation is not worth a spawnable Dodo. Trains need rails.
+typedef enum { VEH_AUTO = 0, VEH_BIKE, VEH_BOAT, VEH_HELI } veh_kind;
+
+static const char *const veh_kind_name[] = { "Car", "Bike", "Boat", "Helicopter" };
 
 typedef void *(*vehicle_new_fn)(size_t size);
 typedef void (*vehicle_ctor_fn)(void *self, int model, unsigned char created_by);
@@ -380,13 +387,28 @@ static vehicle_new_fn vehicle_new = NULL;
 static vehicle_ctor_fn automobile_ctor = NULL;
 static vehicle_ctor_fn bike_ctor = NULL;
 static vehicle_ctor_fn boat_ctor = NULL;
+static vehicle_ctor_fn heli_ctor = NULL;
 static world_add_fn world_add = NULL;
 static request_model_fn request_model = NULL;
 static load_all_models_fn load_all_models = NULL;
 static is_model_fn is_car_model = NULL;
 static is_model_fn is_bike_model = NULL;
 static is_model_fn is_boat_model = NULL;
+static is_model_fn is_heli_model = NULL;
 static is_model_fn is_in_cd_image = NULL;
+
+// How many model slots exist, so the table can be walked end to end.
+static const int *num_model_infos = NULL;
+
+// Classifies a model id, or returns -1 for anything this menu cannot construct
+// (planes, trains, and every non-vehicle model).
+static int veh_classify(int id) {
+  if (is_bike_model && is_bike_model(id)) return VEH_BIKE;
+  if (is_boat_model && is_boat_model(id)) return VEH_BOAT;
+  if (is_heli_model && is_heli_model(id)) return VEH_HELI;
+  if (is_car_model && is_car_model(id))   return VEH_AUTO;
+  return -1;
+}
 
 // Model ids are per-build, so the menu resolves them by name:
 // CModelInfo::GetModelInfo hashes the name and searches, writing the id out.
@@ -400,68 +422,66 @@ static get_model_info_fn get_model_info = NULL;
 typedef struct {
   const char *label;
   const char *model;
-  int id;
-  veh_kind kind;
 } menu_vehicle;
 
-static menu_vehicle menu_vehicles[] = {
-  { "Banshee",          "banshee",   -1 },
-  { "Cheetah",          "cheetah",   -1 },
-  { "Infernus",         "infernus",  -1 },
-  { "Stinger",          "stinger",   -1 },
-  { "Landstalker",      "landstal",  -1 },
-  { "Patriot",          "patriot",   -1 },
-  { "Sentinel",         "sentinel",  -1 },
-  { "Stallion",         "stallion",  -1 },
-  { "Esperanto",        "esperant",  -1 },
-  { "Idaho",            "idaho",     -1 },
-  { "Manana",           "manana",    -1 },
-  { "Kuruma",           "kuruma",    -1 },
-  { "Perennial",        "peren",     -1 },
-  { "Blista",           "blista",    -1 },
-  { "Bobcat",           "bobcat",    -1 },
-  { "Moonbeam",         "moonbeam",  -1 },
-  { "Stretch",          "stretch",   -1 },
-  { "Taxi",             "taxi",      -1 },
-  { "Cabbie",           "cabbie",    -1 },
-  { "Borgnine Taxi",    "borgnine",  -1 },
-  { "Police car",       "police",    -1 },
-  { "Enforcer",         "enforcer",  -1 },
-  { "FBI car",          "fbicar",    -1 },
-  { "Rhino",            "rhino",     -1 },
-  { "Barracks OL",      "barracks",  -1 },
-  { "Ambulance",        "ambulan",   -1 },
-  { "Fire truck",       "firetruk",  -1 },
-  { "Securicar",        "securica",  -1 },
-  { "Trashmaster",      "trash",     -1 },
-  { "Linerunner",       "linerun",   -1 },
-  { "Flatbed",          "flatbed",   -1 },
-  { "Mule",             "mule",      -1 },
-  { "Yankee",           "yankee",    -1 },
-  { "Pony",             "pony",      -1 },
-  { "Rumpo",            "rumpo",     -1 },
-  { "Bus",              "bus",       -1 },
-  { "Coach",            "coach",     -1 },
-  { "Mr Whoopee",       "mrwhoop",   -1 },
-  { "BF Injection",     "bfinject",  -1 },
-  { "Campervan",        "campvan",   -1 },
-  { "Toyz van",         "toyz",      -1 },
-  { "Romeros Hearse",   "hearse",    -1 },
-  { "Mafia Sentinel",   "mafia",     -1 },
-  { "Yardie Lobo",      "yardie",    -1 },
-  { "Yakuza Stinger",   "yakuza",    -1 },
-  { "Cartel Cruiser",   "columb",    -1 },
-  { "Hoods Rumpo",      "hoods",     -1 },
-  { "PCJ-600",          "pcj600",    -1 },
-  { "Freeway",          "freeway",   -1 },
-  { "Sanchez",          "sanchez",   -1 },
-  { "Faggio",           "faggio",    -1 },
-  { "Angel",            "angel",     -1 },
-  { "Pizza Boy",        "pizzaboy",  -1 },
-  { "Noodle Boy",       "noodleboy", -1 },
-  { "Predator",         "predator",  -1 },
-  { "Speeder",          "speeder",   -1 },
-  { "Reefer",           "reefer",    -1 },
+static const menu_vehicle menu_vehicle_names[] = {
+  { "Banshee",          "banshee", },
+  { "Cheetah",          "cheetah", },
+  { "Infernus",         "infernus", },
+  { "Stinger",          "stinger", },
+  { "Landstalker",      "landstal", },
+  { "Patriot",          "patriot", },
+  { "Sentinel",         "sentinel", },
+  { "Stallion",         "stallion", },
+  { "Esperanto",        "esperant", },
+  { "Idaho",            "idaho", },
+  { "Manana",           "manana", },
+  { "Kuruma",           "kuruma", },
+  { "Perennial",        "peren", },
+  { "Blista",           "blista", },
+  { "Bobcat",           "bobcat", },
+  { "Moonbeam",         "moonbeam", },
+  { "Stretch",          "stretch", },
+  { "Taxi",             "taxi", },
+  { "Cabbie",           "cabbie", },
+  { "Borgnine Taxi",    "borgnine", },
+  { "Police car",       "police", },
+  { "Enforcer",         "enforcer", },
+  { "FBI car",          "fbicar", },
+  { "Rhino",            "rhino", },
+  { "Barracks OL",      "barracks", },
+  { "Ambulance",        "ambulan", },
+  { "Fire truck",       "firetruk", },
+  { "Securicar",        "securica", },
+  { "Trashmaster",      "trash", },
+  { "Linerunner",       "linerun", },
+  { "Flatbed",          "flatbed", },
+  { "Mule",             "mule", },
+  { "Yankee",           "yankee", },
+  { "Pony",             "pony", },
+  { "Rumpo",            "rumpo", },
+  { "Bus",              "bus", },
+  { "Coach",            "coach", },
+  { "Mr Whoopee",       "mrwhoop", },
+  { "BF Injection",     "bfinject", },
+  { "Campervan",        "campvan", },
+  { "Toyz van",         "toyz", },
+  { "Romeros Hearse",   "hearse", },
+  { "Mafia Sentinel",   "mafia", },
+  { "Yardie Lobo",      "yardie", },
+  { "Yakuza Stinger",   "yakuza", },
+  { "Cartel Cruiser",   "columb", },
+  { "Hoods Rumpo",      "hoods", },
+  { "PCJ-600",          "pcj600", },
+  { "Freeway",          "freeway", },
+  { "Sanchez",          "sanchez", },
+  { "Faggio",           "faggio", },
+  { "Angel",            "angel", },
+  { "Pizza Boy",        "pizzaboy", },
+  { "Noodle Boy",       "noodleboy", },
+  { "Predator",         "predator", },
+  { "Speeder",          "speeder", },
+  { "Reefer",           "reefer", },
 
   // Vehicles LCS has but whose internal name we have not found yet. There is no
   // way to look these up offline -- the model table is keyed by a CRC-32 of the
@@ -470,84 +490,125 @@ static menu_vehicle menu_vehicles[] = {
   // spelling that misses is dropped and logged; if several hit they collapse to
   // one entry, because resolve drops duplicate model ids. Whatever survives is
   // the right name and can be reduced to a single line later.
-  { "Deimos SP",        "spider",    -1 },   // suggested name
-  { "Deimos SP",        "deimossp",  -1 },
-  { "Phobos VT",        "phobosvt",  -1 },
-  { "Phobos VT",        "vtvan",     -1 },
-  { "Hellenbach GT",    "hellenbac", -1 },
-  { "Hellenbach GT",    "hellenba",  -1 },
-  { "Sindacco Argento", "argento",   -1 },
-  { "Forelli Exsess",   "exsess",    -1 },
-  { "Diablo Stallion",  "diablos",   -1 },
-  { "Wintergreen",      "wintergrn", -1 },
-  { "Wintergreen",      "wintergreen", -1 },
+  { "Deimos SP",        "spider", },   // suggested name
+  { "Deimos SP",        "deimossp", },
+  { "Phobos VT",        "phobosvt", },
+  { "Phobos VT",        "vtvan", },
+  { "Hellenbach GT",    "hellenbac", },
+  { "Hellenbach GT",    "hellenba", },
+  { "Sindacco Argento", "argento", },
+  { "Forelli Exsess",   "exsess", },
+  { "Diablo Stallion",  "diablos", },
+  { "Wintergreen",      "wintergrn", },
+  { "Wintergreen",      "wintergreen", },
 };
-#define MENU_NUM_VEHICLES ((int)(sizeof(menu_vehicles) / sizeof(menu_vehicles[0])))
+#define MENU_NUM_VEHICLE_NAMES \
+  ((int)(sizeof(menu_vehicle_names) / sizeof(menu_vehicle_names[0])))
 
+// The list actually shown. It is built from the game's model table rather than
+// from the names above, so every vehicle in the build is spawnable whether or
+// not we know what it is called: the names only decide how an entry is
+// labelled. Anything unnamed still appears, as "Car 173" or "Boat 191", and is
+// spawned exactly the same way.
+typedef struct {
+  char label[28];
+  int id;
+  veh_kind kind;
+} menu_veh_entry;
+
+#define MENU_VEHICLE_MAX 160
+static menu_veh_entry veh_list[MENU_VEHICLE_MAX];
 static int vehicles_ready = 0;
+
+static void veh_add(int id, veh_kind kind, const char *label) {
+  if (vehicles_ready >= MENU_VEHICLE_MAX)
+    return;
+  menu_veh_entry *e = &veh_list[vehicles_ready++];
+  e->id = id;
+  e->kind = kind;
+  snprintf(e->label, sizeof(e->label), "%s", label);
+}
+
+static int veh_listed(int id) {
+  for (int i = 0; i < vehicles_ready; i++)
+    if (veh_list[i].id == id)
+      return 1;
+  return 0;
+}
 
 // Model ids only exist once the model info table has been built, which is long
 // after patch_game, so this runs the first time the menu is opened in-game.
 static void menu_resolve_vehicles(void) {
   static int done = 0;
-  if (done || !get_model_info)
+  if (done || !get_model_info || !num_model_infos)
     return;
   done = 1;
 
-  int kept = 0;
-  for (int i = 0; i < MENU_NUM_VEHICLES; i++) {
+  // Named vehicles first, in the order written above, so the list opens on
+  // things you recognise rather than on a run of numbered entries.
+  for (int i = 0; i < MENU_NUM_VEHICLE_NAMES; i++) {
+    const char *label = menu_vehicle_names[i].label;
+    const char *model = menu_vehicle_names[i].model;
+
     int id = -1;
-    if (!get_model_info(menu_vehicles[i].model, &id) || id < 0) {
-      debugPrintf("MENU: vehicle \"%s\" (%s) not in this build, dropped\n",
-                  menu_vehicles[i].label, menu_vehicles[i].model);
+    if (!get_model_info(model, &id) || id < 0) {
+      debugPrintf("MENU: name \"%s\" (%s) is not in this build\n", label, model);
       continue;
     }
 
-    // The class has to come from the model, not from the id: building a boat as
-    // a CAutomobile is what killed the game on the Reefer and the Speeder.
-    // Anything that is not a car, bike or boat -- planes, helicopters, trains --
-    // has no constructor here and is dropped rather than guessed at.
-    veh_kind kind;
-    if (is_bike_model && is_bike_model(id))
-      kind = VEH_BIKE;
-    else if (is_boat_model && is_boat_model(id))
-      kind = VEH_BOAT;
-    else if (is_car_model && is_car_model(id))
-      kind = VEH_AUTO;
-    else {
-      debugPrintf("MENU: vehicle \"%s\" (model %d) is not a car, bike or boat, dropped\n",
-                  menu_vehicles[i].label, id);
+    const int kind = veh_classify(id);
+    if (kind < 0) {
+      debugPrintf("MENU: \"%s\" (model %d) is a plane, train or not a vehicle, skipped\n",
+                  label, id);
       continue;
     }
-
     if (is_in_cd_image && !is_in_cd_image(id)) {
-      debugPrintf("MENU: vehicle \"%s\" (model %d) is not in the cd image, dropped\n",
-                  menu_vehicles[i].label, id);
+      debugPrintf("MENU: \"%s\" (model %d) is not in the cd image, skipped\n", label, id);
+      continue;
+    }
+    // Two spellings of one vehicle would otherwise list it twice.
+    if (veh_listed(id)) {
+      debugPrintf("MENU: \"%s\" (%s) is model %d, already listed\n", label, model, id);
       continue;
     }
 
-    // Two spellings of the same vehicle both resolving would put it in the menu
-    // twice, so the second one goes.
-    int dup = 0;
-    for (int k = 0; k < kept; k++) {
-      if (menu_vehicles[k].id == id) {
-        debugPrintf("MENU: \"%s\" (%s) is model %d, already listed as \"%s\"\n",
-                    menu_vehicles[i].label, menu_vehicles[i].model, id,
-                    menu_vehicles[k].label);
-        dup = 1;
-        break;
-      }
-    }
-    if (dup)
-      continue;
-
-    menu_vehicles[kept] = menu_vehicles[i];
-    menu_vehicles[kept].id = id;
-    menu_vehicles[kept].kind = kind;
-    kept++;
+    veh_add(id, (veh_kind)kind, label);
   }
-  vehicles_ready = kept;
-  debugPrintf("MENU: %d/%d vehicles resolved\n", kept, MENU_NUM_VEHICLES);
+
+  const int named = vehicles_ready;
+
+  // Then everything else the game has. This is what makes the list complete:
+  // land, sea and air, named or not.
+  const int total = *num_model_infos;
+  int unnamed = 0;
+  for (int id = 0; id < total; id++) {
+    const int kind = veh_classify(id);
+    if (kind < 0 || veh_listed(id))
+      continue;
+    if (is_in_cd_image && !is_in_cd_image(id))
+      continue;
+
+    char label[28];
+    snprintf(label, sizeof(label), "%s %d", veh_kind_name[kind], id);
+    veh_add(id, (veh_kind)kind, label);
+    unnamed++;
+  }
+
+  int by_kind[4] = { 0, 0, 0, 0 };
+  for (int i = 0; i < vehicles_ready; i++)
+    by_kind[veh_list[i].kind]++;
+
+  debugPrintf("MENU: %d vehicles (%d named, %d unnamed) -- "
+              "%d cars, %d bikes, %d boats, %d helicopters\n",
+              vehicles_ready, named, unnamed,
+              by_kind[VEH_AUTO], by_kind[VEH_BIKE],
+              by_kind[VEH_BOAT], by_kind[VEH_HELI]);
+
+  // Every unnamed entry, so the numbers can be matched up in game and turned
+  // into real names in the table above.
+  for (int i = named; i < vehicles_ready; i++)
+    debugPrintf("MENU: unnamed %s, model %d\n",
+                veh_kind_name[veh_list[i].kind], veh_list[i].id);
 
   // One probe with a key the game itself uses (VehicleCheat passes "CHEAT1" to
   // CText::Get), so a zone-name miss can be told apart from the text system not
@@ -648,7 +709,7 @@ static const char *sub_label(int i) {
   switch (sub_kind) {
     case SUB_CHEATS:   return menu_cheats[i].name;
     case SUB_TELEPORT: return place_label[i];
-    case SUB_VEHICLES: return menu_vehicles[i].label;
+    case SUB_VEHICLES: return veh_list[i].label;
     default:           return "";
   }
 }
@@ -797,7 +858,7 @@ static void menu_spawn_vehicle(int idx) {
   if (idx < 0 || idx >= vehicles_ready)
     return;
   if (!vehicle_new || !world_add || !request_model || !load_all_models ||
-      !find_player_ped || !automobile_ctor || !bike_ctor || !boat_ctor) {
+      !find_player_ped || !automobile_ctor) {
     snprintf(toast, sizeof(toast), "Spawning unavailable");
     toast_pending = 1;
     return;
@@ -807,7 +868,7 @@ static void menu_spawn_vehicle(int idx) {
   if (!ped)
     return;
 
-  const menu_vehicle *v = &menu_vehicles[idx];
+  const menu_veh_entry *v = &veh_list[idx];
 
   // Blocking load, the same pair VehicleCheat uses.
   request_model(v->id, 1);
@@ -818,8 +879,11 @@ static void menu_spawn_vehicle(int idx) {
   switch (v->kind) {
     case VEH_BIKE: size = VEH_SIZE_BIKE; ctor = bike_ctor; break;
     case VEH_BOAT: size = VEH_SIZE_BOAT; ctor = boat_ctor; break;
+    case VEH_HELI: size = VEH_SIZE_HELI; ctor = heli_ctor; break;
     default:       size = VEH_SIZE_AUTO; ctor = automobile_ctor; break;
   }
+  if (!ctor)
+    return;
 
   void *veh = vehicle_new(size);
   if (!veh) {
@@ -1072,12 +1136,15 @@ void menu_init(void) {
   automobile_ctor = (vehicle_ctor_fn)need_sym("_ZN11CAutomobileC1Eih");
   bike_ctor = (vehicle_ctor_fn)need_sym("_ZN5CBikeC1Eih");
   boat_ctor = (vehicle_ctor_fn)need_sym("_ZN5CBoatC1Eih");
+  heli_ctor = (vehicle_ctor_fn)need_sym("_ZN5CHeliC1Eih");
   world_add = (world_add_fn)need_sym("_ZN6CWorld3AddEP7CEntity");
   request_model = (request_model_fn)need_sym("_ZN10CStreaming12RequestModelEii");
   load_all_models = (load_all_models_fn)need_sym("_ZN10CStreaming22LoadAllRequestedModelsEb");
   is_car_model = (is_model_fn)need_sym("_ZN10CModelInfo10IsCarModelEi");
   is_bike_model = (is_model_fn)need_sym("_ZN10CModelInfo11IsBikeModelEi");
   is_boat_model = (is_model_fn)need_sym("_ZN10CModelInfo11IsBoatModelEi");
+  is_heli_model = (is_model_fn)need_sym("_ZN10CModelInfo11IsHeliModelEi");
+  num_model_infos = (const int *)need_sym("_ZN10CModelInfo15msNumModelInfosE");
   is_in_cd_image = (is_model_fn)need_sym("_ZN10CStreaming17IsObjectInCdImageEi");
 
   population_add_ped =
