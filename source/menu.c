@@ -312,9 +312,105 @@ static const menu_place menu_places[] = {
 };
 #define MENU_NUM_PLACES ((int)(sizeof(menu_places) / sizeof(menu_places[0])))
 
-// Resolved the first time the list is opened rather than in menu_init: CText is
-// not loaded that early, so asking at startup would get the fallbacks every time.
+// The game's own zone table, which is the authority on both where a zone is and
+// what it is called. The coordinates above came from reading a CLEO script's
+// data, and teleporting to "Atlantic Quays" put the player in Portland Harbor,
+// so that reading was wrong somewhere -- most likely the mapping from menu entry
+// to coordinate block. Rather than re-guess it, ask the game.
+//
+// gpTheZones is a CTheZones*. CZone is 72 bytes: an 8-byte label at +0, the box
+// minimum at +8/+12/+16 and its maximum at +20/+24/+28, per
+// CTheZones::PointLiesWithinZone.
+#define ZONE_STRIDE 72
+#define ZONE_MIN     8
+#define ZONE_MAX    20
+
+typedef short (*find_zone_label_fn)(void *zones, char *label, int type);
+typedef void *(*get_zone_fn)(void *zones, unsigned short index);
+typedef uint16_t *(*zone_name_fn)(void *zone);
+
+static void **gp_the_zones = NULL;
+static find_zone_label_fn find_zone_by_label = NULL;
+static get_zone_fn get_nav_zone = NULL;
+static get_zone_fn get_info_zone = NULL;
+static get_zone_fn get_map_zone = NULL;
+static zone_name_fn zone_translated_name = NULL;
+
+// Which of the four zone types holds the named zones is not obvious from the
+// disassembly -- the label search branches on type and each type has its own
+// array and accessor -- so all three are tried and the one that answers is
+// logged.
+static const struct { int type; const char *what; } zone_types[] = {
+  { 0, "navigation" }, { 3, "map" }, { 2, "info" },
+};
+#define NUM_ZONE_TYPES ((int)(sizeof(zone_types) / sizeof(zone_types[0])))
+
+static get_zone_fn zone_getter(int type) {
+  switch (type) {
+    case 3:  return get_map_zone;
+    case 2:  return get_info_zone;
+    default: return get_nav_zone;
+  }
+}
+
+// Fills in the centre of the named zone and, where the game has one, its
+// display name. Returns 0 if the game does not know the label.
+static int zone_lookup(const char *key, float *cx, float *cy,
+                       char *name, int name_len) {
+  if (!key || !gp_the_zones || !find_zone_by_label)
+    return 0;
+  void *zones = *gp_the_zones;
+  if (!zones)
+    return 0;
+
+  // The label is copied because the search writes through its argument.
+  char label[16];
+  snprintf(label, sizeof(label), "%s", key);
+
+  for (int t = 0; t < NUM_ZONE_TYPES; t++) {
+    const get_zone_fn get = zone_getter(zone_types[t].type);
+    if (!get)
+      continue;
+
+    const short idx = find_zone_by_label(zones, label, zone_types[t].type);
+    if (idx < 0)
+      continue;
+
+    const uint8_t *z = (const uint8_t *)get(zones, (unsigned short)idx);
+    if (!z)
+      continue;
+
+    const float *mn = (const float *)(z + ZONE_MIN);
+    const float *mx = (const float *)(z + ZONE_MAX);
+    *cx = (mn[0] + mx[0]) * 0.5f;
+    *cy = (mn[1] + mx[1]) * 0.5f;
+
+    // CZone::GetTranslatedName goes through the same CText the HUD uses to
+    // print the zone you are standing in, so it sidesteps our own GXT lookup.
+    if (name && zone_translated_name) {
+      const uint16_t *w = zone_translated_name((void *)z);
+      if (w && w[0]) {
+        int n = 0;
+        for (; w[n] && n < name_len - 1; n++)
+          name[n] = (w[n] < 0x80) ? (char)w[n] : '?';
+        name[n] = 0;
+      }
+    }
+
+    debugPrintf("MENU: zone \"%s\" found as %s zone %d, centre %.1f, %.1f\n",
+                key, zone_types[t].what, (int)idx, *cx, *cy);
+    return 1;
+  }
+
+  debugPrintf("MENU: zone \"%s\" not found in any zone type\n", key);
+  return 0;
+}
+
+// Resolved the first time the list is opened rather than in menu_init: neither
+// the zones nor CText are up that early.
 static char place_label[MENU_NUM_PLACES][40];
+static float place_x[MENU_NUM_PLACES];
+static float place_y[MENU_NUM_PLACES];
 static int places_labelled = 0;
 
 static void menu_label_places(void) {
@@ -322,15 +418,31 @@ static void menu_label_places(void) {
     return;
   places_labelled = 1;
 
-  int named = 0;
+  int from_zone = 0, from_gxt = 0;
   for (int i = 0; i < MENU_NUM_PLACES; i++) {
-    if (gxt_lookup(menu_places[i].key, place_label[i], sizeof(place_label[i])))
-      named++;
-    else
-      snprintf(place_label[i], sizeof(place_label[i]), "%s", menu_places[i].fallback);
+    // Start from the scraped table, then let the game overrule it.
+    place_x[i] = menu_places[i].x;
+    place_y[i] = menu_places[i].y;
+    snprintf(place_label[i], sizeof(place_label[i]), "%s", menu_places[i].fallback);
+
+    char name[40];
+    name[0] = 0;
+    if (zone_lookup(menu_places[i].key, &place_x[i], &place_y[i],
+                    name, sizeof(name))) {
+      from_zone++;
+      if (name[0])
+        snprintf(place_label[i], sizeof(place_label[i]), "%s", name);
+    } else if (gxt_lookup(menu_places[i].key, name, sizeof(name))) {
+      from_gxt++;
+      snprintf(place_label[i], sizeof(place_label[i]), "%s", name);
+    }
   }
-  debugPrintf("MENU: %d/%d place names came from the game's text\n",
-              named, MENU_NUM_PLACES);
+
+  debugPrintf("MENU: %d/%d places located from the game's zones (%d named by GXT)\n",
+              from_zone, MENU_NUM_PLACES, from_gxt);
+  debugPrintf("MENU: CText::msInstance = %p, gpTheZones = %p\n",
+              ctext_instance ? *ctext_instance : NULL,
+              gp_the_zones ? *gp_the_zones : NULL);
 }
 
 // ---- vehicle spawner ----
@@ -359,6 +471,20 @@ static void menu_label_places(void) {
 #define VEH_POS        64    // x,y at +64/+68 and z at +72, per VehicleCheat's
                              // str d1,[x20,#64] / str s0,[x20,#72]
 #define VEH_STATUS     784   // VehicleCheat's str w9(#1),[x20,#784]
+
+// The entity flags word, and the one write that was missing. VehicleCheat does
+//
+//   ldr x10,[x20,#88] / and x10,x10,#0xfffffffffffffe0f / orr x8,x10,#0x40
+//
+// which clears the five-bit field at bit 4 and sets it to 4 -- STATUS_ABANDONED,
+// the status a parked car is meant to have. 82 other places in the binary write
+// this same field, so it is not incidental. Leaving it at whatever the
+// constructor produced is why spawned vehicles stopped appearing: they were
+// built and added to the world, but with a status the engine does not process
+// or draw.
+#define VEH_FLAGS            88
+#define VEH_STATUS_MASK      0x1f0ULL
+#define VEH_STATUS_ABANDONED 0x40ULL
 
 // The player's forward vector is the second matrix row: CPlaceable::SetHeading
 // builds row0 = (cos, sin, 0) and row1 = (-sin, cos, 0), and GTA faces +y.
@@ -857,8 +983,8 @@ static void menu_teleport_to(int idx) {
   // Land on the ground rather than inside it, with enough clearance that the
   // last few inches are a drop.
   float pos[3];
-  pos[0] = menu_places[idx].x;
-  pos[1] = menu_places[idx].y;
+  pos[0] = place_x[idx];
+  pos[1] = place_y[idx];
   pos[2] = find_ground_z(pos[0], pos[1]) + 1.5f;
 
   debugPrintf("MENU: teleport to %s at %.1f, %.1f, %.1f\n",
@@ -919,6 +1045,9 @@ static void menu_spawn_vehicle(int idx) {
   vpos[1] = ppos[1] + fwd[1] * SPAWN_AHEAD;
   vpos[2] = find_ground_z ? find_ground_z(vpos[0], vpos[1]) + 1.0f : ppos[2];
 
+  uint64_t *flags = (uint64_t *)((uintptr_t)veh + VEH_FLAGS);
+  *flags = (*flags & ~VEH_STATUS_MASK) | VEH_STATUS_ABANDONED;
+
   *(int *)((uintptr_t)veh + VEH_STATUS) = 1;
   world_add(veh);
 
@@ -950,9 +1079,20 @@ static void menu_spawn_bodyguards(void) {
 
   for (int i = 0; i < BODYGUARD_COUNT; i++) {
     const int model = choose_gang_occupation(BODYGUARD_GANG);
+    debugPrintf("MENU: bodyguard %d, gang %d -> ped model %d\n",
+                i, BODYGUARD_GANG, model);
     if (model < 0) {
       debugPrintf("MENU: gang %d has no ped model\n", BODYGUARD_GANG);
       break;
+    }
+
+    // AddPed builds the ped straight away, so the model has to be resident
+    // first. Vehicles got this via VehicleCheat's own request/load pair; peds
+    // had nothing, which left AddPed constructing against a model that was
+    // never streamed in -- the crash had happened before the first log line.
+    if (request_model && load_all_models) {
+      request_model(model, 1);
+      load_all_models(0);
     }
 
     float pos[3];
@@ -1143,6 +1283,14 @@ void menu_init(void) {
   ped_teleport = (ped_teleport_fn)need_sym("_ZN4CPed8TeleportE7CVector");
 
   ctext_instance = (void **)need_sym("_ZN5CText10msInstanceE");
+
+  gp_the_zones = (void **)need_sym("gpTheZones");
+  find_zone_by_label =
+      (find_zone_label_fn)need_sym("_ZN9CTheZones29FindZoneByLabelAndReturnIndexEPc9eZoneType");
+  get_nav_zone = (get_zone_fn)need_sym("_ZN9CTheZones17GetNavigationZoneEt");
+  get_info_zone = (get_zone_fn)need_sym("_ZN9CTheZones11GetInfoZoneEt");
+  get_map_zone = (get_zone_fn)need_sym("_ZN9CTheZones10GetMapZoneEt");
+  zone_translated_name = (zone_name_fn)need_sym("_ZN5CZone17GetTranslatedNameEv");
   text_exists = (text_exists_fn)need_sym("_ZN5CText6ExistsEPKc");
   text_get_utf8 = (text_get_utf8_fn)need_sym("_ZN5CText7GetUTF8EPKcPci");
 
