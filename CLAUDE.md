@@ -93,12 +93,20 @@ All derived by disassembling the named function in this build.
 | sprint energy / max | `ped+3116` / `ped+3120` | `CPlayerPed::RestoreSprintEnergy` |
 | `CWanted` | `ped+0x928` | `WantedLevelDownCheat` → `CheatWantedLevel(0)` |
 | weapon array | `ped+1716`, stride 28 | `CPed::SetAmmo` |
+| ped position | `ped+64` (x,y) / `ped+72` (z) | `CPed::Teleport` `str d0,[x20,#64]` |
 | radar blips | `CRadar::ms_RadarTrace`, 75 × 60 | `CRadar::SetTargetBlip` |
 | blip type / pos | `+40` (2=char, 4=coord) / `+12,+16,+20` | ditto + runtime dump |
 
-`FindPlayerPed()` returns the player ped. `CPed::Teleport(CVector)` takes three
-floats: `CVector` is a homogeneous float aggregate, so AAPCS64 passes it in
-`s0/s1/s2` — declare it flattened, not as a struct.
+`FindPlayerPed()` returns the player ped.
+
+**`CVector` is passed by pointer, not in `s0/s1/s2` — do not trust the mangled
+name.** `CPed::Teleport(CVector)` reads `ldr d0,[x1]` / `ldr s2,[x1,#8]`, so the
+argument arrives as an address in `x1` even though the symbol says by-value and a
+three-float aggregate would normally be an HFA. Declaring it flattened made every
+teleport dereference garbage, and cost a long detour hunting the map marker in
+`ms_RadarTrace` — the blip was never the bug. `CPopulation::AddPed`'s
+`RK7CVector` is a pointer too. **Check the disassembly for `ldr` from `x1`
+before assuming any `CVector` argument is in the float registers.**
 
 `HealthCheat` is the only cheat taking a parameter, and that parameter gates the
 game's **own on-screen message** — pass 1 for the native confirmation, 0 to top
@@ -112,7 +120,20 @@ up silently.
 - **Dead cheats exist.** `WallClimbingCheat` etc. flip flags nothing in this
   build reads. `CMenuManager::m_PrefsInvincibility` has **zero readers**.
   Check for readers before exposing something as a feature.
-- **The Rhino does exist in LCS** — `TankCheat` works.
+- **`TankCheat` is not a tank cheat.** It walks a counter over the vehicle model
+  range (130..216, skipping planes) and hands the result to `VehicleCheat`, so it
+  spawns a *different* vehicle each press. It is listed as "Random vehicle".
+  `VehicleCheat(modelId)` is the whole spawner — request, stream, `CBike` for
+  models `0xCA..0xD2` and `CAutomobile` otherwise, nearest path node,
+  `CWorld::Add` — so a deliberate spawner is one call.
+- **Model ids are resolved by name.** `CModelInfo::GetModelInfo(name, &id)`
+  hashes with `CKeyGen::GetUppercaseKey` and searches; the model info stores only
+  the hash, so there is **no name table to enumerate** — not in the binary and
+  not in the wads. A spelled-out name list is unavoidable, so resolve at runtime
+  and drop what does not match rather than trusting it.
+- **Zone names come from the game.** `TheText()` + `CText::Exists` /
+  `CText::GetUTF8(key, buf, len)` resolve GXT keys, so names arrive localised.
+  `CText` is not loaded at `patch_game` time — look them up lazily.
 - Mangled-name length prefixes are easy to miscount (`_Z12WeaponCheat1v`, not
   `_Z11...`). Copy them from the symbol dump rather than typing them.
 
@@ -137,10 +158,13 @@ at an `END_THREAD` stub instead and let the game retire it.
 
 ## Outstanding
 
-- **Vehicle spawner** — `CStreaming::RequestModel` + `LoadAllRequestedModels`,
-  then construct/place the vehicle. `TrashmasterCheat` is a working template.
-- **Bodyguards** — `CPopulation::AddPed(ePedType, model, CVector, int, bool)`
-  spawns them; arming and follow behaviour need the ped task API.
+- **Vehicle name list** — the 64 names in `menu.c` are best-effort; whatever this
+  build does not have is dropped and named in `debug.log`. Read that log and
+  prune or correct the list.
+- **Bodyguard weapon** — `BODYGUARD_WEAPON` is a guessed `eWeaponType` (17). The
+  spawn logs the number it used; adjust once it is clear what they are holding.
+  Ped type is `PEDTYPE_GANG1` (7) with `CPopulation::ChooseGangOccupation(0)`
+  picking the model, and `CPed::SetPlayerToFollow(0)` doing the following.
 - **Strong tyres** — candidate flags are `CVehicle::bCheat3`…`bCheat10`, unnamed.
 - **Flying altitude limit** — *recommended dropped*. In the ARM32 build it is a
   float `80.0` inside `CVehicle::FlyingControl`; our arm64 build has no

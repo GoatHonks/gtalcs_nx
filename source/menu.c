@@ -55,37 +55,57 @@ static set_help_msg_fn hud_set_help_message = NULL;
 static uint8_t *hud_help_forever = NULL;    // CHud::m_HelpMessageDisplayForever
 static uint16_t *hud_help_message = NULL;   // CHud::m_HelpMessage (UTF-16)
 
-// CRadar::ms_RadarTrace: 75 entries of 60 bytes. The layout comes from
-// CRadar::SetTargetBlip (0x35b67c), which walks the array testing the byte at
-// +43 for a free slot and writes the position as three floats at +12/+16/+20.
-#define BLIP_STRIDE 60
-#define BLIP_COUNT  75
-#define BLIP_INUSE  43
-#define BLIP_POS    12
-#define BLIP_KIND   56
-// Byte 40 is the blip type. A marker you place on the map is a coordinate blip
-// (4); the char blip (2) that sits alongside it is a mission contact. Both share
-// every other field, which is why the sprite id at +56 was no use as a test.
-#define BLIP_TYPE   40
-#define BLIP_TYPE_COORD 4
-
-static uint8_t *radar_trace = NULL;
 typedef float (*find_ground_z_fn)(float x, float y);
 static find_ground_z_fn find_ground_z = NULL;
 typedef void *(*find_player_ped_fn)(void);
 static find_player_ped_fn find_player_ped = NULL;
-// CVector is three floats, so AAPCS64 passes it as a homogeneous float aggregate
-// in s0/s1/s2 rather than on the stack -- hence the flattened prototype.
-typedef void (*ped_teleport_fn)(void *ped, float x, float y, float z);
+
+// CPed::Teleport takes its CVector BY POINTER, not in s0/s1/s2.
+//
+// The mangled name says CVector by value, and a three-float aggregate would
+// normally travel in the float registers under AAPCS64 -- but the body is
+//
+//   ldr d0, [x1]  /  ldr s2, [x1, #8]  /  str d0, [x20, #64]
+//
+// so the argument arrives as an address in x1. Passing three floats instead left
+// the callee dereferencing whatever happened to be sitting in x1, which is why
+// teleporting never worked no matter which blip we picked. The blip was never
+// the bug.
+typedef void (*ped_teleport_fn)(void *ped, const float *pos);
 static ped_teleport_fn ped_teleport = NULL;
+
+// That same store says where a ped keeps its position: +64 for x and y, +72 for
+// z -- the translation row of the matrix that begins at +16.
+#define PED_POS 64
+
+// ---- the game's own text ----
+//
+// Zone names are GXT keys, so rather than shipping a guessed English list the
+// menu asks the game for them and falls back only where a key is missing. As a
+// side effect the names arrive in whatever language the game is set to.
+typedef void *(*the_text_fn)(void);
+typedef char (*text_exists_fn)(void *self, const char *key);
+typedef void *(*text_get_utf8_fn)(void *self, const char *key, char *out, int len);
+static the_text_fn the_text = NULL;
+static text_exists_fn text_exists = NULL;
+static text_get_utf8_fn text_get_utf8 = NULL;
+
+// Fills `out` from the GXT key, or leaves it untouched and returns 0.
+static int gxt_lookup(const char *key, char *out, int len) {
+  if (!key || !the_text || !text_exists || !text_get_utf8)
+    return 0;
+  void *t = the_text();
+  if (!t || !text_exists(t, key))
+    return 0;
+  out[0] = 0;
+  text_get_utf8(t, key, out, len);
+  return out[0] != 0;
+}
 
 // ---- cheats ----
 // Called straight through by symbol. Cheats whose flags nothing in this build
 // reads (WallClimbingCheat just eors a byte) are left out rather than listed as
 // something that looks like it works.
-//
-// TankCheat stays: LCS does have a tank (the Rhino), so it does exactly what its
-// name says.
 typedef struct {
   const char *name;
   const char *sym;
@@ -113,7 +133,13 @@ static menu_cheat menu_cheats[] = {
   { "Faster time",      "_Z13FastTimeCheatv",          NULL, 0 },
   { "Slower time",      "_Z13SlowTimeCheatv",          NULL, 0 },
   { "Faster weather",   "_Z16FastWeatherCheatv",       NULL, 0 },
-  { "Spawn tank",       "_Z9TankCheatv",               NULL, 0 },
+  // TankCheat is not "spawn a tank". It walks a counter over the whole vehicle
+  // model range (130..216) and hands whatever it lands on to VehicleCheat, so it
+  // spawns a different vehicle every time -- which is exactly the random cars
+  // that showed up. Spawn vehicle below is the same VehicleCheat call with the
+  // model chosen deliberately; this entry stays, honestly named, because the
+  // cycling is the game's own cheat.
+  { "Random vehicle",   "_Z9TankCheatv",               NULL, 0 },
   { "Trashmaster",      "_Z16TrashmasterCheatv",       NULL, 0 },
   { "Chromed cars",     "_Z14GlassCarsCheatv",         NULL, 0 },
   { "Black cars",       "_Z14BlackCarsCheatv",         NULL, 0 },
@@ -182,22 +208,19 @@ static int menu_toggle_on[MENU_NUM_TOGGLES];
 
 // Runs every frame while the game is live, menu open or not.
 static void menu_apply_toggles(void) {
-  if (menu_toggle_on[MENU_TOG_NEVER_TIRED] && find_player_ped) {
-    void *ped = find_player_ped();
-    if (ped) {
-      float *energy = (float *)((uintptr_t)ped + PED_SPRINT_ENERGY);
-      const float *max = (const float *)((uintptr_t)ped + PED_SPRINT_MAX);
-      if (*energy < *max)
-        *energy = *max;
-    }
-  }
-
   if (!find_player_ped)
     return;
 
   void *ped = find_player_ped();
   if (!ped)
     return;
+
+  if (menu_toggle_on[MENU_TOG_NEVER_TIRED]) {
+    float *energy = (float *)((uintptr_t)ped + PED_SPRINT_ENERGY);
+    const float *max = (const float *)((uintptr_t)ped + PED_SPRINT_MAX);
+    if (*energy < *max)
+      *energy = *max;
+  }
 
   float *health = (float *)((uintptr_t)ped + PED_HEALTH);
   float *armour = (float *)((uintptr_t)ped + PED_ARMOUR);
@@ -232,19 +255,243 @@ static void menu_apply_toggles(void) {
   }
 }
 
+// ---- teleport ----
+//
+// Fixed destinations rather than the map marker. Hunting the marker down in
+// ms_RadarTrace was never the problem -- CPed::Teleport's calling convention
+// was -- but a named list is more useful than a marker anyway: it works with the
+// map closed and needs no setup.
+//
+// The destinations are the game's own map zones. gtalcs.teleport.csi carried
+// each zone as a pair of opposing corners and teleported to the centre of the
+// box, snapped to the ground; these are those boxes reduced to their centres.
+// Names are GXT keys wherever the zone has one, so they come out of the game
+// already localised, and `fallback` only shows if a key is missing.
+typedef struct {
+  const char *key;        // GXT key, or NULL for places the game does not name
+  const char *fallback;
+  float x, y;
+} menu_place;
+
+// Roughly south to north, so walking the list walks the city.
+static const menu_place menu_places[] = {
+  { "PORT_W",   "Portland Harbor",         908.68f, -1068.47f },
+  { "PORT_S",   "Callahan Point",         1283.88f, -1160.74f },
+  { "PORT_E",   "Atlantic Quays",         1589.68f,  -841.65f },
+  { "PORT_I",   "Trenton",                1214.63f,  -905.95f },
+  { "S_VIEW",   "Portland View",          1214.85f,  -627.31f },
+  { "CHINA",    "Chinatown",               905.42f,  -685.99f },
+  { "REDLIGH",  "Red Light District",      905.38f,  -373.12f },
+  { "TOWERS",   "Hepburn Heights",         905.42f,  -180.58f },
+  { "LITTLEI",  "Saint Marks",            1227.40f,  -295.32f },
+  { "HARWOOD",  "Harwood",                1067.48f,   122.25f },
+  { "EASTBAY",  "Portland Beach",         1593.48f,  -206.92f },
+  { "IND_ZON",  "Portland",               1259.91f,  -447.80f },
+  { NULL,       "Portland police",        1159.08f,  -663.02f },
+  { NULL,       "Portland hospital",      1159.09f,  -565.57f },
+  { NULL,       "Markos bistro",          1376.47f,  -562.94f },
+  { "ROADBR2",  "Callahan Bridge",         529.82f,  -933.30f },
+  { "CONSTRU",  "Fort Staunton",           427.10f,  -236.62f },
+  { "STADIUM",  "Aspatria",                -54.76f,  -126.05f },
+  { "YAKUSA",   "Torrington",              388.77f, -1366.18f },
+  { "SHOPING",  "Bedford Point",           -12.44f, -1338.25f },
+  { "COM_EAS",  "Newport",                 407.61f,  -735.69f },
+  { "PARK",     "Belleville Park",          38.85f,  -708.07f },
+  { "UNIVERS",  "Liberty Campus",          178.27f,  -236.62f },
+  { "HOSPI_2",  "Rockford",                366.24f,   103.89f },
+  { "BIG_DAM",  "Cochrane Dam",          -1131.01f,   398.99f },
+  { "AIRPORT",  "Francis Intl Airport",  -1050.80f,  -806.58f },
+  { "PROJECT",  "Wichita Gardens",        -591.44f,   -87.67f },
+  { "SWANKS",   "Cedar Grove",            -567.07f,   371.72f },
+  { "SUB_IND",  "Pike Creek",            -1109.94f,   -87.61f },
+};
+#define MENU_NUM_PLACES ((int)(sizeof(menu_places) / sizeof(menu_places[0])))
+
+// Resolved the first time the list is opened rather than in menu_init: CText is
+// not loaded that early, so asking at startup would get the fallbacks every time.
+static char place_label[MENU_NUM_PLACES][40];
+static int places_labelled = 0;
+
+static void menu_label_places(void) {
+  if (places_labelled)
+    return;
+  places_labelled = 1;
+
+  int named = 0;
+  for (int i = 0; i < MENU_NUM_PLACES; i++) {
+    if (gxt_lookup(menu_places[i].key, place_label[i], sizeof(place_label[i])))
+      named++;
+    else
+      snprintf(place_label[i], sizeof(place_label[i]), "%s", menu_places[i].fallback);
+  }
+  debugPrintf("MENU: %d/%d place names came from the game's text\n",
+              named, MENU_NUM_PLACES);
+}
+
+// ---- vehicle spawner ----
+//
+// VehicleCheat(modelId) is the entire spawner: it requests the model, waits for
+// the stream, builds a CBike for models 0xCA..0xD2 and a CAutomobile otherwise,
+// drops it on the nearest path node to the player and calls CWorld::Add. It is
+// what TankCheat calls once it has picked a model, so this is the game's own
+// code path with the guesswork removed.
+typedef void (*vehicle_cheat_fn)(int model_id);
+static vehicle_cheat_fn vehicle_cheat = NULL;
+
+// Model ids are per-build, so the menu resolves them by name:
+// CModelInfo::GetModelInfo hashes the name and searches, writing the id out.
+// LCS keeps only those hashes -- there is no name table to enumerate, which is
+// why this list is the one place a name has to be spelled out. Anything that
+// does not resolve is dropped and logged rather than left in the menu doing
+// nothing when picked.
+typedef void *(*get_model_info_fn)(const char *name, int *id_out);
+static get_model_info_fn get_model_info = NULL;
+
+typedef struct {
+  const char *label;
+  const char *model;
+  int id;
+} menu_vehicle;
+
+static menu_vehicle menu_vehicles[] = {
+  { "Banshee",          "banshee",   -1 },
+  { "Cheetah",          "cheetah",   -1 },
+  { "Infernus",         "infernus",  -1 },
+  { "Stinger",          "stinger",   -1 },
+  { "Phobos VT",        "phobos",    -1 },
+  { "Deimos SP",        "deimos",    -1 },
+  { "Hellenbach GT",    "hellenbach",-1 },
+  { "Sindacco Argento", "sindacco",  -1 },
+  { "Forelli Exsess",   "forelli",   -1 },
+  { "Landstalker",      "landstal",  -1 },
+  { "Patriot",          "patriot",   -1 },
+  { "Sentinel",         "sentinel",  -1 },
+  { "Stallion",         "stallion",  -1 },
+  { "Esperanto",        "esperant",  -1 },
+  { "Idaho",            "idaho",     -1 },
+  { "Manana",           "manana",    -1 },
+  { "Kuruma",           "kuruma",    -1 },
+  { "Perennial",        "peren",     -1 },
+  { "Blista",           "blista",    -1 },
+  { "Bobcat",           "bobcat",    -1 },
+  { "Moonbeam",         "moonbeam",  -1 },
+  { "Stretch",          "stretch",   -1 },
+  { "Taxi",             "taxi",      -1 },
+  { "Cabbie",           "cabbie",    -1 },
+  { "Borgnine Taxi",    "borgnine",  -1 },
+  { "Police car",       "police",    -1 },
+  { "Enforcer",         "enforcer",  -1 },
+  { "FBI car",          "fbicar",    -1 },
+  { "Rhino",            "rhino",     -1 },
+  { "Barracks OL",      "barracks",  -1 },
+  { "Ambulance",        "ambulan",   -1 },
+  { "Fire truck",       "firetruk",  -1 },
+  { "Securicar",        "securica",  -1 },
+  { "Trashmaster",      "trash",     -1 },
+  { "Linerunner",       "linerun",   -1 },
+  { "Flatbed",          "flatbed",   -1 },
+  { "Mule",             "mule",      -1 },
+  { "Yankee",           "yankee",    -1 },
+  { "Pony",             "pony",      -1 },
+  { "Rumpo",            "rumpo",     -1 },
+  { "Bus",              "bus",       -1 },
+  { "Coach",            "coach",     -1 },
+  { "Mr Whoopee",       "mrwhoop",   -1 },
+  { "BF Injection",     "bfinject",  -1 },
+  { "Campervan",        "campvan",   -1 },
+  { "Toyz van",         "toyz",      -1 },
+  { "Romeros Hearse",   "hearse",    -1 },
+  { "Mafia Sentinel",   "mafia",     -1 },
+  { "Yardie Lobo",      "yardie",    -1 },
+  { "Yakuza Stinger",   "yakuza",    -1 },
+  { "Diablo Stallion",  "diablo",    -1 },
+  { "Cartel Cruiser",   "columb",    -1 },
+  { "Hoods Rumpo",      "hoods",     -1 },
+  { "PCJ-600",          "pcj600",    -1 },
+  { "Freeway",          "freeway",   -1 },
+  { "Sanchez",          "sanchez",   -1 },
+  { "Faggio",           "faggio",    -1 },
+  { "Angel",            "angel",     -1 },
+  { "Wintergreen",      "wintrgrn",  -1 },
+  { "Pizza Boy",        "pizzaboy",  -1 },
+  { "Noodle Boy",       "noodleboy", -1 },
+  { "Predator",         "predator",  -1 },
+  { "Speeder",          "speeder",   -1 },
+  { "Reefer",           "reefer",    -1 },
+};
+#define MENU_NUM_VEHICLES ((int)(sizeof(menu_vehicles) / sizeof(menu_vehicles[0])))
+
+static int vehicles_ready = 0;
+
+// Model ids only exist once the model info table has been built, which is long
+// after patch_game, so this runs the first time the menu is opened in-game.
+static void menu_resolve_vehicles(void) {
+  static int done = 0;
+  if (done || !get_model_info)
+    return;
+  done = 1;
+
+  int kept = 0;
+  for (int i = 0; i < MENU_NUM_VEHICLES; i++) {
+    int id = -1;
+    if (!get_model_info(menu_vehicles[i].model, &id) || id < 0) {
+      debugPrintf("MENU: vehicle \"%s\" (%s) not in this build, dropped\n",
+                  menu_vehicles[i].label, menu_vehicles[i].model);
+      continue;
+    }
+    menu_vehicles[kept] = menu_vehicles[i];
+    menu_vehicles[kept].id = id;
+    kept++;
+  }
+  vehicles_ready = kept;
+  debugPrintf("MENU: %d/%d vehicles resolved\n", kept, MENU_NUM_VEHICLES);
+}
+
+// ---- bodyguards ----
+//
+// CPopulation::AddPed takes its CVector by reference (RK7CVector in the mangled
+// name), so unlike CPed::Teleport this one genuinely does want a pointer.
+// ChooseGangOccupation picks a member model for a gang, so no ped model ids are
+// hardcoded here either.
+typedef void *(*add_ped_fn)(int ped_type, unsigned model, const float *pos,
+                           int a, int b);
+static add_ped_fn population_add_ped = NULL;
+typedef int (*choose_gang_fn)(int gang);
+static choose_gang_fn choose_gang_occupation = NULL;
+// CPed::SetPlayerToFollow(int) is the follow-the-player primitive: it stores the
+// player index at +473 and moves the ped into the follow state at +988.
+typedef void (*set_player_to_follow_fn)(void *ped, int player);
+static set_player_to_follow_fn ped_set_player_to_follow = NULL;
+typedef void (*give_weapon_fn)(void *ped, int weapon, unsigned ammo, int select);
+static give_weapon_fn ped_give_weapon = NULL;
+typedef void (*set_current_weapon_fn)(void *ped, int weapon);
+static set_current_weapon_fn ped_set_current_weapon = NULL;
+
+#define PEDTYPE_GANG1     7
+#define BODYGUARD_GANG    0
+#define BODYGUARD_COUNT   4
+// eWeaponType is not exported as anything readable, so the weapon they carry is
+// logged on spawn rather than asserted -- if this turns out to be the wrong one
+// the log says which number to change.
+#define BODYGUARD_WEAPON  17
+
 // ---- menu state ----
 #define MENU_ROWS 8
 
 typedef enum {
   MENU_ACT_CHEATS = 0,
   MENU_ACT_TELEPORT,
+  MENU_ACT_VEHICLE,
+  MENU_ACT_BODYGUARDS,
   MENU_ACT_CLEAR_WANTED,
   MENU_NUM_ACTIONS
 } menu_action;
 
 static const char *const menu_action_name[MENU_NUM_ACTIONS] = {
   "Cheats",
-  "Teleport to marker",
+  "Teleport",
+  "Spawn vehicle",
+  "Spawn bodyguards",
   "Clear wanted level",
 };
 
@@ -257,9 +504,44 @@ static int menu_cursor = 0;
 static int menu_dirty = 0;
 static u64  menu_pad_prev = 0;
 
-// The cheats list, shown as a second level.
-static int sub_open = 0;
+// The second level. One piece of state covers all three lists rather than a flag
+// per list, so adding a fourth is a table entry instead of another branch.
+typedef enum {
+  SUB_NONE = 0,
+  SUB_CHEATS,
+  SUB_TELEPORT,
+  SUB_VEHICLES
+} menu_sub;
+
+static menu_sub sub_kind = SUB_NONE;
 static int sub_cursor = 0;
+
+static int sub_count(void) {
+  switch (sub_kind) {
+    case SUB_CHEATS:   return cheats_ready;
+    case SUB_TELEPORT: return MENU_NUM_PLACES;
+    case SUB_VEHICLES: return vehicles_ready;
+    default:           return 0;
+  }
+}
+
+static const char *sub_title(void) {
+  switch (sub_kind) {
+    case SUB_CHEATS:   return "CHEATS";
+    case SUB_TELEPORT: return "TELEPORT";
+    case SUB_VEHICLES: return "SPAWN VEHICLE";
+    default:           return "";
+  }
+}
+
+static const char *sub_label(int i) {
+  switch (sub_kind) {
+    case SUB_CHEATS:   return menu_cheats[i].name;
+    case SUB_TELEPORT: return place_label[i];
+    case SUB_VEHICLES: return menu_vehicles[i].label;
+    default:           return "";
+  }
+}
 
 // A short confirmation after an action, the way the game acknowledges its own
 // cheat codes. Queued, because closing the menu wipes the help box on its way out.
@@ -295,19 +577,20 @@ static void menu_render(void) {
   char line[512];
   int n = 0;
 
-  if (sub_open) {
-    n += snprintf(line + n, sizeof(line) - n, "CHEATS");
+  if (sub_kind != SUB_NONE) {
+    const int count = sub_count();
+    n += snprintf(line + n, sizeof(line) - n, "%s", sub_title());
 
     int first = sub_cursor - MENU_ROWS / 2;
-    if (first > cheats_ready - MENU_ROWS)
-      first = cheats_ready - MENU_ROWS;
+    if (first > count - MENU_ROWS)
+      first = count - MENU_ROWS;
     if (first < 0)
       first = 0;
 
-    for (int i = first; i < cheats_ready && i < first + MENU_ROWS; i++) {
+    for (int i = first; i < count && i < first + MENU_ROWS; i++) {
       n += snprintf(line + n, sizeof(line) - n, "~n~%c %s",
-                    i == sub_cursor ? '>' : ' ', menu_cheats[i].name);
-      if (n >= (int)sizeof(line) - 40)
+                    i == sub_cursor ? '>' : ' ', sub_label(i));
+      if (n >= (int)sizeof(line) - 48)
         break;
     }
   } else {
@@ -334,7 +617,7 @@ static void menu_render(void) {
 
 static void menu_close(void) {
   menu_open = 0;
-  sub_open = 0;
+  sub_kind = SUB_NONE;
   g_menu_open = 0;
   *hud_help_forever = 0;
   menu_wide[0] = 0;
@@ -345,6 +628,14 @@ static void menu_close(void) {
     toast_pending = 0;
     menu_push(toast);
   }
+}
+
+static void menu_sub_enter(menu_sub kind) {
+  if (kind == SUB_TELEPORT)
+    menu_label_places();
+  sub_kind = kind;
+  sub_cursor = 0;
+  menu_dirty = 1;
 }
 
 // ---- actions ----
@@ -364,51 +655,11 @@ static void menu_run_cheat(int idx) {
   toast_pending = 1;
 }
 
-static int menu_teleport_ready(void) {
-  return radar_trace && find_ground_z && find_player_ped && ped_teleport;
-}
-
-// The map marker is somewhere in ms_RadarTrace, but which field identifies it is
-// still unconfirmed -- the stamp SetTargetBlip writes (49 at +56) never shows up
-// on a real marker, so the live entries are dumped here to work it out.
-static int menu_find_marker(float *out_x, float *out_y) {
-  int found = 0;
-  for (int i = 0; i < BLIP_COUNT; i++) {
-    const uint8_t *b = radar_trace + (size_t)i * BLIP_STRIDE;
-    if (!b[BLIP_INUSE])
-      continue;
-
-    const uint16_t kind = *(const uint16_t *)(b + BLIP_KIND);
-    const float x = *(const float *)(b + BLIP_POS);
-    const float y = *(const float *)(b + BLIP_POS + 4);
-
-    debugPrintf("MENU: blip %d kind=%u use=%u at %.1f, %.1f | "
-                "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                i, (unsigned)kind, (unsigned)b[BLIP_INUSE], x, y,
-                b[40], b[41], b[42], b[43], b[44], b[45], b[46], b[47],
-                b[48], b[49], b[50], b[51], b[52], b[53], b[54], b[55]);
-
-    if (b[BLIP_TYPE] == BLIP_TYPE_COORD) {
-      // Take the last coordinate blip rather than the first: a mission can own
-      // one too, and the marker you just placed is the more recent.
-      *out_x = x;
-      *out_y = y;
-      found = 1;
-    }
-  }
-  return found;
-}
-
-static void menu_teleport_to_marker(void) {
-  if (!menu_teleport_ready()) {
-    snprintf(toast, sizeof(toast), "Teleport unavailable");
-    toast_pending = 1;
+static void menu_teleport_to(int idx) {
+  if (idx < 0 || idx >= MENU_NUM_PLACES)
     return;
-  }
-
-  float x = 0.0f, y = 0.0f;
-  if (!menu_find_marker(&x, &y)) {
-    snprintf(toast, sizeof(toast), "Place a marker on the map first");
+  if (!find_ground_z || !find_player_ped || !ped_teleport) {
+    snprintf(toast, sizeof(toast), "Teleport unavailable");
     toast_pending = 1;
     return;
   }
@@ -417,12 +668,86 @@ static void menu_teleport_to_marker(void) {
   if (!ped)
     return;
 
-  // Land on the ground rather than inside it, with a little clearance.
-  const float z = find_ground_z(x, y) + 1.5f;
-  debugPrintf("MENU: teleporting to marker %.1f, %.1f, %.1f\n", x, y, z);
-  ped_teleport(ped, x, y, z);
+  // Land on the ground rather than inside it, with enough clearance that the
+  // last few inches are a drop.
+  float pos[3];
+  pos[0] = menu_places[idx].x;
+  pos[1] = menu_places[idx].y;
+  pos[2] = find_ground_z(pos[0], pos[1]) + 1.5f;
 
-  snprintf(toast, sizeof(toast), "Teleported to marker");
+  debugPrintf("MENU: teleport to %s at %.1f, %.1f, %.1f\n",
+              place_label[idx], pos[0], pos[1], pos[2]);
+  ped_teleport(ped, pos);
+
+  snprintf(toast, sizeof(toast), "Teleported to %s", place_label[idx]);
+  toast_pending = 1;
+}
+
+static void menu_spawn_vehicle(int idx) {
+  if (idx < 0 || idx >= vehicles_ready || !vehicle_cheat)
+    return;
+
+  debugPrintf("MENU: spawn %s (model %d)\n",
+              menu_vehicles[idx].label, menu_vehicles[idx].id);
+  vehicle_cheat(menu_vehicles[idx].id);
+
+  snprintf(toast, sizeof(toast), "%s spawned", menu_vehicles[idx].label);
+  toast_pending = 1;
+}
+
+static void menu_spawn_bodyguards(void) {
+  if (!population_add_ped || !choose_gang_occupation || !find_player_ped ||
+      !ped_set_player_to_follow) {
+    snprintf(toast, sizeof(toast), "Bodyguards unavailable");
+    toast_pending = 1;
+    return;
+  }
+
+  void *ped = find_player_ped();
+  if (!ped)
+    return;
+
+  // Spread them around the player rather than stacking four peds on one spot.
+  static const float dx[BODYGUARD_COUNT] = { 2.0f, -2.0f,  2.0f, -2.0f };
+  static const float dy[BODYGUARD_COUNT] = { 2.0f,  2.0f, -2.0f, -2.0f };
+
+  const float *ppos = (const float *)((uintptr_t)ped + PED_POS);
+  int spawned = 0;
+
+  for (int i = 0; i < BODYGUARD_COUNT; i++) {
+    const int model = choose_gang_occupation(BODYGUARD_GANG);
+    if (model < 0) {
+      debugPrintf("MENU: gang %d has no ped model\n", BODYGUARD_GANG);
+      break;
+    }
+
+    float pos[3];
+    pos[0] = ppos[0] + dx[i];
+    pos[1] = ppos[1] + dy[i];
+    pos[2] = find_ground_z ? find_ground_z(pos[0], pos[1]) + 1.0f : ppos[2];
+
+    void *guard = population_add_ped(PEDTYPE_GANG1 + BODYGUARD_GANG,
+                                     (unsigned)model, pos, 0, 0);
+    if (!guard) {
+      debugPrintf("MENU: AddPed(model %d) returned NULL\n", model);
+      continue;
+    }
+
+    ped_set_player_to_follow(guard, 0);
+    if (ped_give_weapon)
+      ped_give_weapon(guard, BODYGUARD_WEAPON, AMMO_TOPUP, 1);
+    if (ped_set_current_weapon)
+      ped_set_current_weapon(guard, BODYGUARD_WEAPON);
+
+    debugPrintf("MENU: bodyguard %d model %d weapon %d at %.1f, %.1f, %.1f\n",
+                i, model, BODYGUARD_WEAPON, pos[0], pos[1], pos[2]);
+    spawned++;
+  }
+
+  if (spawned)
+    snprintf(toast, sizeof(toast), "%d bodyguards spawned", spawned);
+  else
+    snprintf(toast, sizeof(toast), "Could not spawn bodyguards");
   toast_pending = 1;
 }
 
@@ -438,8 +763,13 @@ static void menu_clear_wanted(void) {
 }
 
 static void menu_activate(void) {
-  if (sub_open) {
-    menu_run_cheat(sub_cursor);
+  if (sub_kind != SUB_NONE) {
+    switch (sub_kind) {
+      case SUB_CHEATS:   menu_run_cheat(sub_cursor);    break;
+      case SUB_TELEPORT: menu_teleport_to(sub_cursor);  break;
+      case SUB_VEHICLES: menu_spawn_vehicle(sub_cursor); break;
+      default: break;
+    }
     menu_close();
     return;
   }
@@ -457,14 +787,18 @@ static void menu_activate(void) {
 
   switch (menu_cursor) {
     case MENU_ACT_CHEATS:
-      if (cheats_ready) {
-        sub_open = 1;
-        sub_cursor = 0;
-        menu_dirty = 1;
-      }
+      if (cheats_ready)
+        menu_sub_enter(SUB_CHEATS);
       break;
     case MENU_ACT_TELEPORT:
-      menu_teleport_to_marker();
+      menu_sub_enter(SUB_TELEPORT);
+      break;
+    case MENU_ACT_VEHICLE:
+      if (vehicles_ready)
+        menu_sub_enter(SUB_VEHICLES);
+      break;
+    case MENU_ACT_BODYGUARDS:
+      menu_spawn_bodyguards();
       menu_close();
       break;
     case MENU_ACT_CLEAR_WANTED:
@@ -502,18 +836,19 @@ void menu_tick(int in_game) {
 
   if (!menu_open) {
     if (pressed & HidNpadButton_Minus) {
+      menu_resolve_vehicles();
       menu_open = 1;
       g_menu_open = 1;
       menu_cursor = 0;
-      sub_open = 0;
+      sub_kind = SUB_NONE;
       menu_dirty = 1;
     }
     return;
   }
 
   if (pressed & (HidNpadButton_B | HidNpadButton_Minus)) {
-    if (sub_open) {
-      sub_open = 0;      // back out to the top level rather than closing outright
+    if (sub_kind != SUB_NONE) {
+      sub_kind = SUB_NONE;   // back out to the top level rather than closing outright
       menu_dirty = 1;
     } else {
       menu_close();
@@ -521,22 +856,24 @@ void menu_tick(int in_game) {
     return;
   }
 
-  const int count = sub_open ? cheats_ready : MENU_TOP_ROWS;
-  int *cursor = sub_open ? &sub_cursor : &menu_cursor;
+  const int count = sub_kind != SUB_NONE ? sub_count() : MENU_TOP_ROWS;
+  int *cursor = sub_kind != SUB_NONE ? &sub_cursor : &menu_cursor;
+  if (count <= 0)
+    return;
 
   // The section header is a label, so the cursor steps over it.
   if (pressed & HidNpadButton_Up) {
     do {
       if (--*cursor < 0)
         *cursor = count - 1;
-    } while (!sub_open && *cursor == MENU_HDR_ROW);
+    } while (sub_kind == SUB_NONE && *cursor == MENU_HDR_ROW);
     menu_dirty = 1;
   }
   if (pressed & HidNpadButton_Down) {
     do {
       if (++*cursor >= count)
         *cursor = 0;
-    } while (!sub_open && *cursor == MENU_HDR_ROW);
+    } while (sub_kind == SUB_NONE && *cursor == MENU_HDR_ROW);
     menu_dirty = 1;
   }
   if (pressed & HidNpadButton_A)
@@ -565,12 +902,28 @@ void menu_init(void) {
   hud_help_forever = (uint8_t *)need_sym("_ZN4CHud27m_HelpMessageDisplayForeverE");
   hud_help_message = (uint16_t *)need_sym("_ZN4CHud13m_HelpMessageE");
 
-  radar_trace = (uint8_t *)need_sym("_ZN6CRadar13ms_RadarTraceE");
   ped_set_ammo = (set_ammo_fn)need_sym("_ZN4CPed7SetAmmoE11eWeaponTypej");
   cheat_wanted_level = (cheat_wanted_fn)need_sym("_ZN7CWanted16CheatWantedLevelEi");
   find_ground_z = (find_ground_z_fn)need_sym("_ZN6CWorld19FindGroundZForCoordEff");
   find_player_ped = (find_player_ped_fn)need_sym("_Z13FindPlayerPedv");
   ped_teleport = (ped_teleport_fn)need_sym("_ZN4CPed8TeleportE7CVector");
+
+  the_text = (the_text_fn)need_sym("_Z7TheTextv");
+  text_exists = (text_exists_fn)need_sym("_ZN5CText6ExistsEPKc");
+  text_get_utf8 = (text_get_utf8_fn)need_sym("_ZN5CText7GetUTF8EPKcPci");
+
+  vehicle_cheat = (vehicle_cheat_fn)need_sym("_Z12VehicleCheati");
+  get_model_info = (get_model_info_fn)need_sym("_ZN10CModelInfo12GetModelInfoEPKcPi");
+
+  population_add_ped =
+      (add_ped_fn)need_sym("_ZN11CPopulation6AddPedE8ePedTypejRK7CVectorib");
+  choose_gang_occupation =
+      (choose_gang_fn)need_sym("_ZN11CPopulation20ChooseGangOccupationEi");
+  ped_set_player_to_follow =
+      (set_player_to_follow_fn)need_sym("_ZN4CPed17SetPlayerToFollowEi");
+  ped_give_weapon = (give_weapon_fn)need_sym("_ZN4CPed10GiveWeaponE11eWeaponTypejb");
+  ped_set_current_weapon =
+      (set_current_weapon_fn)need_sym("_ZN4CPed16SetCurrentWeaponE11eWeaponType");
 
   int kept = 0;
   for (int i = 0; i < MENU_NUM_CHEATS; i++) {
@@ -585,6 +938,5 @@ void menu_init(void) {
   }
   cheats_ready = kept;
 
-  debugPrintf("MENU: Liberty Menu ready (%d/%d cheats, teleport %s)\n",
-              kept, MENU_NUM_CHEATS, menu_teleport_ready() ? "ok" : "unavailable");
+  debugPrintf("MENU: Liberty Menu ready (%d/%d cheats)\n", kept, MENU_NUM_CHEATS);
 }
