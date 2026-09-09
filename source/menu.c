@@ -338,6 +338,50 @@ static const menu_place menu_places[] = {
 #define ZONE_MIN     8
 #define ZONE_MAX    20
 
+// Landing on the road rather than on the geometry directly under the zone's
+// centre. FindGroundZForCoord returns whatever surface is highest at that x/y,
+// so a zone whose middle happens to be a building -- Saint Mark's, for one --
+// put the player on its roof.
+//
+// The path network has no such problem: every node is a road. VehicleCheat uses
+// the same call to place a car, and reads the node back the same way -- node
+// records are 20 bytes with x, y and z as int16 at +4, +6 and +8, each an eighth
+// of a world unit (its scvtf is followed by fmul by 0.125).
+#define PATHNODE_STRIDE 20
+#define PATHNODE_X       4
+#define PATHNODE_SCALE   0.125f
+#define PATHNODE_SEARCH  200.0f
+
+typedef int (*find_node_fn)(void *paths, const float *coors, unsigned char type,
+                            float dist, int a, int b, int c, int d);
+static void **gp_the_paths = NULL;
+static find_node_fn find_node_closest = NULL;
+
+// Puts the nearest road position to x/y in `out`, or returns 0.
+static int road_near(float x, float y, float z, float *out) {
+  if (!gp_the_paths || !find_node_closest)
+    return 0;
+  void *paths = *gp_the_paths;
+  if (!paths)
+    return 0;
+
+  const float coors[3] = { x, y, z };
+  const int idx = find_node_closest(paths, coors, 0, PATHNODE_SEARCH, 0, 0, 0, 0);
+  if (idx < 0)
+    return 0;
+
+  const uint8_t *nodes = *(const uint8_t **)paths;
+  if (!nodes)
+    return 0;
+
+  const int16_t *p =
+      (const int16_t *)(nodes + (size_t)idx * PATHNODE_STRIDE + PATHNODE_X);
+  out[0] = p[0] * PATHNODE_SCALE;
+  out[1] = p[1] * PATHNODE_SCALE;
+  out[2] = p[2] * PATHNODE_SCALE;
+  return 1;
+}
+
 typedef short (*find_zone_label_fn)(void *zones, char *label, int type);
 typedef void *(*get_zone_fn)(void *zones, unsigned short index);
 typedef uint16_t *(*zone_name_fn)(void *zone);
@@ -576,6 +620,31 @@ static int veh_classify(int id) {
 
 static void ***ms_model_info_ptrs = NULL;
 
+// The six the game has no name for. They are all helicopters -- identified from
+// screenshots of each one spawned -- but their model info types them as cars, so
+// they are built as CAutomobile and sit there rather than flying. Models 198 and
+// 199 are the two the game types as helicopters, and those do fly.
+//
+// Labelling them by model number ("Car 213") was worse than useless: it said
+// car, and it was a Hunter.
+static const struct { int id; const char *name; } veh_extra_names[] = {
+  { 211, "Small heli 211" },     // a small unmarked light helicopter
+  { 212, "Small heli 212" },     // identical to 211
+  { 213, "Hunter" },             // olive attack helicopter, rockets and minigun
+  { 214, "Maverick" },           // civilian, cream with a blue stripe
+  { 215, "Police Maverick" },    // LCPD markings, tail number P619PD
+  { 216, "News Maverick" },      // white and blue; streams the vcnmav textures
+};
+#define NUM_VEH_EXTRA_NAMES \
+  ((int)(sizeof(veh_extra_names) / sizeof(veh_extra_names[0])))
+
+static const char *veh_extra_name(int id) {
+  for (int i = 0; i < NUM_VEH_EXTRA_NAMES; i++)
+    if (veh_extra_names[i].id == id)
+      return veh_extra_names[i].name;
+  return NULL;
+}
+
 // Writes the game's display name for a model, or returns 0.
 static int vehicle_game_name(int id, char *out, int len) {
   if (!ms_model_info_ptrs || !num_model_infos)
@@ -638,8 +707,11 @@ static void menu_resolve_vehicles(void) {
       continue;
 
     char label[28];
+    const char *extra = veh_extra_name(id);
     if (vehicle_game_name(id, label, sizeof(label)))
       named++;
+    else if (extra)
+      snprintf(label, sizeof(label), "%s", extra);
     else
       snprintf(label, sizeof(label), "%s %d", veh_kind_name[kind], id);
 
@@ -894,15 +966,23 @@ static void menu_teleport_to(int idx) {
   if (!ped)
     return;
 
-  // Land on the ground rather than inside it, with enough clearance that the
-  // last few inches are a drop.
+  // Aim for the nearest road rather than the zone's exact centre, which can be
+  // the middle of a building. Falling back on the ground height keeps the entry
+  // usable for anywhere the path network does not reach.
   float pos[3];
-  pos[0] = place_x[idx];
-  pos[1] = place_y[idx];
-  pos[2] = find_ground_z(pos[0], pos[1]) + 1.5f;
+  const char *how;
+  if (road_near(place_x[idx], place_y[idx], 0.0f, pos)) {
+    pos[2] += 1.5f;
+    how = "road";
+  } else {
+    pos[0] = place_x[idx];
+    pos[1] = place_y[idx];
+    pos[2] = find_ground_z(pos[0], pos[1]) + 1.5f;
+    how = "ground";
+  }
 
-  debugPrintf("MENU: teleport to %s at %.1f, %.1f, %.1f\n",
-              place_label[idx], pos[0], pos[1], pos[2]);
+  debugPrintf("MENU: teleport to %s at %.1f, %.1f, %.1f (%s)\n",
+              place_label[idx], pos[0], pos[1], pos[2], how);
   ped_teleport(ped, pos);
 
   snprintf(toast, sizeof(toast), "Teleported to %s", place_label[idx]);
@@ -1199,6 +1279,9 @@ void menu_init(void) {
   ctext_instance = (void **)need_sym("_ZN5CText10msInstanceE");
 
   gp_the_zones = (void **)need_sym("gpTheZones");
+  gp_the_paths = (void **)need_sym("gpThePaths");
+  find_node_closest =
+      (find_node_fn)need_sym("_ZN9CPathFind22FindNodeClosestToCoorsE7CVectorhfbbbb");
   find_zone_by_label =
       (find_zone_label_fn)need_sym("_ZN9CTheZones29FindZoneByLabelAndReturnIndexEPc9eZoneType");
   get_nav_zone = (get_zone_fn)need_sym("_ZN9CTheZones17GetNavigationZoneEt");

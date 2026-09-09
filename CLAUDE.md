@@ -140,6 +140,11 @@ up silently.
   `0x610` `CBoat`, `0x490` `CHeli`, `0x420` `CTrain`. Read them off the callers of
   each constructor. **`CPlane` has no callers at all** in this build — LCS has no
   flyable plane — so there is no size to read and planes are not spawnable.
+- **Teleport to a path node, not to a zone centre.** `FindGroundZForCoord`
+  returns the highest surface at an x/y, so a zone whose middle is a building
+  drops the player on its roof. `gpThePaths` + `CPathFind::FindNodeClosestToCoors`
+  gives a road instead; node records are 20 bytes with x/y/z as `int16` at
+  `+4`/`+6`/`+8`, each an eighth of a world unit.
 - **Vehicles name themselves.** `CCurrentVehicle::Display` — the bottom-right
   readout when you get in — reads a GXT key stored **inline at model info
   `+0x52`** and passes it to `CText::Get`. So `ms_modelInfoPtrs[id] + 0x52` plus
@@ -199,6 +204,11 @@ at an `END_THREAD` stub instead and let the game retire it.
   is relocated to it) and log the pointer next to the probe.
 - **Bodyguards** — the ped model is now streamed before `AddPed`, but the crash
   itself is unconfirmed as fixed; it has not been retested.
+- **Models 211–216 are helicopters typed as cars.** Screenshots confirm a Hunter,
+  three Mavericks and two small unmarked helis, but their model info says vehicle
+  type 0, so they are built as `CAutomobile` and cannot fly. **198 and 199 are
+  the two the game types as helicopters, and those do fly.** Forcing `CHeli` on
+  a car-typed model is untried and could well crash.
 - **Bodyguard weapon** — `BODYGUARD_WEAPON` is a guessed `eWeaponType` (17). The
   spawn logs the number it used; adjust once it is clear what they are holding.
   Ped type is `PEDTYPE_GANG1` (7) with `CPopulation::ChooseGangOccupation(0)`
