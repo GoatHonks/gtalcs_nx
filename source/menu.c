@@ -89,22 +89,35 @@ static ped_teleport_fn ped_teleport = NULL;
 // miss and quietly replace the game's real text object. Reading the pointer is
 // both safer and the same thing the game's own inlined accessors do:
 // TheText()'s adrp/ldr lands on a GOT entry relocated to CText::msInstance.
-typedef char (*text_exists_fn)(void *self, const char *key);
-typedef void *(*text_get_utf8_fn)(void *self, const char *key, char *out, int len);
+// CText::Get is the call the game itself makes -- CCurrentVehicle::Display and
+// CZone::GetTranslatedName both use it. CText::Exists, which this used to gate
+// on, answered false for every key including CHEAT1, one the game demonstrably
+// resolves; whatever it is checking, it is not what Get needs.
+typedef uint16_t *(*text_get_fn)(void *self, const char *key);
 static void **ctext_instance = NULL;
-static text_exists_fn text_exists = NULL;
-static text_get_utf8_fn text_get_utf8 = NULL;
+static text_get_fn text_get = NULL;
+
+// The game's strings are UTF-16. Nothing the menu shows needs more than ASCII,
+// and the help box is fed a wide buffer anyway, so anything outside it becomes
+// '?' rather than dropping the whole name.
+static int wide_to_ascii(const uint16_t *w, char *out, int len) {
+  if (!w || !w[0])
+    return 0;
+  int n = 0;
+  for (; w[n] && n < len - 1; n++)
+    out[n] = (w[n] < 0x80) ? (char)w[n] : '?';
+  out[n] = 0;
+  return n > 0;
+}
 
 // Fills `out` from the GXT key, or leaves it untouched and returns 0.
 static int gxt_lookup(const char *key, char *out, int len) {
-  if (!key || !ctext_instance || !text_exists || !text_get_utf8)
+  if (!key || !key[0] || !ctext_instance || !text_get)
     return 0;
   void *t = *ctext_instance;
-  if (!t || !text_exists(t, key))
+  if (!t)
     return 0;
-  out[0] = 0;
-  text_get_utf8(t, key, out, len);
-  return out[0] != 0;
+  return wide_to_ascii(text_get(t, key), out, len);
 }
 
 // ---- cheats ----
@@ -547,102 +560,39 @@ static int veh_classify(int id) {
 // why this list is the one place a name has to be spelled out. Anything that
 // does not resolve is dropped and logged rather than left in the menu doing
 // nothing when picked.
-typedef void *(*get_model_info_fn)(const char *name, int *id_out);
-static get_model_info_fn get_model_info = NULL;
+// The game names its own vehicles. CCurrentVehicle::Display -- the code behind
+// the vehicle name that flashes bottom-right when you get in -- does:
+//
+//   w8  = vehicle->[124]                 (model index)
+//   x20 = CModelInfo::ms_modelInfoPtrs[w8]
+//   x1  = x20 + 0x52                     (the GXT key, inline in the model info)
+//   CHud::SetVehicleName(CText::Get(x1))
+//
+// So every vehicle carries its own key at model info +0x52, and CText turns it
+// into the real name -- localised, and correct by construction. That replaces
+// the hand-written name list this used to carry entirely: no spellings to guess,
+// nothing to get wrong, and the twenty numbered entries get proper names.
+#define MODELINFO_GXT_KEY 0x52
 
-typedef struct {
-  const char *label;
-  const char *model;
-} menu_vehicle;
+static void ***ms_model_info_ptrs = NULL;
 
-static const menu_vehicle menu_vehicle_names[] = {
-  { "Banshee",          "banshee", },
-  { "Cheetah",          "cheetah", },
-  { "Infernus",         "infernus", },
-  { "Stinger",          "stinger", },
-  { "Landstalker",      "landstal", },
-  { "Patriot",          "patriot", },
-  { "Sentinel",         "sentinel", },
-  { "Stallion",         "stallion", },
-  { "Esperanto",        "esperant", },
-  { "Idaho",            "idaho", },
-  { "Manana",           "manana", },
-  { "Kuruma",           "kuruma", },
-  { "Perennial",        "peren", },
-  { "Blista",           "blista", },
-  { "Bobcat",           "bobcat", },
-  { "Moonbeam",         "moonbeam", },
-  { "Stretch",          "stretch", },
-  { "Taxi",             "taxi", },
-  { "Cabbie",           "cabbie", },
-  { "Borgnine Taxi",    "borgnine", },
-  { "Police car",       "police", },
-  { "Enforcer",         "enforcer", },
-  { "FBI car",          "fbicar", },
-  { "Rhino",            "rhino", },
-  { "Barracks OL",      "barracks", },
-  { "Ambulance",        "ambulan", },
-  { "Fire truck",       "firetruk", },
-  { "Securicar",        "securica", },
-  { "Trashmaster",      "trash", },
-  { "Linerunner",       "linerun", },
-  { "Flatbed",          "flatbed", },
-  { "Mule",             "mule", },
-  { "Yankee",           "yankee", },
-  { "Pony",             "pony", },
-  { "Rumpo",            "rumpo", },
-  { "Bus",              "bus", },
-  { "Coach",            "coach", },
-  { "Mr Whoopee",       "mrwhoop", },
-  { "BF Injection",     "bfinject", },
-  { "Campervan",        "campvan", },
-  { "Toyz van",         "toyz", },
-  { "Romeros Hearse",   "hearse", },
-  { "Mafia Sentinel",   "mafia", },
-  { "Yardie Lobo",      "yardie", },
-  { "Yakuza Stinger",   "yakuza", },
-  { "Cartel Cruiser",   "columb", },
-  { "Hoods Rumpo",      "hoods", },
-  { "PCJ-600",          "pcj600", },
-  { "Freeway",          "freeway", },
-  { "Sanchez",          "sanchez", },
-  { "Faggio",           "faggio", },
-  { "Angel",            "angel", },
-  { "Pizza Boy",        "pizzaboy", },
-  { "Noodle Boy",       "noodleboy", },
-  { "Predator",         "predator", },
-  { "Speeder",          "speeder", },
-  { "Reefer",           "reefer", },
+// Writes the game's display name for a model, or returns 0.
+static int vehicle_game_name(int id, char *out, int len) {
+  if (!ms_model_info_ptrs || !num_model_infos)
+    return 0;
+  if (id < 0 || id >= *num_model_infos)
+    return 0;
 
-  // Vehicles LCS has but whose internal name we have not found yet. There is no
-  // way to look these up offline -- the model table is keyed by a CRC-32 of the
-  // uppercased name and the game data does not store those hashes anywhere
-  // searchable -- so the candidates are simply listed and the game asked. A
-  // spelling that misses is dropped and logged; if several hit they collapse to
-  // one entry, because resolve drops duplicate model ids. Whatever survives is
-  // the right name and can be reduced to a single line later.
-  { "Deimos SP",        "spider", },   // suggested name
-  { "Deimos SP",        "deimossp", },
-  { "Phobos VT",        "phobosvt", },
-  { "Phobos VT",        "vtvan", },
-  { "Hellenbach GT",    "hellenbac", },
-  { "Hellenbach GT",    "hellenba", },
-  { "Sindacco Argento", "argento", },
-  { "Forelli Exsess",   "exsess", },
-  { "Diablo Stallion",  "diablos", },
-  { "Wintergreen",      "wintergrn", },
-  { "Wintergreen",      "wintergreen", },
+  void **table = *ms_model_info_ptrs;
+  if (!table)
+    return 0;
+  const uint8_t *info = (const uint8_t *)table[id];
+  if (!info)
+    return 0;
 
-  // Helicopters. LCS flies a Maverick in missions, so the class is live -- these
-  // are candidate spellings for it and its variants, same drop-and-log deal.
-  { "Maverick",         "maverick", },
-  { "Police Maverick",  "polmav", },
-  { "News Maverick",    "newsmav", },
-  { "Chopper",          "chopper", },
-  { "Hunter",           "hunter", },
-};
-#define MENU_NUM_VEHICLE_NAMES \
-  ((int)(sizeof(menu_vehicle_names) / sizeof(menu_vehicle_names[0])))
+  const char *key = (const char *)(info + MODELINFO_GXT_KEY);
+  return gxt_lookup(key, out, len);
+}
 
 // The list actually shown. It is built from the game's model table rather than
 // from the names above, so every vehicle in the build is spawnable whether or
@@ -668,72 +618,36 @@ static void veh_add(int id, veh_kind kind, const char *label) {
   snprintf(e->label, sizeof(e->label), "%s", label);
 }
 
-static int veh_listed(int id) {
-  for (int i = 0; i < vehicles_ready; i++)
-    if (veh_list[i].id == id)
-      return 1;
-  return 0;
-}
 
 // Model ids only exist once the model info table has been built, which is long
 // after patch_game, so this runs the first time the menu is opened in-game.
 static void menu_resolve_vehicles(void) {
   static int done = 0;
-  if (done || !get_model_info || !num_model_infos)
+  if (done || !num_model_infos)
     return;
   done = 1;
 
-  // Named vehicles first, in the order written above, so the list opens on
-  // things you recognise rather than on a run of numbered entries.
-  for (int i = 0; i < MENU_NUM_VEHICLE_NAMES; i++) {
-    const char *label = menu_vehicle_names[i].label;
-    const char *model = menu_vehicle_names[i].model;
-
-    int id = -1;
-    if (!get_model_info(model, &id) || id < 0) {
-      debugPrintf("MENU: name \"%s\" (%s) is not in this build\n", label, model);
-      continue;
-    }
-
-    const int kind = veh_classify(id);
-    if (kind < 0) {
-      debugPrintf("MENU: \"%s\" (model %d) is a plane, train or not a vehicle, skipped\n",
-                  label, id);
-      continue;
-    }
-    if (is_in_cd_image && !is_in_cd_image(id)) {
-      debugPrintf("MENU: \"%s\" (model %d) is not in the cd image, skipped\n", label, id);
-      continue;
-    }
-    // Two spellings of one vehicle would otherwise list it twice.
-    if (veh_listed(id)) {
-      debugPrintf("MENU: \"%s\" (%s) is model %d, already listed\n", label, model, id);
-      continue;
-    }
-
-    debugPrintf("MENU: name \"%s\" (%s) -> model %d, %s\n",
-                label, model, id, veh_kind_name[kind]);
-    veh_add(id, (veh_kind)kind, label);
-  }
-
-  const int named = vehicles_ready;
-
-  // Then everything else the game has. This is what makes the list complete:
-  // land, sea and air, named or not.
+  // Every vehicle model the game has, in model order, each named by the game.
   const int total = *num_model_infos;
-  int unnamed = 0;
+  int named = 0;
   for (int id = 0; id < total; id++) {
     const int kind = veh_classify(id);
-    if (kind < 0 || veh_listed(id))
+    if (kind < 0)
       continue;
     if (is_in_cd_image && !is_in_cd_image(id))
       continue;
 
     char label[28];
-    snprintf(label, sizeof(label), "%s %d", veh_kind_name[kind], id);
+    if (vehicle_game_name(id, label, sizeof(label)))
+      named++;
+    else
+      snprintf(label, sizeof(label), "%s %d", veh_kind_name[kind], id);
+
+    debugPrintf("MENU: model %3d  %-10s  %s\n", id, veh_kind_name[kind], label);
     veh_add(id, (veh_kind)kind, label);
-    unnamed++;
   }
+
+  const int unnamed = vehicles_ready - named;
 
   int by_kind[4] = { 0, 0, 0, 0 };
   for (int i = 0; i < vehicles_ready; i++)
@@ -1291,10 +1205,9 @@ void menu_init(void) {
   get_info_zone = (get_zone_fn)need_sym("_ZN9CTheZones11GetInfoZoneEt");
   get_map_zone = (get_zone_fn)need_sym("_ZN9CTheZones10GetMapZoneEt");
   zone_translated_name = (zone_name_fn)need_sym("_ZN5CZone17GetTranslatedNameEv");
-  text_exists = (text_exists_fn)need_sym("_ZN5CText6ExistsEPKc");
-  text_get_utf8 = (text_get_utf8_fn)need_sym("_ZN5CText7GetUTF8EPKcPci");
+  text_get = (text_get_fn)need_sym("_ZN5CText3GetEPKc");
+  ms_model_info_ptrs = (void ***)need_sym("_ZN10CModelInfo16ms_modelInfoPtrsE");
 
-  get_model_info = (get_model_info_fn)need_sym("_ZN10CModelInfo12GetModelInfoEPKcPi");
   vehicle_new = (vehicle_new_fn)need_sym("_ZN8CVehiclenwEm");
   automobile_ctor = (vehicle_ctor_fn)need_sym("_ZN11CAutomobileC1Eih");
   bike_ctor = (vehicle_ctor_fn)need_sym("_ZN5CBikeC1Eih");

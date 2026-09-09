@@ -140,6 +140,20 @@ up silently.
   `0x610` `CBoat`, `0x490` `CHeli`, `0x420` `CTrain`. Read them off the callers of
   each constructor. **`CPlane` has no callers at all** in this build — LCS has no
   flyable plane — so there is no size to read and planes are not spawnable.
+- **Vehicles name themselves.** `CCurrentVehicle::Display` — the bottom-right
+  readout when you get in — reads a GXT key stored **inline at model info
+  `+0x52`** and passes it to `CText::Get`. So `ms_modelInfoPtrs[id] + 0x52` plus
+  `CText::Get` names every vehicle, localised, with nothing hardcoded.
+- **Use `CText::Get`, not `CText::Exists`.** `Exists` returned false for every
+  key tried, including `CHEAT1`, which the game itself resolves through `Get`.
+  Both call `CKeyArray::Search`; whatever `Exists` gates on is not what `Get`
+  needs. `CText::msInstance` is the object, reached without `TheText()`.
+- **Zone boxes come from `gpTheZones`.** `FindZoneByLabelAndReturnIndex` plus
+  `GetNavigationZone` (the named zones are navigation zones, type 0); `CZone` is
+  72 bytes with its box at `+8`/`+20` and its name via `GetTranslatedName`.
+  Coordinates scraped from the CLEO script matched these exactly — the script
+  read was right all along and only the **English names guessed against it** were
+  wrong, which is what sent "Atlantic Quays" to Portland Harbor.
 - **Names are gone, but ids are enumerable.** `CBaseModelInfo::SetModelName`
   stores only a CRC-32 of the uppercased name (`CKeyGen::GetUppercaseKey`,
   standard reflected table at `0x24532c`, no final complement) and `strcpy`s the
@@ -183,11 +197,8 @@ at an `END_THREAD` stub instead and let the game retire it.
   installs a fresh empty `CText` when the slot is null, which would answer every
   key with a miss. Now read `CText::msInstance` directly (`TheText()`'s GOT entry
   is relocated to it) and log the pointer next to the probe.
-- **Naming the numbered vehicles.** The spawn list is built by walking
-  `CModelInfo::msNumModelInfos` and classifying every id, so completeness does
-  not depend on the name table — unknown vehicles appear as `Car 173` and spawn
-  fine. The name table only supplies labels. `debug.log` prints every unnamed id
-  and its class; match them in game and add names.
+- **Bodyguards** — the ped model is now streamed before `AddPed`, but the crash
+  itself is unconfirmed as fixed; it has not been retested.
 - **Bodyguard weapon** — `BODYGUARD_WEAPON` is a guessed `eWeaponType` (17). The
   spawn logs the number it used; adjust once it is clear what they are holding.
   Ped type is `PEDTYPE_GANG1` (7) with `CPopulation::ChooseGangOccupation(0)`
