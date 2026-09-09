@@ -54,7 +54,17 @@ pacman -S --needed switch-openal-soft switch-mpg123 switch-ffmpeg switch-dav1d s
 ```
 
 `DEBUG_LOG` in `source/config.h` controls `/switch/gtalcs/debug.log`. It is
-currently **on**; turn it off for a release build.
+currently **on**; turn it off for a release build. Every line is `fflush`ed to
+the SD card and the game's own `printf` comes through the same function, so the
+log costs real boot time — measure with it off before blaming anything else.
+Lines are stamped `[seconds.millis]` from the first line, which is what makes
+timing questions answerable at all.
+
+`data_main.wad` is **not a zip**: no `PK` magic, no end-of-central-directory. The
+engine reads it by sector (`STREAM[n] sec=56664 nsec=495`, and the bytes
+returned are exactly `nsec * 2048`), so there is nothing to unpack and nothing
+addressable if you did. Contents are high entropy, so any decompression happens
+inside the engine after the read, not in a container layer we could remove.
 
 ## How the menu works
 
@@ -204,11 +214,13 @@ at an `END_THREAD` stub instead and let the game retire it.
   is relocated to it) and log the pointer next to the probe.
 - **Bodyguards** — the ped model is now streamed before `AddPed`, but the crash
   itself is unconfirmed as fixed; it has not been retested.
-- **Models 211–216 are helicopters typed as cars.** Screenshots confirm a Hunter,
-  three Mavericks and two small unmarked helis, but their model info says vehicle
-  type 0, so they are built as `CAutomobile` and cannot fly. **198 and 199 are
-  the two the game types as helicopters, and those do fly.** Forcing `CHeli` on
-  a car-typed model is untried and could well crash.
+- **Models 211–216 are helicopters typed as cars — and they fly anyway.** Their
+  model info says vehicle type 0, so the menu builds them as `CAutomobile`, and
+  they still fly when entered. Flight comes from the handling data, not the
+  vehicle type, so *do not* assume the type field gates behaviour — it only picks
+  the class. 211, 212 and 216 have no textures in this build.
+  **198 and 199, the two the game does type as helicopters, are the ones you
+  cannot fly**: they are scripted traffic that takes off by itself.
 - **Bodyguard weapon** — `BODYGUARD_WEAPON` is a guessed `eWeaponType` (17). The
   spawn logs the number it used; adjust once it is clear what they are holding.
   Ped type is `PEDTYPE_GANG1` (7) with `CPopulation::ChooseGangOccupation(0)`

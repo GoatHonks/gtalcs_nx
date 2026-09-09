@@ -620,20 +620,24 @@ static int veh_classify(int id) {
 
 static void ***ms_model_info_ptrs = NULL;
 
-// The six the game has no name for. They are all helicopters -- identified from
-// screenshots of each one spawned -- but their model info types them as cars, so
-// they are built as CAutomobile and sit there rather than flying. Models 198 and
-// 199 are the two the game types as helicopters, and those do fly.
+// The six the game has no name for, identified from screenshots of each one
+// spawned. All are helicopters, and all of them fly -- even though their model
+// info types them as cars, so the menu builds them as CAutomobile. Flight in
+// this engine evidently comes from the handling data, not the model type.
 //
-// Labelling them by model number ("Car 213") was worse than useless: it said
-// car, and it was a Hunter.
+// (Models 198 and 199, the two the game does type as helicopters, are the ones
+// you cannot fly: they are scripted traffic and take off by themselves.)
+//
+// Three have no textures in this build and look unfinished, which the labels
+// say so the entry is not a wasted trip. Labelling any of them by model number
+// was worse than useless: it said car, and what appeared was a Hunter.
 static const struct { int id; const char *name; } veh_extra_names[] = {
-  { 211, "Small heli 211" },     // a small unmarked light helicopter
-  { 212, "Small heli 212" },     // identical to 211
+  { 211, "Small heli (no tex)" },   // untextured; looks unfinished
+  { 212, "Small heli 2 (no tex)" }, // identical to 211
   { 213, "Hunter" },             // olive attack helicopter, rockets and minigun
   { 214, "Maverick" },           // civilian, cream with a blue stripe
   { 215, "Police Maverick" },    // LCPD markings, tail number P619PD
-  { 216, "News Maverick" },      // white and blue; streams the vcnmav textures
+  { 216, "News Maverick (no tex)" }, // its vcnmav textures are missing
 };
 #define NUM_VEH_EXTRA_NAMES \
   ((int)(sizeof(veh_extra_names) / sizeof(veh_extra_names[0])))
