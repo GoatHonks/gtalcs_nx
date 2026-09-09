@@ -123,9 +123,21 @@ up silently.
 - **`TankCheat` is not a tank cheat.** It walks a counter over the vehicle model
   range (130..216, skipping planes) and hands the result to `VehicleCheat`, so it
   spawns a *different* vehicle each press. It is listed as "Random vehicle".
-  `VehicleCheat(modelId)` is the whole spawner — request, stream, `CBike` for
-  models `0xCA..0xD2` and `CAutomobile` otherwise, nearest path node,
-  `CWorld::Add` — so a deliberate spawner is one call.
+- **`VehicleCheat(modelId)` is only safe for cars and bikes.** It picks the class
+  from the id alone (`CBike` for `0xCA..0xD2`, `CAutomobile` for everything else),
+  so a boat is constructed as a car and the game dies — that is what crashed on
+  the Reefer and the Speeder. It also places the vehicle on the nearest path node
+  within 100 units, which puts cars out of view. `menu.c` does the spawn itself:
+  `RequestModel` + `LoadAllRequestedModels`, `CVehicle::operator new`, the right
+  constructor, matrix, `CWorld::Add`. **Choose the class with
+  `CModelInfo::IsCarModel` / `IsBikeModel` / `IsBoatModel`, never an id range.**
+- **Entity layout** (from `VehicleCheat`'s own stores): matrix at `+16`, three
+  16-byte rotation rows at `+16`/`+32`/`+48`, position at `+64` (x,y) and `+72`
+  (z), status at `+784`. Row 1 (`+32`) is the forward vector — `SetHeading`
+  builds row0 `(cos,sin,0)`, row1 `(-sin,cos,0)`, and GTA faces `+y`. Copying a
+  ped's 48 rotation bytes onto a vehicle is an easy way to face it correctly.
+- **`CVehicle::operator new` sizes**: `0x7b0` `CAutomobile`, `0x6a0` `CBike`,
+  `0x610` `CBoat`. Read them off the callers of each constructor.
 - **Model ids are resolved by name.** `CModelInfo::GetModelInfo(name, &id)`
   hashes with `CKeyGen::GetUppercaseKey` and searches; the model info stores only
   the hash, so there is **no name table to enumerate** — not in the binary and
@@ -158,9 +170,14 @@ at an `END_THREAD` stub instead and let the game retire it.
 
 ## Outstanding
 
-- **Vehicle name list** — the 64 names in `menu.c` are best-effort; whatever this
-  build does not have is dropped and named in `debug.log`. Read that log and
-  prune or correct the list.
+- **Zone names never resolve.** `0/29` GXT keys hit, so the list runs on its
+  built-in English fallbacks. A probe with `CHEAT1` (a key `VehicleCheat` itself
+  passes to `CText::Get`) is logged next to the vehicle count: if the probe hits,
+  the zone keys are wrong for LCS; if it misses, the lookup or its timing is.
+- **Vehicle name list** — 57 names, all confirmed present in this build. Seven
+  guesses (`phobos`, `deimos`, `hellenbach`, `sindacco`, `forelli`, `diablo`,
+  `wintrgrn`) did not resolve and were removed; LCS may still have those vehicles
+  under other names.
 - **Bodyguard weapon** — `BODYGUARD_WEAPON` is a guessed `eWeaponType` (17). The
   spawn logs the number it used; adjust once it is clear what they are holding.
   Ped type is `PEDTYPE_GANG1` (7) with `CPopulation::ChooseGangOccupation(0)`

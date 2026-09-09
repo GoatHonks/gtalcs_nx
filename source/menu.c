@@ -330,13 +330,63 @@ static void menu_label_places(void) {
 
 // ---- vehicle spawner ----
 //
-// VehicleCheat(modelId) is the entire spawner: it requests the model, waits for
-// the stream, builds a CBike for models 0xCA..0xD2 and a CAutomobile otherwise,
-// drops it on the nearest path node to the player and calls CWorld::Add. It is
-// what TankCheat calls once it has picked a model, so this is the game's own
-// code path with the guesswork removed.
-typedef void (*vehicle_cheat_fn)(int model_id);
-static vehicle_cheat_fn vehicle_cheat = NULL;
+// VehicleCheat(modelId) looked like the whole spawner, and it is the call
+// TankCheat makes -- but it is only safe for two of the four vehicle classes.
+// It picks the class by model id alone:
+//
+//   sub w8, w19, #0xca / cmp w8, #8 / b.hi   ->  CBike for 202..210,
+//                                               CAutomobile for everything else
+//
+// so a boat gets built as a CAutomobile and the game dies the moment anything
+// touches it. That is exactly what happened with the Reefer and the Speeder.
+// (TankCheat gets away with it because it skips planes and never lands on a
+// boat often enough to matter.)
+//
+// It also places the vehicle on the nearest path node within 100 units of the
+// player, which is why cars kept appearing out of view or across the street.
+//
+// So the spawn is done here instead, following VehicleCheat's own sequence --
+// request, load, allocate, construct, write the matrix, CWorld::Add -- with the
+// class chosen from CModelInfo rather than from an id range, and the position
+// taken from the player rather than from a path node.
+#define VEH_MATRIX     16    // three 16-byte rotation rows, +16..+63
+#define VEH_MATRIX_LEN 48
+#define VEH_POS        64    // x,y at +64/+68 and z at +72, per VehicleCheat's
+                             // str d1,[x20,#64] / str s0,[x20,#72]
+#define VEH_STATUS     784   // VehicleCheat's str w9(#1),[x20,#784]
+
+// The player's forward vector is the second matrix row: CPlaceable::SetHeading
+// builds row0 = (cos, sin, 0) and row1 = (-sin, cos, 0), and GTA faces +y.
+#define PED_FORWARD    (VEH_MATRIX + 16)
+#define SPAWN_AHEAD    5.0f
+
+// Allocation sizes come from the callers of each constructor: CVehicle::operator
+// new is handed 0x7b0 before CAutomobile, 0x6a0 before CBike and 0x610 before
+// CBoat.
+#define VEH_SIZE_AUTO 0x7b0
+#define VEH_SIZE_BIKE 0x6a0
+#define VEH_SIZE_BOAT 0x610
+
+typedef enum { VEH_AUTO = 0, VEH_BIKE, VEH_BOAT } veh_kind;
+
+typedef void *(*vehicle_new_fn)(size_t size);
+typedef void (*vehicle_ctor_fn)(void *self, int model, unsigned char created_by);
+typedef void (*world_add_fn)(void *entity);
+typedef void (*request_model_fn)(int model, int flags);
+typedef void (*load_all_models_fn)(int prio);
+typedef char (*is_model_fn)(int model);
+
+static vehicle_new_fn vehicle_new = NULL;
+static vehicle_ctor_fn automobile_ctor = NULL;
+static vehicle_ctor_fn bike_ctor = NULL;
+static vehicle_ctor_fn boat_ctor = NULL;
+static world_add_fn world_add = NULL;
+static request_model_fn request_model = NULL;
+static load_all_models_fn load_all_models = NULL;
+static is_model_fn is_car_model = NULL;
+static is_model_fn is_bike_model = NULL;
+static is_model_fn is_boat_model = NULL;
+static is_model_fn is_in_cd_image = NULL;
 
 // Model ids are per-build, so the menu resolves them by name:
 // CModelInfo::GetModelInfo hashes the name and searches, writing the id out.
@@ -351,6 +401,7 @@ typedef struct {
   const char *label;
   const char *model;
   int id;
+  veh_kind kind;
 } menu_vehicle;
 
 static menu_vehicle menu_vehicles[] = {
@@ -358,11 +409,6 @@ static menu_vehicle menu_vehicles[] = {
   { "Cheetah",          "cheetah",   -1 },
   { "Infernus",         "infernus",  -1 },
   { "Stinger",          "stinger",   -1 },
-  { "Phobos VT",        "phobos",    -1 },
-  { "Deimos SP",        "deimos",    -1 },
-  { "Hellenbach GT",    "hellenbach",-1 },
-  { "Sindacco Argento", "sindacco",  -1 },
-  { "Forelli Exsess",   "forelli",   -1 },
   { "Landstalker",      "landstal",  -1 },
   { "Patriot",          "patriot",   -1 },
   { "Sentinel",         "sentinel",  -1 },
@@ -404,7 +450,6 @@ static menu_vehicle menu_vehicles[] = {
   { "Mafia Sentinel",   "mafia",     -1 },
   { "Yardie Lobo",      "yardie",    -1 },
   { "Yakuza Stinger",   "yakuza",    -1 },
-  { "Diablo Stallion",  "diablo",    -1 },
   { "Cartel Cruiser",   "columb",    -1 },
   { "Hoods Rumpo",      "hoods",     -1 },
   { "PCJ-600",          "pcj600",    -1 },
@@ -412,7 +457,6 @@ static menu_vehicle menu_vehicles[] = {
   { "Sanchez",          "sanchez",   -1 },
   { "Faggio",           "faggio",    -1 },
   { "Angel",            "angel",     -1 },
-  { "Wintergreen",      "wintrgrn",  -1 },
   { "Pizza Boy",        "pizzaboy",  -1 },
   { "Noodle Boy",       "noodleboy", -1 },
   { "Predator",         "predator",  -1 },
@@ -439,12 +483,44 @@ static void menu_resolve_vehicles(void) {
                   menu_vehicles[i].label, menu_vehicles[i].model);
       continue;
     }
+
+    // The class has to come from the model, not from the id: building a boat as
+    // a CAutomobile is what killed the game on the Reefer and the Speeder.
+    // Anything that is not a car, bike or boat -- planes, helicopters, trains --
+    // has no constructor here and is dropped rather than guessed at.
+    veh_kind kind;
+    if (is_bike_model && is_bike_model(id))
+      kind = VEH_BIKE;
+    else if (is_boat_model && is_boat_model(id))
+      kind = VEH_BOAT;
+    else if (is_car_model && is_car_model(id))
+      kind = VEH_AUTO;
+    else {
+      debugPrintf("MENU: vehicle \"%s\" (model %d) is not a car, bike or boat, dropped\n",
+                  menu_vehicles[i].label, id);
+      continue;
+    }
+
+    if (is_in_cd_image && !is_in_cd_image(id)) {
+      debugPrintf("MENU: vehicle \"%s\" (model %d) is not in the cd image, dropped\n",
+                  menu_vehicles[i].label, id);
+      continue;
+    }
+
     menu_vehicles[kept] = menu_vehicles[i];
     menu_vehicles[kept].id = id;
+    menu_vehicles[kept].kind = kind;
     kept++;
   }
   vehicles_ready = kept;
   debugPrintf("MENU: %d/%d vehicles resolved\n", kept, MENU_NUM_VEHICLES);
+
+  // One probe with a key the game itself uses (VehicleCheat passes "CHEAT1" to
+  // CText::Get), so a zone-name miss can be told apart from the text system not
+  // answering at all.
+  char probe[40];
+  debugPrintf("MENU: GXT probe CHEAT1 -> %s\n",
+              gxt_lookup("CHEAT1", probe, sizeof(probe)) ? probe : "(miss)");
 }
 
 // ---- bodyguards ----
@@ -684,14 +760,59 @@ static void menu_teleport_to(int idx) {
 }
 
 static void menu_spawn_vehicle(int idx) {
-  if (idx < 0 || idx >= vehicles_ready || !vehicle_cheat)
+  if (idx < 0 || idx >= vehicles_ready)
+    return;
+  if (!vehicle_new || !world_add || !request_model || !load_all_models ||
+      !find_player_ped || !automobile_ctor || !bike_ctor || !boat_ctor) {
+    snprintf(toast, sizeof(toast), "Spawning unavailable");
+    toast_pending = 1;
+    return;
+  }
+
+  void *ped = find_player_ped();
+  if (!ped)
     return;
 
-  debugPrintf("MENU: spawn %s (model %d)\n",
-              menu_vehicles[idx].label, menu_vehicles[idx].id);
-  vehicle_cheat(menu_vehicles[idx].id);
+  const menu_vehicle *v = &menu_vehicles[idx];
 
-  snprintf(toast, sizeof(toast), "%s spawned", menu_vehicles[idx].label);
+  // Blocking load, the same pair VehicleCheat uses.
+  request_model(v->id, 1);
+  load_all_models(0);
+
+  size_t size;
+  vehicle_ctor_fn ctor;
+  switch (v->kind) {
+    case VEH_BIKE: size = VEH_SIZE_BIKE; ctor = bike_ctor; break;
+    case VEH_BOAT: size = VEH_SIZE_BOAT; ctor = boat_ctor; break;
+    default:       size = VEH_SIZE_AUTO; ctor = automobile_ctor; break;
+  }
+
+  void *veh = vehicle_new(size);
+  if (!veh) {
+    debugPrintf("MENU: no room for %s\n", v->label);
+    return;
+  }
+  ctor(veh, v->id, 1);   // 1 = created by the game rather than by a mission
+
+  // Face it the way the player is facing by copying their three rotation rows,
+  // which is both simpler and safer than building a matrix from a heading.
+  memcpy((char *)veh + VEH_MATRIX, (const char *)ped + VEH_MATRIX, VEH_MATRIX_LEN);
+
+  // Just in front of the player rather than on a path node up the road.
+  const float *ppos = (const float *)((uintptr_t)ped + PED_POS);
+  const float *fwd = (const float *)((uintptr_t)ped + PED_FORWARD);
+  float *vpos = (float *)((uintptr_t)veh + VEH_POS);
+  vpos[0] = ppos[0] + fwd[0] * SPAWN_AHEAD;
+  vpos[1] = ppos[1] + fwd[1] * SPAWN_AHEAD;
+  vpos[2] = find_ground_z ? find_ground_z(vpos[0], vpos[1]) + 1.0f : ppos[2];
+
+  *(int *)((uintptr_t)veh + VEH_STATUS) = 1;
+  world_add(veh);
+
+  debugPrintf("MENU: spawn %s (model %d, kind %d) at %.1f, %.1f, %.1f\n",
+              v->label, v->id, (int)v->kind, vpos[0], vpos[1], vpos[2]);
+
+  snprintf(toast, sizeof(toast), "%s spawned", v->label);
   toast_pending = 1;
 }
 
@@ -912,8 +1033,18 @@ void menu_init(void) {
   text_exists = (text_exists_fn)need_sym("_ZN5CText6ExistsEPKc");
   text_get_utf8 = (text_get_utf8_fn)need_sym("_ZN5CText7GetUTF8EPKcPci");
 
-  vehicle_cheat = (vehicle_cheat_fn)need_sym("_Z12VehicleCheati");
   get_model_info = (get_model_info_fn)need_sym("_ZN10CModelInfo12GetModelInfoEPKcPi");
+  vehicle_new = (vehicle_new_fn)need_sym("_ZN8CVehiclenwEm");
+  automobile_ctor = (vehicle_ctor_fn)need_sym("_ZN11CAutomobileC1Eih");
+  bike_ctor = (vehicle_ctor_fn)need_sym("_ZN5CBikeC1Eih");
+  boat_ctor = (vehicle_ctor_fn)need_sym("_ZN5CBoatC1Eih");
+  world_add = (world_add_fn)need_sym("_ZN6CWorld3AddEP7CEntity");
+  request_model = (request_model_fn)need_sym("_ZN10CStreaming12RequestModelEii");
+  load_all_models = (load_all_models_fn)need_sym("_ZN10CStreaming22LoadAllRequestedModelsEb");
+  is_car_model = (is_model_fn)need_sym("_ZN10CModelInfo10IsCarModelEi");
+  is_bike_model = (is_model_fn)need_sym("_ZN10CModelInfo11IsBikeModelEi");
+  is_boat_model = (is_model_fn)need_sym("_ZN10CModelInfo11IsBoatModelEi");
+  is_in_cd_image = (is_model_fn)need_sym("_ZN10CStreaming17IsObjectInCdImageEi");
 
   population_add_ped =
       (add_ped_fn)need_sym("_ZN11CPopulation6AddPedE8ePedTypejRK7CVectorib");
