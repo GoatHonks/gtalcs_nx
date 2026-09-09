@@ -501,6 +501,14 @@ static const menu_vehicle menu_vehicle_names[] = {
   { "Diablo Stallion",  "diablos", },
   { "Wintergreen",      "wintergrn", },
   { "Wintergreen",      "wintergreen", },
+
+  // Helicopters. LCS flies a Maverick in missions, so the class is live -- these
+  // are candidate spellings for it and its variants, same drop-and-log deal.
+  { "Maverick",         "maverick", },
+  { "Police Maverick",  "polmav", },
+  { "News Maverick",    "newsmav", },
+  { "Chopper",          "chopper", },
+  { "Hunter",           "hunter", },
 };
 #define MENU_NUM_VEHICLE_NAMES \
   ((int)(sizeof(menu_vehicle_names) / sizeof(menu_vehicle_names[0])))
