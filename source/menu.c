@@ -462,6 +462,25 @@ static menu_vehicle menu_vehicles[] = {
   { "Predator",         "predator",  -1 },
   { "Speeder",          "speeder",   -1 },
   { "Reefer",           "reefer",    -1 },
+
+  // Vehicles LCS has but whose internal name we have not found yet. There is no
+  // way to look these up offline -- the model table is keyed by a CRC-32 of the
+  // uppercased name and the game data does not store those hashes anywhere
+  // searchable -- so the candidates are simply listed and the game asked. A
+  // spelling that misses is dropped and logged; if several hit they collapse to
+  // one entry, because resolve drops duplicate model ids. Whatever survives is
+  // the right name and can be reduced to a single line later.
+  { "Deimos SP",        "spider",    -1 },   // suggested name
+  { "Deimos SP",        "deimossp",  -1 },
+  { "Phobos VT",        "phobosvt",  -1 },
+  { "Phobos VT",        "vtvan",     -1 },
+  { "Hellenbach GT",    "hellenbac", -1 },
+  { "Hellenbach GT",    "hellenba",  -1 },
+  { "Sindacco Argento", "argento",   -1 },
+  { "Forelli Exsess",   "exsess",    -1 },
+  { "Diablo Stallion",  "diablos",   -1 },
+  { "Wintergreen",      "wintergrn", -1 },
+  { "Wintergreen",      "wintergreen", -1 },
 };
 #define MENU_NUM_VEHICLES ((int)(sizeof(menu_vehicles) / sizeof(menu_vehicles[0])))
 
@@ -506,6 +525,21 @@ static void menu_resolve_vehicles(void) {
                   menu_vehicles[i].label, id);
       continue;
     }
+
+    // Two spellings of the same vehicle both resolving would put it in the menu
+    // twice, so the second one goes.
+    int dup = 0;
+    for (int k = 0; k < kept; k++) {
+      if (menu_vehicles[k].id == id) {
+        debugPrintf("MENU: \"%s\" (%s) is model %d, already listed as \"%s\"\n",
+                    menu_vehicles[i].label, menu_vehicles[i].model, id,
+                    menu_vehicles[k].label);
+        dup = 1;
+        break;
+      }
+    }
+    if (dup)
+      continue;
 
     menu_vehicles[kept] = menu_vehicles[i];
     menu_vehicles[kept].id = id;
