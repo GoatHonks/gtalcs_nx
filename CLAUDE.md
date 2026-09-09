@@ -219,8 +219,13 @@ at an `END_THREAD` stub instead and let the game retire it.
   they still fly when entered. Flight comes from the handling data, not the
   vehicle type, so *do not* assume the type field gates behaviour — it only picks
   the class. 211, 212 and 216 have no textures in this build.
-  **198 and 199, the two the game does type as helicopters, are the ones you
-  cannot fly**: they are scripted traffic that takes off by itself.
+  **198 and 199, the two the game does type as helicopters, are the useless
+  ones**: 199 takes off by itself the moment it exists, and **198 crashes the
+  game on spawn** and is excluded from the list. Both go through the identical
+  `CHeli` path, so the class is not at fault — 198 is an incomplete model. The
+  suspected mechanism is `CHeli`'s `FillNodeArray` on the clump at `+112`, which
+  walks the rotor hierarchy and would take a null from a model with no geometry;
+  that is a theory, not a finding.
 - **Bodyguard weapon** — `BODYGUARD_WEAPON` is a guessed `eWeaponType` (17). The
   spawn logs the number it used; adjust once it is clear what they are holding.
   Ped type is `PEDTYPE_GANG1` (7) with `CPopulation::ChooseGangOccupation(0)`

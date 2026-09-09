@@ -631,7 +631,26 @@ static void ***ms_model_info_ptrs = NULL;
 // Three have no textures in this build and look unfinished, which the labels
 // say so the entry is not a wasted trip. Labelling any of them by model number
 // was worse than useless: it said car, and what appeared was a Hunter.
+// Model 198 crashes the game on spawn. Both it and 199 are typed as
+// helicopters and both go through the identical CHeli path, so the class is not
+// the problem -- 198 itself is incomplete, like the untextured models nearby.
+// The likely mechanism is in the constructor:
+//
+//   ldr x0, [x19, #112]                     (the clump SetModelIndex installed)
+//   bl  CElementGroupModelInfo::FillNodeArray
+//
+// FillNodeArray walks the model's node hierarchy for the rotor bones, so a model
+// with no geometry hands it a null and it dies there. That is a theory, not a
+// finding -- what is certain is that this one entry crashes, so it is not
+// offered. The collision-model check in menu_spawn_vehicle is the general
+// version of the same guard, and the log will say if it ever catches anything.
+#define VEH_MODEL_BROKEN 198
+
+// Collision model pointer, from CBaseModelInfo::GetColModelPtr: ldr x0,[x0,#48].
+#define MODELINFO_COL_MODEL 48
+
 static const struct { int id; const char *name; } veh_extra_names[] = {
+  { 199, "Helicopter (AI flies off)" },  // takes off by itself, cannot be flown
   { 211, "Small heli (no tex)" },   // untextured; looks unfinished
   { 212, "Small heli 2 (no tex)" }, // identical to 211
   { 213, "Hunter" },             // olive attack helicopter, rockets and minigun
@@ -647,6 +666,16 @@ static const char *veh_extra_name(int id) {
     if (veh_extra_names[i].id == id)
       return veh_extra_names[i].name;
   return NULL;
+}
+
+// The model info record for a model id, or NULL.
+static const uint8_t *model_info_for(int id) {
+  if (!ms_model_info_ptrs || !num_model_infos)
+    return NULL;
+  if (id < 0 || id >= *num_model_infos)
+    return NULL;
+  void **table = *ms_model_info_ptrs;
+  return table ? (const uint8_t *)table[id] : NULL;
 }
 
 // Writes the game's display name for a model, or returns 0.
@@ -709,13 +738,19 @@ static void menu_resolve_vehicles(void) {
       continue;
     if (is_in_cd_image && !is_in_cd_image(id))
       continue;
+    if (id == VEH_MODEL_BROKEN) {
+      debugPrintf("MENU: model %d skipped, known to crash on spawn\n", id);
+      continue;
+    }
 
     char label[28];
+    // Our own label wins where we have one: 199's GXT name is just "Helicopter",
+    // which tells you nothing about it flying away the moment it exists.
     const char *extra = veh_extra_name(id);
-    if (vehicle_game_name(id, label, sizeof(label)))
-      named++;
-    else if (extra)
+    if (extra)
       snprintf(label, sizeof(label), "%s", extra);
+    else if (vehicle_game_name(id, label, sizeof(label)))
+      named++;
     else
       snprintf(label, sizeof(label), "%s %d", veh_kind_name[kind], id);
 
@@ -1012,6 +1047,19 @@ static void menu_spawn_vehicle(int idx) {
   // Blocking load, the same pair VehicleCheat uses.
   request_model(v->id, 1);
   load_all_models(0);
+
+  // A model whose collision never loaded is not built. Constructing against an
+  // incomplete model is how model 198 takes the game down, and while this check
+  // is not proven to be the same fault, refusing to build is always better than
+  // finding out inside a constructor.
+  const uint8_t *info = model_info_for(v->id);
+  if (info && !*(void *const *)(info + MODELINFO_COL_MODEL)) {
+    debugPrintf("MENU: %s (model %d) has no collision model, refusing to spawn\n",
+                v->label, v->id);
+    snprintf(toast, sizeof(toast), "%s is incomplete", v->label);
+    toast_pending = 1;
+    return;
+  }
 
   size_t size;
   vehicle_ctor_fn ctor;
