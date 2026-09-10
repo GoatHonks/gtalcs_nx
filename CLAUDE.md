@@ -113,6 +113,18 @@ All derived by disassembling the named function in this build.
 | radar blips | `CRadar::ms_RadarTrace`, 75 × 60 | `CRadar::SetTargetBlip` |
 | blip type / pos | `+40` (2=char, 4=coord) / `+12,+16,+20` | ditto + runtime dump |
 
+**A data symbol is not dead just because you grepped for it.** "Fly higher"
+stored two floats in `VehicleNames`, on the strength of a grep for `adrp` +
+`add #0x1c8` finding no readers. That only covers **same-translation-unit**
+access; everything else reaches a data symbol through the **GOT**.
+`objdump -R | grep VehicleNames` shows a `GLOB_DAT` relocation and five readers,
+and the symbol sits between `HandlingFilename` and `BOAT_BUOYANCY_DAMPING` in
+the vehicle handling data. Writing there cost **every vehicle in the world its
+collision** — spawned cars fell through the map, the streets emptied of traffic —
+and sent me hunting a spawn bug that did not exist, for several rounds, while
+the user was telling me it began when that feature landed. **Check `objdump -R`
+for a GOT entry before believing any data symbol is unused.**
+
 **Do not dereference a resolved address inside `menu_init`.** It runs from
 `patch_game`, and `so_try_find_addr_rx` returns a `load_virtbase` address that
 **is not mapped until `so_finalize`** — reading through one there is an instant
@@ -147,19 +159,13 @@ up silently.
 - **`TankCheat` is not a tank cheat.** It walks a counter over the vehicle model
   range (130..216, skipping planes) and hands the result to `VehicleCheat`, so it
   spawns a *different* vehicle each press. It is listed as "Random vehicle".
-- **Spawn with `VehicleCheat(modelId)`. Nothing else has ever worked.** Both
-  alternatives produce a vehicle with **no collision**: it falls straight down,
-  x and y frozen, until `CWorld::RemoveFallenCars` takes it below −100 about 3.5
-  seconds later. That is true of hand-building it (operator new, constructor,
-  matrix, `CWorld::Add`) *and* of `SpawnInModel`, which is the game's own
-  spawner but has **zero callers** in this build, so nothing ever exercised it.
-  Ruled out along the way, each by a log rather than an argument: the status
-  word, the island byte (`+390`, not the `+126` that `SetupBigBuilding` uses),
-  and the matrix — its rows logged as a clean rotation and it still fell.
-  `VehicleCheat`'s two costs are real and worth paying: it **crashes on boats**
-  (builds them as `CAutomobile`), so those still go through `SpawnInModel`, and
-  it places the vehicle on a path node up to 100 units away rather than next to
-  you.
+- **Spawn with `VehicleCheat(modelId)`** — the path `TrashmasterCheat` uses.
+  It **crashes on boats** (builds them as `CAutomobile`), so those go through
+  `SpawnInModel`, and it places the vehicle on a path node up to 100 units away
+  rather than next to you. Both costs are worth paying: a long detour spent
+  hand-rolling a spawner and then swapping in `SpawnInModel` achieved nothing,
+  because the vehicles were falling for a reason that had nothing to do with how
+  they were built (see the `VehicleNames` entry).
 - **The vehicle pool**, from `CCarCtrl::RemoveDistantCars`: entries at `+0`, flag
   bytes at `+8`, count at `+16`, stride 1968, negative flag means free. Snapshot
   the taken slots before a spawn to find the vehicle afterwards — neither
