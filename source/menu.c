@@ -868,6 +868,13 @@ static void menu_label_places(void) {
 // taken from the player rather than from a path node.
 #define VEH_MATRIX  16    // three 16-byte rotation rows, +16..+63
 #define VEH_POS     64    // x,y at +64/+68 and z at +72
+#define VEH_FLAGS   88    // entity flags; the status is five bits at bit 4
+#define VEH_STATUS_MASK 0x1f0ULL
+
+// Which island the entity is on. SpawnInModel writes the vehicle's at +390;
+// CEntity::SetupBigBuilding writes a building's at +126, which is a different
+// field and the wrong one to copy for a vehicle.
+#define ENTITY_LEVEL 390
 
 // The player's forward vector is the second matrix row: CPlaceable::SetHeading
 // builds row0 = (cos, sin, 0) and row1 = (-sin, cos, 0), and GTA faces +y.
@@ -1545,6 +1552,126 @@ static void menu_teleport_to_marker(void) {
   menu_teleport_xy(x, y, 0, "the marker");
 }
 
+// ---- watching a spawned vehicle ----
+//
+// If they still vanish, the useful question is *when*: a fixed delay points at
+// something periodic, and an instant one points at the add itself. The pool
+// handle is the safe way to ask -- CPools::GetVehicle checks the slot's flag
+// byte against the handle, so a freed or reused slot answers NULL instead of
+// handing back a dangling pointer to read.
+typedef int (*get_vehicle_ref_fn)(void *veh);
+typedef void *(*get_vehicle_fn)(int ref);
+static get_vehicle_ref_fn pools_get_vehicle_ref = NULL;
+static get_vehicle_fn pools_get_vehicle = NULL;
+
+static int veh_track_ref = 0;
+static u64 veh_track_t0 = 0;
+static u64 veh_track_next_report = 0;
+static char veh_track_label[28];
+
+static void veh_track_begin(void *veh, const char *label) {
+  if (!pools_get_vehicle_ref || !pools_get_vehicle)
+    return;
+  veh_track_ref = pools_get_vehicle_ref(veh);
+  veh_track_t0 = armTicksToNs(armGetSystemTick());
+  veh_track_next_report = 0;
+  snprintf(veh_track_label, sizeof(veh_track_label), "%s", label);
+  debugPrintf("MENU: watching %s, pool ref %d\n", veh_track_label, veh_track_ref);
+}
+
+static void veh_track_tick(void) {
+  if (!veh_track_ref || !pools_get_vehicle)
+    return;
+
+  const u64 ms = (armTicksToNs(armGetSystemTick()) - veh_track_t0) / 1000000ull;
+
+  void *veh = pools_get_vehicle(veh_track_ref);
+  if (!veh) {
+    debugPrintf("MENU: %s was removed from the pool after %llu ms\n",
+                veh_track_label, (unsigned long long)ms);
+    veh_track_ref = 0;
+    return;
+  }
+
+  // Where it is, twice a second, while it still exists.
+  //
+  // Every spawn so far has been removed after a remarkably consistent 3.4-3.7
+  // seconds. CCarCtrl::PossiblyRemoveVehicle only removes at a distance (its
+  // thresholds are 190 and 70 units, and these sit five away), but
+  // CWorld::RemoveFallenCars deletes anything below z = -100, and falling from
+  // ground level to -100 takes about that long. If these numbers march
+  // downwards, the vehicle is falling through the map and the fix belongs at
+  // the spawn, not in whatever deletes it afterwards.
+  if (ms >= veh_track_next_report) {
+    veh_track_next_report = ms + 500;
+    const float *p = (const float *)((uintptr_t)veh + VEH_POS);
+    const uint64_t flags = *(const uint64_t *)((uintptr_t)veh + VEH_FLAGS);
+    debugPrintf("MENU: %s at %llu ms: %.1f, %.1f, %.1f  status %u  level %u\n",
+                veh_track_label, (unsigned long long)ms,
+                p[0], p[1], p[2],
+                (unsigned)((flags & VEH_STATUS_MASK) >> 4),
+                *(const uint8_t *)((uintptr_t)veh + ENTITY_LEVEL));
+  }
+}
+
+// ---- finding what SpawnInModel just made ----
+//
+// SpawnInModel returns nothing, so the vehicle it creates has to be found in
+// the pool. CCarCtrl::RemoveDistantCars shows the layout: entries at +0, the
+// per-slot flag bytes at +8, the count at +16, and a stride of 1968. A flag
+// byte with its top bit set is a free slot.
+//
+// Snapshot which slots are taken, spawn, then look for the one that was not
+// taken before.
+#define VEHPOOL_ENTRIES 0
+#define VEHPOOL_FLAGS   8
+#define VEHPOOL_SIZE    16
+#define VEHPOOL_STRIDE  1968
+#define VEHPOOL_MAX     512
+
+static void **ms_p_vehicle_pool = NULL;
+static uint8_t veh_slot_taken[VEHPOOL_MAX];
+
+static int veh_pool(uint8_t **entries, const int8_t **flags, int *size) {
+  if (!ms_p_vehicle_pool)
+    return 0;
+  const uint8_t *pool = (const uint8_t *)*ms_p_vehicle_pool;
+  if (!pool)
+    return 0;
+
+  *entries = *(uint8_t **)(pool + VEHPOOL_ENTRIES);
+  *flags = *(const int8_t **)(pool + VEHPOOL_FLAGS);
+  *size = *(const int *)(pool + VEHPOOL_SIZE);
+  if (!*entries || !*flags || *size <= 0)
+    return 0;
+  if (*size > VEHPOOL_MAX)
+    *size = VEHPOOL_MAX;
+  return 1;
+}
+
+static void veh_pool_snapshot(void) {
+  uint8_t *entries;
+  const int8_t *flags;
+  int size;
+  memset(veh_slot_taken, 0, sizeof(veh_slot_taken));
+  if (!veh_pool(&entries, &flags, &size))
+    return;
+  for (int i = 0; i < size; i++)
+    veh_slot_taken[i] = flags[i] >= 0;
+}
+
+static void *veh_pool_find_new(void) {
+  uint8_t *entries;
+  const int8_t *flags;
+  int size;
+  if (!veh_pool(&entries, &flags, &size))
+    return NULL;
+  for (int i = 0; i < size; i++)
+    if (flags[i] >= 0 && !veh_slot_taken[i])
+      return entries + (size_t)i * VEHPOOL_STRIDE;
+  return NULL;
+}
+
 static void menu_spawn_vehicle(int idx) {
   if (idx < 0 || idx >= vehicles_ready)
     return;
@@ -1570,10 +1697,30 @@ static void menu_spawn_vehicle(int idx) {
   pos[1] = ppos[1] + fwd[1] * SPAWN_AHEAD;
   pos[2] = -1000.0f;
 
+  veh_pool_snapshot();
   spawn_in_model(v->id, pos);
+  void *veh = veh_pool_find_new();
 
-  debugPrintf("MENU: spawn %s (model %d) via SpawnInModel -> %.1f, %.1f, %.1f\n",
-              v->label, v->id, pos[0], pos[1], pos[2]);
+  debugPrintf("MENU: spawn %s (model %d) -> %.1f, %.1f, %.1f, vehicle %p\n",
+              v->label, v->id, pos[0], pos[1], pos[2], veh);
+
+  if (veh) {
+    // SpawnInModel never touches the rotation, and it has no callers anywhere in
+    // this build -- so nothing has ever exercised whatever the constructor
+    // leaves in the matrix. The hand-built version set it from the player and
+    // was at least visible before it fell; this one is not visible at all, which
+    // is what a degenerate matrix looks like. Give it the player's rotation,
+    // which is also how it ends up facing the right way.
+    memcpy((char *)veh + VEH_MATRIX, (const char *)ped + VEH_MATRIX, 48);
+
+    const float *m = (const float *)((uintptr_t)veh + VEH_MATRIX);
+    const float *p = (const float *)((uintptr_t)veh + VEH_POS);
+    debugPrintf("MENU: %s rows (%.2f %.2f %.2f)(%.2f %.2f %.2f)(%.2f %.2f %.2f) "
+                "pos %.1f %.1f %.1f\n",
+                v->label, m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10],
+                p[0], p[1], p[2]);
+    veh_track_begin(veh, v->label);
+  }
 
   snprintf(toast, sizeof(toast), "%s spawned", v->label);
   toast_pending = 1;
@@ -1798,6 +1945,7 @@ void menu_tick(int in_game) {
   }
 
   menu_apply_toggles();
+  veh_track_tick();
 
   const u64 down = g_menu_pad_down;
   const u64 pressed = down & ~menu_pad_prev;
@@ -1915,6 +2063,10 @@ void menu_init(void) {
   ms_model_info_ptrs = (void ***)need_sym("_ZN10CModelInfo16ms_modelInfoPtrsE");
 
   spawn_in_model = (spawn_in_model_fn)need_sym("_Z12SpawnInModeli7CVector");
+  ms_p_vehicle_pool = (void **)need_sym("_ZN6CPools15ms_pVehiclePoolE");
+  pools_get_vehicle_ref =
+      (get_vehicle_ref_fn)need_sym("_ZN6CPools13GetVehicleRefEP8CVehicle");
+  pools_get_vehicle = (get_vehicle_fn)need_sym("_ZN6CPools10GetVehicleEi");
   request_model = (request_model_fn)need_sym("_ZN10CStreaming12RequestModelEii");
   load_all_models = (load_all_models_fn)need_sym("_ZN10CStreaming22LoadAllRequestedModelsEb");
   is_car_model = (is_model_fn)need_sym("_ZN10CModelInfo10IsCarModelEi");
