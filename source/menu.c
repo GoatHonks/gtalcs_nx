@@ -235,6 +235,23 @@ static int fly_patch_applied = 0;
 // called when the toggle changes, never per frame, and never while the game
 // could be inside FlyingControl -- the menu runs on the game thread, between
 // frames.
+// Reads the two instructions and decides whether they are ours to change. Runs
+// once, on the first menu open, because the image is not mapped where these
+// addresses point until well after menu_init.
+static void fly_patch_probe(void) {
+  static int done = 0;
+  if (done || !fly_patch_addr[0])
+    return;
+  done = 1;
+
+  const uint32_t got[2] = { *(const uint32_t *)fly_patch_addr[0],
+                            *(const uint32_t *)fly_patch_addr[1] };
+  fly_patch_ok = (got[0] == FLY_CAP_STOCK && got[1] == FLY_FLOOR_STOCK);
+  debugPrintf("MENU: flying ceiling %s (found %08x %08x, wanted %08x %08x)\n",
+              fly_patch_ok ? "patchable" : "NOT patchable",
+              got[0], got[1], FLY_CAP_STOCK, FLY_FLOOR_STOCK);
+}
+
 static int fly_patch_write(const uint32_t *words) {
   if (!fly_patch_ok)
     return 0;
@@ -1621,6 +1638,7 @@ void menu_tick(int in_game) {
   if (!menu_open) {
     if (pressed & HidNpadButton_Minus) {
       menu_resolve_vehicles();
+      fly_patch_probe();
       menu_open = 1;
       g_menu_open = 1;
       menu_cursor = 0;
@@ -1702,21 +1720,17 @@ void menu_init(void) {
   ctext_instance = (void **)need_sym("_ZN5CText10msInstanceE");
 
   gp_the_zones = (void **)need_sym("gpTheZones");
-  // The two instructions are only patched if they are exactly what the
-  // disassembly of this build says they are. A different build, or an offset
-  // that has drifted, leaves the toggle inert rather than writing a MOVZ into
-  // the middle of something else.
+  // Address only. Reading through it here would fault: so_try_find_addr_rx
+  // returns a load_virtbase address and menu_init runs from patch_game, which
+  // is before so_finalize maps that region. Every other symbol resolved in this
+  // function is stored and not dereferenced until a frame is running, which is
+  // why nothing else has ever tripped over it. The verify happens in
+  // fly_patch_probe, on the lazy path.
   const uintptr_t fc = so_try_find_addr_rx(&game_mod,
                                            "_ZN8CVehicle13FlyingControlE12eFlightModel");
   if (fc) {
     fly_patch_addr[0] = fc + FLY_CEILING_OFF_CAP;
     fly_patch_addr[1] = fc + FLY_CEILING_OFF_FLOOR;
-    const uint32_t got[2] = { *(const uint32_t *)fly_patch_addr[0],
-                              *(const uint32_t *)fly_patch_addr[1] };
-    fly_patch_ok = (got[0] == FLY_CAP_STOCK && got[1] == FLY_FLOOR_STOCK);
-    debugPrintf("MENU: flying ceiling %s (found %08x %08x, wanted %08x %08x)\n",
-                fly_patch_ok ? "patchable" : "NOT patchable",
-                got[0], got[1], FLY_CAP_STOCK, FLY_FLOOR_STOCK);
   } else {
     debugPrintf("MENU: CVehicle::FlyingControl not found\n");
   }

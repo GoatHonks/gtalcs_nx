@@ -107,6 +107,14 @@ All derived by disassembling the named function in this build.
 | radar blips | `CRadar::ms_RadarTrace`, 75 × 60 | `CRadar::SetTargetBlip` |
 | blip type / pos | `+40` (2=char, 4=coord) / `+12,+16,+20` | ditto + runtime dump |
 
+**Do not dereference a resolved address inside `menu_init`.** It runs from
+`patch_game`, and `so_try_find_addr_rx` returns a `load_virtbase` address that
+**is not mapped until `so_finalize`** — reading through one there is an instant
+boot crash with the log stopping right after the port's last hook line. Storing
+the address is fine, and is why every other symbol got away with it for months.
+Anything that needs to *read* game memory belongs on the lazy path that runs when
+the menu is first opened.
+
 `FindPlayerPed()` returns the player ped.
 
 **`CVector` is passed by pointer, not in `s0/s1/s2` — do not trust the mangled
