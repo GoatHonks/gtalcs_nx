@@ -743,16 +743,45 @@ static uint8_t *radar_trace = NULL;
 // mysterious.
 static uint8_t *menu_target_on = NULL;
 static float *menu_target_pos = NULL;
+static float *radar_map_waypoint = NULL;   // CRadar::MapWayPoint, two floats
+static int *menu_target_blip_index = NULL;
 
+// Where the marker you place actually lives is still unknown, so this reports
+// every candidate at once rather than guessing at a fourth.
+//
+// Ruled out so far, each by looking rather than reasoning:
+//   - ms_RadarTrace holds only two blips with a marker placed, sprite 40 by the
+//     player and sprite 19 on the home icon. The array is the right one: it is
+//     0x1194 bytes, exactly 75 x 60, and +43 is the in-use byte per
+//     CRadar::SetTargetBlip's own free-slot scan.
+//   - CMenuManager::m_TargetIsOn stays 0 and m_fTargetPos stays 0,0.
+//   - CRadar::MapWayPoint and m_TargetBlipIndex have no writers at all outside
+//     save/load -- checked for both GOT access and same-module addressing.
+//
+// Something draws that pin on the map and on the radar, so the data exists. The
+// blip sweep below now reports any slot with a non-zero position regardless of
+// its in-use byte, in case the marker is stored with a different convention.
 static int menu_find_marker(float *out_x, float *out_y) {
-  if (menu_target_on && menu_target_pos) {
-    debugPrintf("MENU: map target on=%u at %.1f, %.1f\n", *menu_target_on,
-                menu_target_pos[0], menu_target_pos[1]);
-    if (*menu_target_on) {
-      *out_x = menu_target_pos[0];
-      *out_y = menu_target_pos[1];
-      return 1;
-    }
+  if (radar_map_waypoint)
+    debugPrintf("MENU: CRadar::MapWayPoint = %.1f, %.1f\n",
+                radar_map_waypoint[0], radar_map_waypoint[1]);
+  if (menu_target_blip_index)
+    debugPrintf("MENU: m_TargetBlipIndex = %d\n", *menu_target_blip_index);
+  if (menu_target_on && menu_target_pos)
+    debugPrintf("MENU: m_TargetIsOn=%u m_fTargetPos = %.1f, %.1f\n",
+                *menu_target_on, menu_target_pos[0], menu_target_pos[1]);
+
+  if (radar_map_waypoint &&
+      (radar_map_waypoint[0] != 0.0f || radar_map_waypoint[1] != 0.0f)) {
+    *out_x = radar_map_waypoint[0];
+    *out_y = radar_map_waypoint[1];
+    return 1;
+  }
+
+  if (menu_target_on && menu_target_pos && *menu_target_on) {
+    *out_x = menu_target_pos[0];
+    *out_y = menu_target_pos[1];
+    return 1;
   }
 
   if (!radar_trace)
@@ -761,20 +790,20 @@ static int menu_find_marker(float *out_x, float *out_y) {
   int found = 0;
   for (int i = 0; i < BLIP_COUNT; i++) {
     const uint8_t *b = radar_trace + (size_t)i * BLIP_STRIDE;
-    if (!b[BLIP_INUSE])
+    const float x = *(const float *)(b + BLIP_POS);
+    const float y = *(const float *)(b + BLIP_POS + 4);
+    if (!b[BLIP_INUSE] && x == 0.0f && y == 0.0f)
       continue;
 
     const uint16_t sprite = *(const uint16_t *)(b + BLIP_SPRITE);
-    debugPrintf("MENU: blip %d sprite %u at %.1f, %.1f\n", i, sprite,
-                *(const float *)(b + BLIP_POS),
-                *(const float *)(b + BLIP_POS + 4));
+    debugPrintf("MENU: blip %2d use=%u sprite=%u at %.1f, %.1f\n", i,
+                b[BLIP_INUSE], sprite, x, y);
 
-    if (sprite != BLIP_SPRITE_WAYPOINT)
-      continue;
-
-    *out_x = *(const float *)(b + BLIP_POS);
-    *out_y = *(const float *)(b + BLIP_POS + 4);
-    found = 1;
+    if (b[BLIP_INUSE] && sprite == BLIP_SPRITE_WAYPOINT) {
+      *out_x = x;
+      *out_y = y;
+      found = 1;
+    }
   }
   return found;
 }
@@ -2141,6 +2170,9 @@ void menu_init(void) {
   fly_height_limit = (float *)need_sym("_ZN8CVehicle17rcHeliHeightLimitE");
   menu_target_on = (uint8_t *)need_sym("_ZN12CMenuManager12m_TargetIsOnE");
   menu_target_pos = (float *)need_sym("_ZN12CMenuManager12m_fTargetPosE");
+  radar_map_waypoint = (float *)need_sym("_ZN6CRadar11MapWayPointE");
+  menu_target_blip_index =
+      (int *)need_sym("_ZN12CMenuManager17m_TargetBlipIndexE");
   fly_raise_hard_cap();
   find_node_closest =
       (find_node_fn)need_sym("_ZN9CPathFind22FindNodeClosestToCoorsE7CVectorhfbbbb");
