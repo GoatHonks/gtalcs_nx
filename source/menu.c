@@ -211,6 +211,52 @@ static int cheats_ready = 0;
 // this purpose. No code patching, and nothing borrowed from a neighbour: the
 // last attempt parked two floats in VehicleNames and took every vehicle's
 // collision with it.
+// Writing 8000.0 there on its own changed nothing, and the log shows why: the
+// stock limit is 60.0, and the two branches of FlyingControl work out to the
+// same formula.
+//
+//   if (z > rcHeliHeightLimit)  lift *= 10 / ((z - limit) - 10)
+//   else if (z > 80.0)          lift *= 10 / (z - 70)
+//
+// With limit 60 the first branch gives 10/(z-70). With limit 8000 the first
+// branch never fires and the second gives 10/(z-70). Identical. The 80/-70 pair
+// is the real ceiling, and it is two MOVZ immediates in the code.
+//
+// So both halves are needed: patch those immediates once at init to 300/-290 --
+// plain instruction rewriting, no borrowed storage this time -- and have the
+// toggle push rcHeliHeightLimit out of the way so the patched branch is the one
+// that runs. Toggled off, the limit goes back to 60, the first branch governs
+// again, and the patched constants are unreachable, so stock behaviour is exact.
+#define FLY_OFF_CAP   0x69c
+#define FLY_OFF_FLOOR 0x6ac
+
+#define MOVZ_W8_HI(imm16) (0x52a00000u | ((uint32_t)(imm16) << 5) | 8u)
+#define FLY_CAP_STOCK   MOVZ_W8_HI(0x42a0)   //   80.0
+#define FLY_FLOOR_STOCK MOVZ_W8_HI(0xc28c)   //  -70.0
+#define FLY_CAP_HIGH    MOVZ_W8_HI(0x4396)   //  300.0
+#define FLY_FLOOR_HIGH  MOVZ_W8_HI(0xc391)   // -290.0
+
+// Runs from menu_init, while the image is still only mapped at load_base.
+static void fly_raise_hard_cap(void) {
+  const uintptr_t fc =
+      so_try_find_addr_rx(&game_mod, "_ZN8CVehicle13FlyingControlE12eFlightModel");
+  if (!fc || !game_mod.load_base || !game_mod.load_virtbase)
+    return;
+
+  const uintptr_t virt = (uintptr_t)game_mod.load_virtbase;
+  const uintptr_t base = (uintptr_t)game_mod.load_base;
+  uint32_t *const cap = (uint32_t *)(base + (fc + FLY_OFF_CAP - virt));
+  uint32_t *const floor_ = (uint32_t *)(base + (fc + FLY_OFF_FLOOR - virt));
+
+  if (*cap != FLY_CAP_STOCK || *floor_ != FLY_FLOOR_STOCK) {
+    debugPrintf("MENU: flying cap NOT patched, found %08x %08x\n", *cap, *floor_);
+    return;
+  }
+  *cap = FLY_CAP_HIGH;
+  *floor_ = FLY_FLOOR_HIGH;
+  debugPrintf("MENU: flying cap 80 -> 300 (only reached while Fly higher is on)\n");
+}
+
 #define FLY_LIMIT_HIGH 8000.0f
 
 static float *fly_height_limit = NULL;
@@ -683,7 +729,32 @@ static level_from_pos_fn level_from_position = NULL;
 
 static uint8_t *radar_trace = NULL;
 
+// The marker you place is not a radar blip at all.
+//
+// The blip dump settled that: with a marker on the map, ms_RadarTrace held
+// exactly two entries -- sprite 40 next to the player and sprite 19 on the home
+// icon, which is the one it kept teleporting to. Nothing for the waypoint.
+// CRadar::MapWayPoint is 8 bytes and looks right, but only CRadar::Shutdown and
+// LoadAllRadarBlips touch it, so it is not where a live marker lives either.
+//
+// CMenuManager keeps it: m_TargetIsOn is a byte saying whether one is placed and
+// m_fTargetPos is the two floats. Both are logged, so if the coordinates turn
+// out to be map-space rather than world-space that will be obvious rather than
+// mysterious.
+static uint8_t *menu_target_on = NULL;
+static float *menu_target_pos = NULL;
+
 static int menu_find_marker(float *out_x, float *out_y) {
+  if (menu_target_on && menu_target_pos) {
+    debugPrintf("MENU: map target on=%u at %.1f, %.1f\n", *menu_target_on,
+                menu_target_pos[0], menu_target_pos[1]);
+    if (*menu_target_on) {
+      *out_x = menu_target_pos[0];
+      *out_y = menu_target_pos[1];
+      return 1;
+    }
+  }
+
   if (!radar_trace)
     return 0;
 
@@ -2068,6 +2139,9 @@ void menu_init(void) {
       (level_from_pos_fn)need_sym("_ZN9CTheZones20GetLevelFromPositionEPK7CVector");
   radar_trace = (uint8_t *)need_sym("_ZN6CRadar13ms_RadarTraceE");
   fly_height_limit = (float *)need_sym("_ZN8CVehicle17rcHeliHeightLimitE");
+  menu_target_on = (uint8_t *)need_sym("_ZN12CMenuManager12m_TargetIsOnE");
+  menu_target_pos = (float *)need_sym("_ZN12CMenuManager12m_fTargetPosE");
+  fly_raise_hard_cap();
   find_node_closest =
       (find_node_fn)need_sym("_ZN9CPathFind22FindNodeClosestToCoorsE7CVectorhfbbbb");
   find_zone_by_label =
