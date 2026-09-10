@@ -866,75 +866,50 @@ static void menu_label_places(void) {
 // request, load, allocate, construct, write the matrix, CWorld::Add -- with the
 // class chosen from CModelInfo rather than from an id range, and the position
 // taken from the player rather than from a path node.
-#define VEH_MATRIX     16    // three 16-byte rotation rows, +16..+63
-#define VEH_MATRIX_LEN 48
-#define VEH_POS        64    // x,y at +64/+68 and z at +72, per VehicleCheat's
-                             // str d1,[x20,#64] / str s0,[x20,#72]
-#define VEH_STATUS     784   // VehicleCheat's str w9(#1),[x20,#784]
-
-// CEntity::m_level -- which island the entity belongs to.
-//
-// CEntity::SetupBigBuilding sets it the way everything in the world gets one:
-//
-//   bl    CTheZones::GetLevelFromPosition
-//   strb  w0, [x19, #126]
-//
-// and CWorld::Add and CWorld::Remove both read it. Nothing we construct ever
-// set it, so a spawned vehicle carried whatever the constructor left -- which
-// reads as belonging to a different island than the one you are standing on,
-// and the game tidies away things that are not on the current island no matter
-// how close they are. That is the shape of "it appears for a second and then it
-// is gone".
-#define ENTITY_LEVEL 126
-
-// The entity flags word, and the one write that was missing. VehicleCheat does
-//
-//   ldr x10,[x20,#88] / and x10,x10,#0xfffffffffffffe0f / orr x8,x10,#0x40
-//
-// which clears the five-bit field at bit 4 and sets it to 4 -- STATUS_ABANDONED,
-// the status a parked car is meant to have. 82 other places in the binary write
-// this same field, so it is not incidental. Leaving it at whatever the
-// constructor produced is why spawned vehicles stopped appearing: they were
-// built and added to the world, but with a status the engine does not process
-// or draw.
-#define VEH_FLAGS            88
-#define VEH_STATUS_MASK      0x1f0ULL
-#define VEH_STATUS_ABANDONED 0x40ULL
+#define VEH_MATRIX  16    // three 16-byte rotation rows, +16..+63
+#define VEH_POS     64    // x,y at +64/+68 and z at +72
 
 // The player's forward vector is the second matrix row: CPlaceable::SetHeading
 // builds row0 = (cos, sin, 0) and row1 = (-sin, cos, 0), and GTA faces +y.
-#define PED_FORWARD    (VEH_MATRIX + 16)
-#define SPAWN_AHEAD    5.0f
+#define PED_FORWARD (VEH_MATRIX + 16)
+#define SPAWN_AHEAD 5.0f
 
-// Allocation sizes come from the callers of each constructor: CVehicle::operator
-// new is handed 0x7b0 before CAutomobile, 0x6a0 before CBike and 0x610 before
-// CBoat.
-#define VEH_SIZE_AUTO 0x7b0
-#define VEH_SIZE_BIKE 0x6a0
-#define VEH_SIZE_BOAT 0x610
-#define VEH_SIZE_HELI 0x490
-
-// Planes and trains are deliberately absent. `CPlane::CPlane` exists but nothing
-// in this build ever calls it -- LCS has no flyable plane -- so its allocation
-// size cannot be read off a caller the way the others can, and guessing the size
-// of a heap allocation is not worth a spawnable Dodo. Trains need rails.
+// Planes and trains are deliberately absent: LCS has no flyable plane -- nothing
+// in this build even calls CPlane's constructor -- and trains need rails.
 typedef enum { VEH_AUTO = 0, VEH_BIKE, VEH_BOAT, VEH_HELI } veh_kind;
+
+// SpawnInModel(int model, CVector &pos) is the game's own vehicle spawner, and
+// hand-rolling one instead was the whole problem. Ours built the vehicle and
+// added it to the world, and it fell straight through the map -- x and y frozen,
+// z going 11.7, 10.5, 4.6, -6.4, -22.5, -43.5 until CWorld::RemoveFallenCars
+// swept it up below -100. Boats did not even manage that; their z came out NaN.
+//
+// The game's version does a dozen things ours did not, and rather than guess
+// which one grants collision, this now calls it. Among the differences:
+//
+//   RequestModel(id, 4)          not 1
+//   constructors take createdBy 2, not 1
+//   CBike / CHeli / CBoat / CAutomobile chosen by the Is*Model predicates,
+//     with CHeli::ActivateHeli(false) and a bike-specific flag at +1540
+//   z = FindGroundZForCoord + CEntity::GetDistanceFromCentreOfMassToBaseOfModel
+//     -- the model's own height, rather than our flat +1.0
+//   CCarCtrl::JoinCarWithRoadSystem
+//   several flag writes at +717, and the level byte at +390, not +126
+//
+// The CVector is by reference and is written back with the settled position, so
+// the log shows where the vehicle actually ended up.
+typedef void (*spawn_in_model_fn)(int model, float *pos);
+static spawn_in_model_fn spawn_in_model = NULL;
 
 static const char *const veh_kind_name[] = { "Car", "Bike", "Boat", "Helicopter" };
 
-typedef void *(*vehicle_new_fn)(size_t size);
-typedef void (*vehicle_ctor_fn)(void *self, int model, unsigned char created_by);
-typedef void (*world_add_fn)(void *entity);
+// Streaming and classification are still ours -- the list is built from the
+// model table and peds are loaded the same way -- but nothing here constructs a
+// vehicle any more. SpawnInModel does that, and does it correctly.
 typedef void (*request_model_fn)(int model, int flags);
 typedef void (*load_all_models_fn)(int prio);
 typedef char (*is_model_fn)(int model);
 
-static vehicle_new_fn vehicle_new = NULL;
-static vehicle_ctor_fn automobile_ctor = NULL;
-static vehicle_ctor_fn bike_ctor = NULL;
-static vehicle_ctor_fn boat_ctor = NULL;
-static vehicle_ctor_fn heli_ctor = NULL;
-static world_add_fn world_add = NULL;
 static request_model_fn request_model = NULL;
 static load_all_models_fn load_all_models = NULL;
 static is_model_fn is_car_model = NULL;
@@ -1570,73 +1545,10 @@ static void menu_teleport_to_marker(void) {
   menu_teleport_xy(x, y, 0, "the marker");
 }
 
-// ---- watching a spawned vehicle ----
-//
-// If they still vanish, the useful question is *when*: a fixed delay points at
-// something periodic, and an instant one points at the add itself. The pool
-// handle is the safe way to ask -- CPools::GetVehicle checks the slot's flag
-// byte against the handle, so a freed or reused slot answers NULL instead of
-// handing back a dangling pointer to read.
-typedef int (*get_vehicle_ref_fn)(void *veh);
-typedef void *(*get_vehicle_fn)(int ref);
-static get_vehicle_ref_fn pools_get_vehicle_ref = NULL;
-static get_vehicle_fn pools_get_vehicle = NULL;
-
-static int veh_track_ref = 0;
-static u64 veh_track_t0 = 0;
-static u64 veh_track_next_report = 0;
-static char veh_track_label[28];
-
-static void veh_track_begin(void *veh, const char *label) {
-  if (!pools_get_vehicle_ref || !pools_get_vehicle)
-    return;
-  veh_track_ref = pools_get_vehicle_ref(veh);
-  veh_track_t0 = armTicksToNs(armGetSystemTick());
-  veh_track_next_report = 0;
-  snprintf(veh_track_label, sizeof(veh_track_label), "%s", label);
-  debugPrintf("MENU: watching %s, pool ref %d\n", veh_track_label, veh_track_ref);
-}
-
-static void veh_track_tick(void) {
-  if (!veh_track_ref || !pools_get_vehicle)
-    return;
-
-  const u64 ms = (armTicksToNs(armGetSystemTick()) - veh_track_t0) / 1000000ull;
-
-  void *veh = pools_get_vehicle(veh_track_ref);
-  if (!veh) {
-    debugPrintf("MENU: %s was removed from the pool after %llu ms\n",
-                veh_track_label, (unsigned long long)ms);
-    veh_track_ref = 0;
-    return;
-  }
-
-  // Where it is, twice a second, while it still exists.
-  //
-  // Every spawn so far has been removed after a remarkably consistent 3.4-3.7
-  // seconds. CCarCtrl::PossiblyRemoveVehicle only removes at a distance (its
-  // thresholds are 190 and 70 units, and these sit five away), but
-  // CWorld::RemoveFallenCars deletes anything below z = -100, and falling from
-  // ground level to -100 takes about that long. If these numbers march
-  // downwards, the vehicle is falling through the map and the fix belongs at
-  // the spawn, not in whatever deletes it afterwards.
-  if (ms >= veh_track_next_report) {
-    veh_track_next_report = ms + 500;
-    const float *p = (const float *)((uintptr_t)veh + VEH_POS);
-    const uint64_t flags = *(const uint64_t *)((uintptr_t)veh + VEH_FLAGS);
-    debugPrintf("MENU: %s at %llu ms: %.1f, %.1f, %.1f  status %u  level %u\n",
-                veh_track_label, (unsigned long long)ms,
-                p[0], p[1], p[2],
-                (unsigned)((flags & VEH_STATUS_MASK) >> 4),
-                *(const uint8_t *)((uintptr_t)veh + ENTITY_LEVEL));
-  }
-}
-
 static void menu_spawn_vehicle(int idx) {
   if (idx < 0 || idx >= vehicles_ready)
     return;
-  if (!vehicle_new || !world_add || !request_model || !load_all_models ||
-      !find_player_ped || !automobile_ctor) {
+  if (!spawn_in_model || !find_player_ped) {
     snprintf(toast, sizeof(toast), "Spawning unavailable");
     toast_pending = 1;
     return;
@@ -1648,75 +1560,20 @@ static void menu_spawn_vehicle(int idx) {
 
   const menu_veh_entry *v = &veh_list[idx];
 
-  // Blocking load, the same pair VehicleCheat uses.
-  request_model(v->id, 1);
-  load_all_models(0);
-
-  // A model whose collision never loaded is not built. Constructing against an
-  // incomplete model is how model 198 takes the game down, and while this check
-  // is not proven to be the same fault, refusing to build is always better than
-  // finding out inside a constructor.
-  const uint8_t *info = model_info_for(v->id);
-  if (!model_has_clump(v->id) ||
-      (info && !*(void *const *)(info + MODELINFO_COL_MODEL))) {
-    debugPrintf("MENU: %s (model %d) did not load (clump %d, collision %d), "
-                "refusing to spawn\n",
-                v->label, v->id, model_has_clump(v->id),
-                info && *(void *const *)(info + MODELINFO_COL_MODEL) ? 1 : 0);
-    snprintf(toast, sizeof(toast), "%s is incomplete", v->label);
-    toast_pending = 1;
-    return;
-  }
-
-  size_t size;
-  vehicle_ctor_fn ctor;
-  switch (v->kind) {
-    case VEH_BIKE: size = VEH_SIZE_BIKE; ctor = bike_ctor; break;
-    case VEH_BOAT: size = VEH_SIZE_BOAT; ctor = boat_ctor; break;
-    case VEH_HELI: size = VEH_SIZE_HELI; ctor = heli_ctor; break;
-    default:       size = VEH_SIZE_AUTO; ctor = automobile_ctor; break;
-  }
-  if (!ctor)
-    return;
-
-  void *veh = vehicle_new(size);
-  if (!veh) {
-    debugPrintf("MENU: no room for %s\n", v->label);
-    return;
-  }
-  ctor(veh, v->id, 1);   // 1 = created by the game rather than by a mission
-
-  // Face it the way the player is facing by copying their three rotation rows,
-  // which is both simpler and safer than building a matrix from a heading.
-  memcpy((char *)veh + VEH_MATRIX, (const char *)ped + VEH_MATRIX, VEH_MATRIX_LEN);
-
-  // Just in front of the player rather than on a path node up the road.
+  // Just in front of the player. SpawnInModel drops it to the ground itself, so
+  // only x and y matter -- z is handed in below the fallen-car threshold so that
+  // its own FindGroundZForCoord branch is the one that runs.
   const float *ppos = (const float *)((uintptr_t)ped + PED_POS);
   const float *fwd = (const float *)((uintptr_t)ped + PED_FORWARD);
-  float *vpos = (float *)((uintptr_t)veh + VEH_POS);
-  vpos[0] = ppos[0] + fwd[0] * SPAWN_AHEAD;
-  vpos[1] = ppos[1] + fwd[1] * SPAWN_AHEAD;
-  vpos[2] = find_ground_z ? find_ground_z(vpos[0], vpos[1]) + 1.0f : ppos[2];
+  float pos[3];
+  pos[0] = ppos[0] + fwd[0] * SPAWN_AHEAD;
+  pos[1] = ppos[1] + fwd[1] * SPAWN_AHEAD;
+  pos[2] = -1000.0f;
 
-  uint64_t *flags = (uint64_t *)((uintptr_t)veh + VEH_FLAGS);
-  *flags = (*flags & ~VEH_STATUS_MASK) | VEH_STATUS_ABANDONED;
+  spawn_in_model(v->id, pos);
 
-  *(int *)((uintptr_t)veh + VEH_STATUS) = 1;
-
-  // Before CWorld::Add, because that is what reads it.
-  uint8_t *level = (uint8_t *)((uintptr_t)veh + ENTITY_LEVEL);
-  const uint8_t was_level = *level;
-  if (level_from_position && gp_the_zones && *gp_the_zones)
-    *level = (uint8_t)level_from_position(*gp_the_zones, vpos);
-
-  world_add(veh);
-
-  debugPrintf("MENU: spawn %s (model %d, kind %d) at %.1f, %.1f, %.1f, "
-              "level %u (was %u)\n",
-              v->label, v->id, (int)v->kind, vpos[0], vpos[1], vpos[2],
-              *level, was_level);
-
-  veh_track_begin(veh, v->label);
+  debugPrintf("MENU: spawn %s (model %d) via SpawnInModel -> %.1f, %.1f, %.1f\n",
+              v->label, v->id, pos[0], pos[1], pos[2]);
 
   snprintf(toast, sizeof(toast), "%s spawned", v->label);
   toast_pending = 1;
@@ -1941,7 +1798,6 @@ void menu_tick(int in_game) {
   }
 
   menu_apply_toggles();
-  veh_track_tick();
 
   const u64 down = g_menu_pad_down;
   const u64 pressed = down & ~menu_pad_prev;
@@ -2058,15 +1914,7 @@ void menu_init(void) {
   text_get = (text_get_fn)need_sym("_ZN5CText3GetEPKc");
   ms_model_info_ptrs = (void ***)need_sym("_ZN10CModelInfo16ms_modelInfoPtrsE");
 
-  vehicle_new = (vehicle_new_fn)need_sym("_ZN8CVehiclenwEm");
-  automobile_ctor = (vehicle_ctor_fn)need_sym("_ZN11CAutomobileC1Eih");
-  bike_ctor = (vehicle_ctor_fn)need_sym("_ZN5CBikeC1Eih");
-  boat_ctor = (vehicle_ctor_fn)need_sym("_ZN5CBoatC1Eih");
-  heli_ctor = (vehicle_ctor_fn)need_sym("_ZN5CHeliC1Eih");
-  world_add = (world_add_fn)need_sym("_ZN6CWorld3AddEP7CEntity");
-  pools_get_vehicle_ref =
-      (get_vehicle_ref_fn)need_sym("_ZN6CPools13GetVehicleRefEP8CVehicle");
-  pools_get_vehicle = (get_vehicle_fn)need_sym("_ZN6CPools10GetVehicleEi");
+  spawn_in_model = (spawn_in_model_fn)need_sym("_Z12SpawnInModeli7CVector");
   request_model = (request_model_fn)need_sym("_ZN10CStreaming12RequestModelEii");
   load_all_models = (load_all_models_fn)need_sym("_ZN10CStreaming22LoadAllRequestedModelsEb");
   is_car_model = (is_model_fn)need_sym("_ZN10CModelInfo10IsCarModelEi");

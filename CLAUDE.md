@@ -147,6 +147,17 @@ up silently.
 - **`TankCheat` is not a tank cheat.** It walks a counter over the vehicle model
   range (130..216, skipping planes) and hands the result to `VehicleCheat`, so it
   spawns a *different* vehicle each press. It is listed as "Random vehicle".
+- **`SpawnInModel(int model, CVector &pos)` is the game's own vehicle spawner —
+  use it.** Building a vehicle by hand (operator new, constructor, matrix,
+  `CWorld::Add`) produced one that **fell straight through the map**: x and y
+  frozen, z 11.7 → 10.5 → 4.6 → −6.4 → −43.5 until `CWorld::RemoveFallenCars`
+  swept it below −100, about 3.5 seconds later. Boats came out with `z = NaN`.
+  `SpawnInModel` differs in a dozen ways — `RequestModel(id, **4**)`, `createdBy`
+  **2**, class by `Is*Model` with `CHeli::ActivateHeli(false)` and a bike flag at
+  `+1540`, `z = FindGroundZForCoord + CEntity::GetDistanceFromCentreOfMassToBaseOfModel`,
+  `CCarCtrl::JoinCarWithRoadSystem`, flag writes at `+717`, and the level byte at
+  **`+390`**, not the `+126` that `SetupBigBuilding` uses. The `CVector` is by
+  reference and is written back with the settled position.
 - **`VehicleCheat(modelId)` is only safe for cars and bikes.** It picks the class
   from the id alone (`CBike` for `0xCA..0xD2`, `CAutomobile` for everything else),
   so a boat is constructed as a car and the game dies — that is what crashed on
@@ -223,18 +234,6 @@ at an `END_THREAD` stub instead and let the game retire it.
 
 ## Outstanding
 
-- **Spawned vehicles vanish after ~3.5 seconds.** Not a regression: the spawn
-  code is unchanged since the build whose screenshots showed them parked. The
-  pool watchdog measured it — 3682, 3478, 3438, 3680 ms — so something periodic
-  removes them, and setting `CEntity::m_level` (`+126`, from
-  `GetLevelFromPosition`, read by `CWorld::Add`/`Remove`) did **not** stop it,
-  though it is correct and stays.
-  `CCarCtrl::PossiblyRemoveVehicle` is ruled out: it only removes at distance
-  (thresholds 190 and 70 units; these sit five away). **Current suspect:
-  `CWorld::RemoveFallenCars`, which deletes anything below `z = -100`** — a fall
-  from ground level takes about 3.5 seconds, which fits. The watchdog now logs
-  position twice a second, so the next log says outright whether they are
-  falling.
 - **Bodyguards** — crashed four times, all on the same call. The instrumented
   log settled it: `AddPed` **succeeds**, and `CPed::SetPlayerToFollow` then dies
   on `ldr x10,[x19,#1552]` / `ldrsh w8,[x10,#124]` with no null check — a ped
