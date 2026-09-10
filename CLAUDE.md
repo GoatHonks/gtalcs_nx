@@ -285,6 +285,13 @@ at an `END_THREAD` stub instead and let the game retire it.
   Ped type is `PEDTYPE_GANG1` (7) with `CPopulation::ChooseGangOccupation(0)`
   picking the model, and `CPed::SetPlayerToFollow(0)` doing the following.
 - **Strong tyres** — candidate flags are `CVehicle::bCheat3`…`bCheat10`, unnamed.
+- **Unused vehicles (corpse, mini, topfun, …) are not in the stock game.** The
+  mod in `MODINFO/gta lcs unused vehicles` adds them as models 218/223/224/226/239
+  by shipping a modified `DEFAULT.IDE` plus textures. Nothing to do in the menu:
+  the spawn list is built by **walking the model table**, so installing that mod
+  makes them appear on their own. That IDE is also the authority on names —
+  it is what says 211 is `rcgoblin` and 212 `rcraider`, two different RC
+  vehicles rather than the duplicate I had assumed.
 - **Make the Dodo fly** — asked for, not started. It is model 164, typed as a
   car, and `MODINFO/dodo fly.csa` is **840 bytes of script**: a whole flight
   model that reads the pad, does vector maths on the vehicle matrix and applies

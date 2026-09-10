@@ -1083,7 +1083,6 @@ static void ***ms_model_info_ptrs = NULL;
 static const struct { int id; const char *why; } veh_excluded[] = {
   { 198, "crashes on spawn" },
   { 199, "takes off by itself, cannot be flown" },
-  { 212, "second copy of the RC helicopter" },
 };
 #define NUM_VEH_EXCLUDED ((int)(sizeof(veh_excluded) / sizeof(veh_excluded[0])))
 
@@ -1104,6 +1103,8 @@ static const char *veh_exclude_reason(int id) {
 // Helicopters the model table calls cars. They fly, so they belong under Air
 // even though they are built as CAutomobile.
 static int veh_model_is_air(int id) {
+  if (id == 164)          // the Dodo: a plane the model table calls a car
+    return 1;
   return id >= 211 && id <= 216;
 }
 
@@ -1111,7 +1112,11 @@ static int veh_model_is_air(int id) {
 #define MODELINFO_COL_MODEL 48
 
 static const struct { int id; const char *name; } veh_extra_names[] = {
-  { 211, "RC Helicopter (no tex)" }, // untextured; looks unfinished
+  // 211 and 212 are not the same model twice: DEFAULT.IDE calls them rcgoblin
+  // and rcraider. Both ship without textures in this build.
+  { 164, "Dodo" },                  // a plane, filed under Air; it cannot fly yet
+  { 211, "RC Goblin (no tex)" },
+  { 212, "RC Raider (no tex)" },
   { 213, "Hunter" },             // olive attack helicopter, rockets and minigun
   { 214, "Maverick" },           // civilian, cream with a blue stripe
   { 215, "Police Maverick" },    // LCPD markings, tail number P619PD
@@ -1340,6 +1345,52 @@ static set_current_weapon_fn ped_set_current_weapon = NULL;
 // the log says which number to change.
 #define BODYGUARD_WEAPON  17
 
+// ---- the vehicle you are in ----
+//
+// Colours are a byte each at +576 and +577: CAutomobile::Render, CBike::Render
+// and CBoat::Render all do
+//
+//   ldrb w2, [x19, #577] / ldrb w1, [x19, #576]
+//   bl   CVehicleModelInfo::SetVehicleColour
+//
+// so they are per-vehicle and take effect on the next frame drawn.
+//
+// Velocity and mass come from CPhysical::ApplyMoveForce, which reads the mass at
+// +240 and the velocity at +144 before adding force/mass to it. Everything here
+// is per-vehicle on purpose: the handling record at +392 is **shared by every
+// vehicle of that model**, so editing "speed" there would change every Banshee
+// in the city, not the one you are sitting in.
+#define VEH_COLOUR1   576
+#define VEH_COLOUR2   577
+#define VEH_MOVESPEED 144
+#define VEH_MASS      240
+#define VEH_NUM_COLOURS 128
+
+typedef void *(*find_player_vehicle_fn)(void);
+static find_player_vehicle_fn find_player_vehicle = NULL;
+typedef void (*apply_move_force_fn)(void *phys, float x, float y, float z);
+static apply_move_force_fn apply_move_force = NULL;
+
+typedef enum {
+  VEDIT_COLOUR1 = 0,
+  VEDIT_COLOUR2,
+  VEDIT_COLOUR_RANDOM,
+  VEDIT_BOOST,
+  VEDIT_UPRIGHT,
+  VEDIT_STOP,
+  VEDIT_NUM
+} veh_edit_action;
+
+static const char *const veh_edit_name[VEDIT_NUM] = {
+  "Next colour 1",
+  "Next colour 2",
+  "Random colours",
+  "Speed boost",
+  "Flip upright",
+  "Stop dead",
+};
+
+
 // ---- menu state ----
 #define MENU_ROWS 8
 
@@ -1347,6 +1398,7 @@ typedef enum {
   MENU_ACT_CHEATS = 0,
   MENU_ACT_TELEPORT,
   MENU_ACT_VEHICLE,
+  MENU_ACT_VEHEDIT,
   MENU_ACT_BODYGUARDS,
   MENU_ACT_CLEAR_WANTED,
   MENU_NUM_ACTIONS
@@ -1356,6 +1408,7 @@ static const char *const menu_action_name[MENU_NUM_ACTIONS] = {
   "Cheats",
   "Teleport",
   "Spawn vehicle",
+  "Edit vehicle",
   "Spawn bodyguards",
   "Clear wanted level",
 };
@@ -1375,7 +1428,8 @@ typedef enum {
   SUB_NONE = 0,
   SUB_CHEATS,
   SUB_TELEPORT,
-  SUB_VEHICLES
+  SUB_VEHICLES,
+  SUB_VEHEDIT
 } menu_sub;
 
 static menu_sub sub_kind = SUB_NONE;
@@ -1400,6 +1454,7 @@ static int sub_num_cats(void) {
     case SUB_CHEATS:   return CHEAT_NUM_CATS;
     case SUB_TELEPORT: return PLACE_NUM_CATS + 1;
     case SUB_VEHICLES: return VEH_NUM_CATS;
+    case SUB_VEHEDIT:  return 1;   // flat list, entered straight away
     default:           return 0;
   }
 }
@@ -1410,6 +1465,7 @@ static const char *sub_cat_label(int i) {
     case SUB_TELEPORT: return i == TELEPORT_CAT_MARKER ? "Map marker"
                                                        : place_cat_name[i - 1];
     case SUB_VEHICLES: return veh_cat_name[i];
+    case SUB_VEHEDIT:  return "Vehicle";
     default:           return "";
   }
 }
@@ -1419,6 +1475,7 @@ static int sub_total(void) {
     case SUB_CHEATS:   return cheats_ready;
     case SUB_TELEPORT: return MENU_NUM_PLACES;
     case SUB_VEHICLES: return vehicles_ready;
+    case SUB_VEHEDIT:  return VEDIT_NUM;
     default:           return 0;
   }
 }
@@ -1429,6 +1486,7 @@ static int sub_item_cat(int i) {
     case SUB_CHEATS:   return menu_cheats[i].cat;
     case SUB_TELEPORT: return place_cat[i] + 1;   // 0 is the map marker
     case SUB_VEHICLES: return veh_list[i].cat;
+    case SUB_VEHEDIT:  return 0;
     default:           return -1;
   }
 }
@@ -1438,6 +1496,7 @@ static const char *sub_item_label(int i) {
     case SUB_CHEATS:   return menu_cheats[i].name;
     case SUB_TELEPORT: return place_label[i];
     case SUB_VEHICLES: return veh_list[i].label;
+    case SUB_VEHEDIT:  return veh_edit_name[i];
     default:           return "";
   }
 }
@@ -1447,6 +1506,7 @@ static const char *sub_title(void) {
     case SUB_CHEATS:   return "CHEATS";
     case SUB_TELEPORT: return "TELEPORT";
     case SUB_VEHICLES: return "SPAWN VEHICLE";
+    case SUB_VEHEDIT:  return "EDIT VEHICLE";
     default:           return "";
   }
 }
@@ -1599,6 +1659,12 @@ static void menu_sub_enter(menu_sub kind) {
   sub_cat = -1;          // categories first
   cat_cursor = 0;
   sub_cursor = 0;
+
+  // Unless there is only one, in which case picking it is not a decision.
+  if (sub_num_cats() == 1) {
+    sub_cat = 0;
+    sub_build_index(0);
+  }
   menu_dirty = 1;
 }
 
@@ -2106,6 +2172,92 @@ static void menu_spawn_bodyguards(void) {
   toast_pending = 1;
 }
 
+static void menu_vehicle_edit(int action) {
+  if (!find_player_vehicle) {
+    snprintf(toast, sizeof(toast), "Vehicle editing unavailable");
+    toast_pending = 1;
+    return;
+  }
+
+  uint8_t *veh = (uint8_t *)find_player_vehicle();
+  if (!veh) {
+    snprintf(toast, sizeof(toast), "Get in a vehicle first");
+    toast_pending = 1;
+    return;
+  }
+
+  float *vel = (float *)(veh + VEH_MOVESPEED);
+  const float mass = *(const float *)(veh + VEH_MASS);
+  float *rows = (float *)(veh + VEH_MATRIX);
+
+  switch (action) {
+    case VEDIT_COLOUR1:
+      veh[VEH_COLOUR1] = (uint8_t)((veh[VEH_COLOUR1] + 1) % VEH_NUM_COLOURS);
+      snprintf(toast, sizeof(toast), "Colour 1: %u", veh[VEH_COLOUR1]);
+      break;
+
+    case VEDIT_COLOUR2:
+      veh[VEH_COLOUR2] = (uint8_t)((veh[VEH_COLOUR2] + 1) % VEH_NUM_COLOURS);
+      snprintf(toast, sizeof(toast), "Colour 2: %u", veh[VEH_COLOUR2]);
+      break;
+
+    case VEDIT_COLOUR_RANDOM: {
+      // The frame counter is as good a source of noise as anything here, and it
+      // avoids dragging in the game's RNG.
+      static unsigned seed = 12345;
+      seed = seed * 1103515245u + 12345u;
+      veh[VEH_COLOUR1] = (uint8_t)((seed >> 16) % VEH_NUM_COLOURS);
+      veh[VEH_COLOUR2] = (uint8_t)((seed >> 8) % VEH_NUM_COLOURS);
+      snprintf(toast, sizeof(toast), "Colours: %u / %u", veh[VEH_COLOUR1],
+               veh[VEH_COLOUR2]);
+      break;
+    }
+
+    case VEDIT_BOOST: {
+      // Along the vehicle's own forward vector, through the game's own force
+      // routine so the result is a push rather than a teleport. ApplyMoveForce
+      // divides by mass, so multiplying by it asks for an acceleration.
+      const float *fwd = rows + 4;   // row 1, the forward row
+      if (apply_move_force)
+        apply_move_force(veh, fwd[0] * mass * 0.35f, fwd[1] * mass * 0.35f,
+                         fwd[2] * mass * 0.35f);
+      snprintf(toast, sizeof(toast), "Boost");
+      break;
+    }
+
+    case VEDIT_UPRIGHT: {
+      // Rebuild the rotation from the heading it already has, which is what
+      // CPlaceable::SetHeading does: row0 = (cos, sin, 0), row1 = (-sin, cos, 0).
+      float fx = rows[4], fy = rows[5];
+      const float len = __builtin_sqrtf(fx * fx + fy * fy);
+      if (len < 0.0001f) {
+        fx = 0.0f; fy = 1.0f;
+      } else {
+        fx /= len; fy /= len;
+      }
+      rows[0] = fy;  rows[1] = -fx; rows[2] = 0.0f;
+      rows[4] = fx;  rows[5] = fy;  rows[6] = 0.0f;
+      rows[8] = 0.0f; rows[9] = 0.0f; rows[10] = 1.0f;
+      vel[2] = 0.2f;   // a nudge upward so it does not resolve into the ground
+      snprintf(toast, sizeof(toast), "Flipped upright");
+      break;
+    }
+
+    case VEDIT_STOP:
+      vel[0] = vel[1] = vel[2] = 0.0f;
+      snprintf(toast, sizeof(toast), "Stopped");
+      break;
+
+    default:
+      return;
+  }
+
+  debugPrintf("MENU: vehicle edit %d -> colours %u/%u, vel %g %g %g\n", action,
+              veh[VEH_COLOUR1], veh[VEH_COLOUR2], (double)vel[0], (double)vel[1],
+              (double)vel[2]);
+  toast_pending = 1;
+}
+
 static void menu_clear_wanted(void) {
   if (!cheat_wanted_level || !find_player_ped)
     return;
@@ -2142,6 +2294,7 @@ static void menu_activate(void) {
       case SUB_CHEATS:   menu_run_cheat(item);     break;
       case SUB_TELEPORT: menu_teleport_to(item);   break;
       case SUB_VEHICLES: menu_spawn_vehicle(item); break;
+      case SUB_VEHEDIT:  menu_vehicle_edit(item);  break;
       default: break;
     }
     menu_close();
@@ -2170,6 +2323,9 @@ static void menu_activate(void) {
     case MENU_ACT_VEHICLE:
       if (vehicles_ready)
         menu_sub_enter(SUB_VEHICLES);
+      break;
+    case MENU_ACT_VEHEDIT:
+      menu_sub_enter(SUB_VEHEDIT);
       break;
     case MENU_ACT_BODYGUARDS:
       menu_spawn_bodyguards();
@@ -2290,6 +2446,10 @@ void menu_init(void) {
   cheat_wanted_level = (cheat_wanted_fn)need_sym("_ZN7CWanted16CheatWantedLevelEi");
   find_ground_z = (find_ground_z_fn)need_sym("_ZN6CWorld19FindGroundZForCoordEff");
   find_player_ped = (find_player_ped_fn)need_sym("_Z13FindPlayerPedv");
+  find_player_vehicle =
+      (find_player_vehicle_fn)need_sym("_Z17FindPlayerVehiclev");
+  apply_move_force =
+      (apply_move_force_fn)need_sym("_ZN9CPhysical14ApplyMoveForceEfff");
   ped_teleport = (ped_teleport_fn)need_sym("_ZN4CPed8TeleportE7CVector");
 
   ctext_instance = (void **)need_sym("_ZN5CText10msInstanceE");
