@@ -872,6 +872,21 @@ static void menu_label_places(void) {
                              // str d1,[x20,#64] / str s0,[x20,#72]
 #define VEH_STATUS     784   // VehicleCheat's str w9(#1),[x20,#784]
 
+// CEntity::m_level -- which island the entity belongs to.
+//
+// CEntity::SetupBigBuilding sets it the way everything in the world gets one:
+//
+//   bl    CTheZones::GetLevelFromPosition
+//   strb  w0, [x19, #126]
+//
+// and CWorld::Add and CWorld::Remove both read it. Nothing we construct ever
+// set it, so a spawned vehicle carried whatever the constructor left -- which
+// reads as belonging to a different island than the one you are standing on,
+// and the game tidies away things that are not on the current island no matter
+// how close they are. That is the shape of "it appears for a second and then it
+// is gone".
+#define ENTITY_LEVEL 126
+
 // The entity flags word, and the one write that was missing. VehicleCheat does
 //
 //   ldr x10,[x20,#88] / and x10,x10,#0xfffffffffffffe0f / orr x8,x10,#0x40
@@ -1555,6 +1570,43 @@ static void menu_teleport_to_marker(void) {
   menu_teleport_xy(x, y, 0, "the marker");
 }
 
+// ---- watching a spawned vehicle ----
+//
+// If they still vanish, the useful question is *when*: a fixed delay points at
+// something periodic, and an instant one points at the add itself. The pool
+// handle is the safe way to ask -- CPools::GetVehicle checks the slot's flag
+// byte against the handle, so a freed or reused slot answers NULL instead of
+// handing back a dangling pointer to read.
+typedef int (*get_vehicle_ref_fn)(void *veh);
+typedef void *(*get_vehicle_fn)(int ref);
+static get_vehicle_ref_fn pools_get_vehicle_ref = NULL;
+static get_vehicle_fn pools_get_vehicle = NULL;
+
+static int veh_track_ref = 0;
+static u64 veh_track_t0 = 0;
+static char veh_track_label[28];
+
+static void veh_track_begin(void *veh, const char *label) {
+  if (!pools_get_vehicle_ref || !pools_get_vehicle)
+    return;
+  veh_track_ref = pools_get_vehicle_ref(veh);
+  veh_track_t0 = armTicksToNs(armGetSystemTick());
+  snprintf(veh_track_label, sizeof(veh_track_label), "%s", label);
+  debugPrintf("MENU: watching %s, pool ref %d\n", veh_track_label, veh_track_ref);
+}
+
+static void veh_track_tick(void) {
+  if (!veh_track_ref || !pools_get_vehicle)
+    return;
+  if (pools_get_vehicle(veh_track_ref))
+    return;
+
+  const u64 ms = (armTicksToNs(armGetSystemTick()) - veh_track_t0) / 1000000ull;
+  debugPrintf("MENU: %s was removed from the pool after %llu ms\n",
+              veh_track_label, (unsigned long long)ms);
+  veh_track_ref = 0;
+}
+
 static void menu_spawn_vehicle(int idx) {
   if (idx < 0 || idx >= vehicles_ready)
     return;
@@ -1625,10 +1677,21 @@ static void menu_spawn_vehicle(int idx) {
   *flags = (*flags & ~VEH_STATUS_MASK) | VEH_STATUS_ABANDONED;
 
   *(int *)((uintptr_t)veh + VEH_STATUS) = 1;
+
+  // Before CWorld::Add, because that is what reads it.
+  uint8_t *level = (uint8_t *)((uintptr_t)veh + ENTITY_LEVEL);
+  const uint8_t was_level = *level;
+  if (level_from_position && gp_the_zones && *gp_the_zones)
+    *level = (uint8_t)level_from_position(*gp_the_zones, vpos);
+
   world_add(veh);
 
-  debugPrintf("MENU: spawn %s (model %d, kind %d) at %.1f, %.1f, %.1f\n",
-              v->label, v->id, (int)v->kind, vpos[0], vpos[1], vpos[2]);
+  debugPrintf("MENU: spawn %s (model %d, kind %d) at %.1f, %.1f, %.1f, "
+              "level %u (was %u)\n",
+              v->label, v->id, (int)v->kind, vpos[0], vpos[1], vpos[2],
+              *level, was_level);
+
+  veh_track_begin(veh, v->label);
 
   snprintf(toast, sizeof(toast), "%s spawned", v->label);
   toast_pending = 1;
@@ -1853,6 +1916,7 @@ void menu_tick(int in_game) {
   }
 
   menu_apply_toggles();
+  veh_track_tick();
 
   const u64 down = g_menu_pad_down;
   const u64 pressed = down & ~menu_pad_prev;
@@ -1975,6 +2039,9 @@ void menu_init(void) {
   boat_ctor = (vehicle_ctor_fn)need_sym("_ZN5CBoatC1Eih");
   heli_ctor = (vehicle_ctor_fn)need_sym("_ZN5CHeliC1Eih");
   world_add = (world_add_fn)need_sym("_ZN6CWorld3AddEP7CEntity");
+  pools_get_vehicle_ref =
+      (get_vehicle_ref_fn)need_sym("_ZN6CPools13GetVehicleRefEP8CVehicle");
+  pools_get_vehicle = (get_vehicle_fn)need_sym("_ZN6CPools10GetVehicleEi");
   request_model = (request_model_fn)need_sym("_ZN10CStreaming12RequestModelEii");
   load_all_models = (load_all_models_fn)need_sym("_ZN10CStreaming22LoadAllRequestedModelsEb");
   is_car_model = (is_model_fn)need_sym("_ZN10CModelInfo10IsCarModelEi");

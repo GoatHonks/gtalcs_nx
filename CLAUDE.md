@@ -223,17 +223,23 @@ at an `END_THREAD` stub instead and let the game retire it.
 
 ## Outstanding
 
+- **Spawned vehicles vanish after a second or two.** Not a regression — the
+  spawn code is unchanged since the build whose screenshots showed them standing
+  around, so they were probably always being tidied away and only a ridden one
+  survived. Current suspect: `CEntity::m_level` at `+126`, the island byte that
+  `CEntity::SetupBigBuilding` fills from `CTheZones::GetLevelFromPosition` and
+  that both `CWorld::Add` and `CWorld::Remove` read. Nothing we construct set it.
+  Now set before `CWorld::Add`, and the spawned vehicle's pool handle is watched
+  so the log says how long it lasted if this is not it.
 - **Bodyguards** — crashed four times, all on the same call. The instrumented
   log settled it: `AddPed` **succeeds**, and `CPed::SetPlayerToFollow` then dies
   on `ldr x10,[x19,#1552]` / `ldrsh w8,[x10,#124]` with no null check — a ped
   fresh from `AddPed` has nothing at `+1552`. Use `CPed::SetLeader`, which is
   one null-checked store and is what `PlaceGangMembersInFormation` uses.
   **Read the callee's first few instructions before handing it a new object.**
-  Old note said the crash was streaming; it was not. The second time the log stopped straight after
-  the chosen ped model, so the fault is in `AddPed` building against a model that
-  requesting alone did not make resident. `model_has_clump()` now applies the
-  game's own test (`CBaseModelInfo` vtable entry 6 returns the clump;
-  `CPopulation::AddPedInCar` checks it and falls back). Unverified.
+  Fixed and confirmed working. Three earlier guesses (streaming, model residency,
+  the clump check) were all aimed at the wrong call; the staged logging that
+  finally found it should have been the first move.
 - **Models 211–216 are helicopters typed as cars — and they fly anyway.** Their
   model info says vehicle type 0, so the menu builds them as `CAutomobile`, and
   they still fly when entered. Flight comes from the handling data, not the
