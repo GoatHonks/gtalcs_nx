@@ -205,15 +205,11 @@ at an `END_THREAD` stub instead and let the game retire it.
 
 ## Outstanding
 
-- **Zone names never resolve.** `0/29` GXT keys hit, *and* a probe with `CHEAT1`
-  -- a key `VehicleCheat` itself passes to `CText::Get` and which visibly works
-  in game -- also missed. So the keys are not the problem; the lookup is. First
-  suspect was `TheText()`: it is a weak symbol *and* a lazy constructor that
-  installs a fresh empty `CText` when the slot is null, which would answer every
-  key with a miss. Now read `CText::msInstance` directly (`TheText()`'s GOT entry
-  is relocated to it) and log the pointer next to the probe.
-- **Bodyguards** — the ped model is now streamed before `AddPed`, but the crash
-  itself is unconfirmed as fixed; it has not been retested.
+- **Bodyguards** — crashed twice. The second time the log stopped straight after
+  the chosen ped model, so the fault is in `AddPed` building against a model that
+  requesting alone did not make resident. `model_has_clump()` now applies the
+  game's own test (`CBaseModelInfo` vtable entry 6 returns the clump;
+  `CPopulation::AddPedInCar` checks it and falls back). Unverified.
 - **Models 211–216 are helicopters typed as cars — and they fly anyway.** Their
   model info says vehicle type 0, so the menu builds them as `CAutomobile`, and
   they still fly when entered. Flight comes from the handling data, not the
@@ -231,10 +227,12 @@ at an `END_THREAD` stub instead and let the game retire it.
   Ped type is `PEDTYPE_GANG1` (7) with `CPopulation::ChooseGangOccupation(0)`
   picking the model, and `CPed::SetPlayerToFollow(0)` doing the following.
 - **Strong tyres** — candidate flags are `CVehicle::bCheat3`…`bCheat10`, unnamed.
-- **Flying altitude limit** — *recommended dropped*. In the ARM32 build it is a
-  float `80.0` inside `CVehicle::FlyingControl`; our arm64 build has no
-  equivalent literal (the whole function yields only `-0.0143`, `0.62`, `1.0`),
-  so it is likely read from a parameter struct. Three static approaches failed.
+- **Vehicle editor** — asked for (colour, speed, handling) and not started. The
+  handling data pointer is at `vehicle+400` (`CHeli`'s constructor writes it from
+  an array indexed by model info `+102`, stride `0xe0`), and `cHandlingDataMgr`
+  exposes `GetFlyingPointer` / `GetBoatPointer` / `ModifyHandlingValue`. Note
+  handling records are **shared per model**, so editing one changes every vehicle
+  of that type.
 
 ## Working style that has paid off
 
