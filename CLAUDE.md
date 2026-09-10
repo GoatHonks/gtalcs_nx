@@ -82,6 +82,12 @@ makes the menu look native. Two hard-won rules:
 - **Never** re-push unconditionally every frame: `SetHelpMessage` restarts the
   box's animation and replays its sound, so at 60Hz the cue machine-guns and the
   text never finishes appearing.
+- **`CHud::m_HelpMessage` is 0x200 bytes — 255 characters plus a terminator.**
+  Push more and the game keeps a truncated copy, the clobber check never matches
+  again, and you get the machine-gun above with nothing on screen. Adding a
+  sixth toggle was enough (246 → 268 characters). Both lists are windowed to
+  `MENU_ROWS` and the render stops at `HUD_HELP_CHARS - 40`, so **check the
+  rendered length, not the row count, when adding entries.**
 
 **Input**: `main.c` publishes the pad state and, while `g_menu_open` is set,
 sends the game no buttons and **centred sticks**. The stick part matters — an

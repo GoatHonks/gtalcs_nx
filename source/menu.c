@@ -1213,8 +1213,16 @@ static int menu_ready(void) {
   return hud_set_help_message && hud_help_forever && hud_help_message;
 }
 
+// CHud::m_HelpMessage is 0x200 bytes -- 256 UTF-16 characters, so 255 plus a
+// terminator. Overrun it and the game stores a truncated copy, our comparison
+// against what we pushed never matches again, and the menu re-pushes every
+// frame: the help box restarts its animation 60 times a second, so nothing is
+// ever legible and the cue machine-guns. That is what a sixth toggle did, by
+// taking the top level from 246 characters to 268.
+#define HUD_HELP_CHARS 256
+
 static int menu_text_clobbered(void) {
-  for (int i = 0; i < 256; i++) {
+  for (int i = 0; i < HUD_HELP_CHARS - 1; i++) {
     if (hud_help_message[i] != menu_wide[i])
       return 1;
     if (!menu_wide[i])
@@ -1223,9 +1231,11 @@ static int menu_text_clobbered(void) {
   return 0;
 }
 
+// Clamped to what the game's buffer holds, so what we compare against is always
+// what it actually stored.
 static void menu_push(const char *text) {
   int i = 0;
-  for (; text[i] && i < (int)(sizeof(menu_wide) / sizeof(menu_wide[0])) - 1; i++)
+  for (; text[i] && i < HUD_HELP_CHARS - 1; i++)
     menu_wide[i] = (uint16_t)(unsigned char)text[i];
   menu_wide[i] = 0;
   hud_set_help_message(menu_wide, 0, 0);
@@ -1256,24 +1266,40 @@ static void menu_render(void) {
     for (int i = first; i < count && i < first + MENU_ROWS; i++) {
       n += snprintf(line + n, sizeof(line) - n, "~n~%c %s",
                     i == cursor ? '>' : ' ', sub_label(i));
-      if (n >= (int)sizeof(line) - 48)
+      // Stop well short of what the help box holds; a row that would be
+      // cut in half is a row that makes the text never match again.
+      if (n >= HUD_HELP_CHARS - 40)
         break;
     }
   } else {
     n += snprintf(line + n, sizeof(line) - n, "LIBERTY MENU");
 
-    for (int i = 0; i < MENU_NUM_ACTIONS; i++) {
-      n += snprintf(line + n, sizeof(line) - n, "~n~%c %s",
-                    i == menu_cursor ? '>' : ' ', menu_action_name[i]);
-    }
+    // Windowed like the sub-lists. It used to draw all of itself, which was
+    // fine until the rows outgrew the help box; scrolling means another toggle
+    // costs nothing.
+    int first = menu_cursor - MENU_ROWS / 2;
+    if (first > MENU_TOP_ROWS - MENU_ROWS)
+      first = MENU_TOP_ROWS - MENU_ROWS;
+    if (first < 0)
+      first = 0;
 
-    n += snprintf(line + n, sizeof(line) - n, "~n~  -- ALWAYS ON --");
-
-    for (int i = 0; i < MENU_NUM_TOGGLES; i++) {
-      const int row = MENU_HDR_ROW + 1 + i;
-      n += snprintf(line + n, sizeof(line) - n, "~n~%c %s  [%s]",
-                    row == menu_cursor ? '>' : ' ', menu_toggle_name[i],
-                    menu_toggle_on[i] ? "ON" : "off");
+    for (int i = first; i < MENU_TOP_ROWS && i < first + MENU_ROWS; i++) {
+      const char mark = i == menu_cursor ? '>' : ' ';
+      if (i < MENU_NUM_ACTIONS) {
+        n += snprintf(line + n, sizeof(line) - n, "~n~%c %s",
+                      mark, menu_action_name[i]);
+      } else if (i == MENU_HDR_ROW) {
+        n += snprintf(line + n, sizeof(line) - n, "~n~  -- ALWAYS ON --");
+      } else {
+        const int t = i - MENU_HDR_ROW - 1;
+        n += snprintf(line + n, sizeof(line) - n, "~n~%c %s  [%s]",
+                      mark, menu_toggle_name[t],
+                      menu_toggle_on[t] ? "ON" : "off");
+      }
+      // Stop well short of what the help box holds; a row that would be
+      // cut in half is a row that makes the text never match again.
+      if (n >= HUD_HELP_CHARS - 40)
+        break;
     }
   }
 
