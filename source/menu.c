@@ -1289,7 +1289,11 @@ static void menu_resolve_vehicles(void) {
   // skipped silently. Asking by name settles both questions at once: the id if
   // the game knows the name at all, and the classification if it does.
   if (get_model_info) {
+    // Asked of the running game rather than read out of anyone's data file.
+    // The first two confirm that 211 and 212 are two different RC vehicles; the
+    // rest are the ones said to exist but be unreachable.
     static const char *const probe[] = {
+      "rcgoblin", "rcraider",
       "corpse", "mafiablood", "mini", "speakermav", "topfun", "deaddodo",
       "escape",
     };
