@@ -223,14 +223,18 @@ at an `END_THREAD` stub instead and let the game retire it.
 
 ## Outstanding
 
-- **Spawned vehicles vanish after a second or two.** Not a regression — the
-  spawn code is unchanged since the build whose screenshots showed them standing
-  around, so they were probably always being tidied away and only a ridden one
-  survived. Current suspect: `CEntity::m_level` at `+126`, the island byte that
-  `CEntity::SetupBigBuilding` fills from `CTheZones::GetLevelFromPosition` and
-  that both `CWorld::Add` and `CWorld::Remove` read. Nothing we construct set it.
-  Now set before `CWorld::Add`, and the spawned vehicle's pool handle is watched
-  so the log says how long it lasted if this is not it.
+- **Spawned vehicles vanish after ~3.5 seconds.** Not a regression: the spawn
+  code is unchanged since the build whose screenshots showed them parked. The
+  pool watchdog measured it — 3682, 3478, 3438, 3680 ms — so something periodic
+  removes them, and setting `CEntity::m_level` (`+126`, from
+  `GetLevelFromPosition`, read by `CWorld::Add`/`Remove`) did **not** stop it,
+  though it is correct and stays.
+  `CCarCtrl::PossiblyRemoveVehicle` is ruled out: it only removes at distance
+  (thresholds 190 and 70 units; these sit five away). **Current suspect:
+  `CWorld::RemoveFallenCars`, which deletes anything below `z = -100`** — a fall
+  from ground level takes about 3.5 seconds, which fits. The watchdog now logs
+  position twice a second, so the next log says outright whether they are
+  falling.
 - **Bodyguards** — crashed four times, all on the same call. The instrumented
   log settled it: `AddPed` **succeeds**, and `CPed::SetPlayerToFollow` then dies
   on `ldr x10,[x19,#1552]` / `ldrsh w8,[x10,#124]` with no null check — a ped

@@ -1584,6 +1584,7 @@ static get_vehicle_fn pools_get_vehicle = NULL;
 
 static int veh_track_ref = 0;
 static u64 veh_track_t0 = 0;
+static u64 veh_track_next_report = 0;
 static char veh_track_label[28];
 
 static void veh_track_begin(void *veh, const char *label) {
@@ -1591,6 +1592,7 @@ static void veh_track_begin(void *veh, const char *label) {
     return;
   veh_track_ref = pools_get_vehicle_ref(veh);
   veh_track_t0 = armTicksToNs(armGetSystemTick());
+  veh_track_next_report = 0;
   snprintf(veh_track_label, sizeof(veh_track_label), "%s", label);
   debugPrintf("MENU: watching %s, pool ref %d\n", veh_track_label, veh_track_ref);
 }
@@ -1598,13 +1600,36 @@ static void veh_track_begin(void *veh, const char *label) {
 static void veh_track_tick(void) {
   if (!veh_track_ref || !pools_get_vehicle)
     return;
-  if (pools_get_vehicle(veh_track_ref))
-    return;
 
   const u64 ms = (armTicksToNs(armGetSystemTick()) - veh_track_t0) / 1000000ull;
-  debugPrintf("MENU: %s was removed from the pool after %llu ms\n",
-              veh_track_label, (unsigned long long)ms);
-  veh_track_ref = 0;
+
+  void *veh = pools_get_vehicle(veh_track_ref);
+  if (!veh) {
+    debugPrintf("MENU: %s was removed from the pool after %llu ms\n",
+                veh_track_label, (unsigned long long)ms);
+    veh_track_ref = 0;
+    return;
+  }
+
+  // Where it is, twice a second, while it still exists.
+  //
+  // Every spawn so far has been removed after a remarkably consistent 3.4-3.7
+  // seconds. CCarCtrl::PossiblyRemoveVehicle only removes at a distance (its
+  // thresholds are 190 and 70 units, and these sit five away), but
+  // CWorld::RemoveFallenCars deletes anything below z = -100, and falling from
+  // ground level to -100 takes about that long. If these numbers march
+  // downwards, the vehicle is falling through the map and the fix belongs at
+  // the spawn, not in whatever deletes it afterwards.
+  if (ms >= veh_track_next_report) {
+    veh_track_next_report = ms + 500;
+    const float *p = (const float *)((uintptr_t)veh + VEH_POS);
+    const uint64_t flags = *(const uint64_t *)((uintptr_t)veh + VEH_FLAGS);
+    debugPrintf("MENU: %s at %llu ms: %.1f, %.1f, %.1f  status %u  level %u\n",
+                veh_track_label, (unsigned long long)ms,
+                p[0], p[1], p[2],
+                (unsigned)((flags & VEH_STATUS_MASK) >> 4),
+                *(const uint8_t *)((uintptr_t)veh + ENTITY_LEVEL));
+  }
 }
 
 static void menu_spawn_vehicle(int idx) {
