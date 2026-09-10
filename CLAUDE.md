@@ -177,6 +177,10 @@ up silently.
   key tried, including `CHEAT1`, which the game itself resolves through `Get`.
   Both call `CKeyArray::Search`; whatever `Exists` gates on is not what `Get`
   needs. `CText::msInstance` is the object, reached without `TheText()`.
+- **`CTheZones` methods take `gpTheZones` as `this`.** `GetLevelFromPosition` is
+  `(CTheZones*, const CVector*)`, not a free function — calling it with the
+  vector in `x0` returned nonsense levels and then faulted. Check `x0` at a call
+  site before assuming a `CTheZones::` symbol is static.
 - **Zone boxes come from `gpTheZones`.** `FindZoneByLabelAndReturnIndex` plus
   `GetNavigationZone` (the named zones are navigation zones, type 0); `CZone` is
   72 bytes with its box at `+8`/`+20` and its name via `GetTranslatedName`.

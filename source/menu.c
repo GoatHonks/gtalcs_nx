@@ -193,9 +193,7 @@ static int cheats_ready = 0;
 
 // ---- the flying ceiling ----
 //
-// This was written off as unfindable once, on the grounds that the arm64 build
-// had no 80.0 anywhere in CVehicle::FlyingControl. It does; it is just not a
-// literal pool entry. At FlyingControl+0x69c:
+// CVehicle::FlyingControl+0x69c caps altitude:
 //
 //   movz w8, #0x42a0, lsl #16     ; 80.0
 //   fmov s2, w8
@@ -203,86 +201,130 @@ static int cheats_ready = 0;
 //   fcmp s1, s2
 //   b.le skip
 //   movz w8, #0xc28c, lsl #16     ; -70.0
+//   fmov s2, w8
 //   fadd s1, s1, s2               ; z - 70
 //   fmov s2, #10.0
 //   fdiv s1, s2, s1               ; 10 / (z - 70)
 //   fmul s0, s0, s1               ; and lift is scaled by that
 //
-// so above 80 the lift falls away as 10/(z-70), which is the ceiling. Raising
-// it means raising both numbers together: at z equal to the cap the divisor
-// must still be 10, or lift is cut the moment you reach it. 300 and -290 keep
-// exactly the original shape, 220 units higher up, and both encode as a single
-// MOVZ because their float bit patterns have empty low halves.
-#define FLY_CEILING_OFF_CAP   0x69c
-#define FLY_CEILING_OFF_FLOOR 0x6ac
+// Both numbers have to move together: at the cap the divisor must still be 10,
+// or lift collapses the moment you reach it.
+//
+// Two earlier attempts patched the immediates at runtime and both were wrong.
+// Flipping the pages RX -> RW -> RX fails coming back (0xd401) -- so_util.c says
+// "the kernel forbids W->X on code memory". Writing through load_base fails too:
+// svcMapProcessCodeMemory takes those pages when it maps them at load_virtbase,
+// so the original allocation is no longer yours to write once the game is
+// running.
+//
+// What is always safe is patching *before* so_finalize, from menu_init, through
+// load_base -- that is where the port does all its own patching. So the code is
+// rewritten once, at init, to stop holding the numbers at all:
+//
+//   adrp x8, <page of the two floats>
+//   ldr  s2, [x8, #off]           ; replaces movz + fmov, same two slots
+//
+// and the toggle then only ever writes two floats into a data page, which is
+// plain RW memory at runtime. No code is modified after boot.
+#define FLY_OFF_CAP_MOVZ   0x69c
+#define FLY_OFF_CAP_FMOV   0x6a0
+#define FLY_OFF_FLOOR_MOVZ 0x6ac
+#define FLY_OFF_FLOOR_FMOV 0x6b0
 
 // movz w8, #imm16, lsl #16  ==  0x52a00000 | (imm16 << 5) | 8
 #define MOVZ_W8_HI(imm16) (0x52a00000u | ((uint32_t)(imm16) << 5) | 8u)
+#define FMOV_S2_W8        0x1e270102u
 
-#define FLY_CAP_STOCK   MOVZ_W8_HI(0x42a0)   //   80.0
-#define FLY_FLOOR_STOCK MOVZ_W8_HI(0xc28c)   //  -70.0
-#define FLY_CAP_HIGH    MOVZ_W8_HI(0x4396)   //  300.0
-#define FLY_FLOOR_HIGH  MOVZ_W8_HI(0xc391)   // -290.0
+#define FLY_CAP_STOCK   MOVZ_W8_HI(0x42a0)   //  80.0
+#define FLY_FLOOR_STOCK MOVZ_W8_HI(0xc28c)   // -70.0
 
-static uintptr_t fly_patch_addr[2];
-static uint32_t fly_patch_stock[2] = { FLY_CAP_STOCK, FLY_FLOOR_STOCK };
-static uint32_t fly_patch_high[2] = { FLY_CAP_HIGH, FLY_FLOOR_HIGH };
-static int fly_patch_ok = 0;      // the instructions were what we expected
+#define FLY_CAP_ON      300.0f
+#define FLY_FLOOR_ON   -290.0f
+#define FLY_CAP_OFF      80.0f
+#define FLY_FLOOR_OFF   -70.0f
+
+// The two floats live in VehicleNames: 0x200 bytes of zeroed .data that nothing
+// in this build reads or relocates -- CHud::SetVehicleName has no callers either,
+// so the whole mechanism it belonged to is dead code. It is inside the image, so
+// ADRP reaches it from FlyingControl with room to spare.
+#define FLY_DATA_SYM "VehicleNames"
+
+static float *fly_ceiling_data = NULL;   // [0] = cap, [1] = floor
+static int fly_patch_ok = 0;
 static int fly_patch_applied = 0;
 
-// Writes instruction words into the game's text, which is RX by the time
-// anything runs, so the pages are flipped to RW for the duration. Only ever
-// called when the toggle changes, never per frame, and never while the game
-// could be inside FlyingControl -- the menu runs on the game thread, between
-// frames.
-// Reads the two instructions and decides whether they are ours to change. Runs
-// once, on the first menu open, because the image is not mapped where these
-// addresses point until well after menu_init.
-static void fly_patch_probe(void) {
-  static int done = 0;
-  if (done || !fly_patch_addr[0])
+static uint32_t fly_adrp(uintptr_t pc, uintptr_t target, int rd) {
+  const int64_t delta = (int64_t)(target & ~(uintptr_t)0xfff) -
+                        (int64_t)(pc & ~(uintptr_t)0xfff);
+  const int64_t imm21 = delta >> 12;
+  return 0x90000000u | ((uint32_t)(imm21 & 3) << 29) |
+         (((uint32_t)(imm21 >> 2) & 0x7ffffu) << 5) | (uint32_t)rd;
+}
+
+// ldr s<rt>, [x<rn>, #off]
+static uint32_t fly_ldr_s(int rt, int rn, unsigned off) {
+  return 0xbd400000u | ((off / 4u) << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+
+// Called from menu_init, while the image is still only mapped at load_base.
+static void fly_patch_install(void) {
+  const uintptr_t fc =
+      so_try_find_addr_rx(&game_mod, "_ZN8CVehicle13FlyingControlE12eFlightModel");
+  const uintptr_t data = so_try_find_addr_rx(&game_mod, FLY_DATA_SYM);
+  if (!fc || !data || !game_mod.load_base || !game_mod.load_virtbase) {
+    debugPrintf("MENU: flying ceiling not patched (missing symbol)\n");
     return;
-  done = 1;
-
-  const uint32_t got[2] = { *(const uint32_t *)fly_patch_addr[0],
-                            *(const uint32_t *)fly_patch_addr[1] };
-  fly_patch_ok = (got[0] == FLY_CAP_STOCK && got[1] == FLY_FLOOR_STOCK);
-  debugPrintf("MENU: flying ceiling %s (found %08x %08x, wanted %08x %08x)\n",
-              fly_patch_ok ? "patchable" : "NOT patchable",
-              got[0], got[1], FLY_CAP_STOCK, FLY_FLOOR_STOCK);
-}
-
-// Writes instruction words into the game's code through the writable alias.
-//
-// The first attempt flipped the pages RX -> RW -> RX with
-// svcSetProcessMemoryPermission. The way back failed with 0xd401 and left
-// FlyingControl non-executable. so_util.c explains why in its own comment --
-// "The kernel forbids W->X on code memory" -- so that path was never going to
-// work, and reading it first would have saved a bad build.
-//
-// It is also unnecessary. so_finalize maps the image a *second* time, with
-// svcMapProcessCodeMemory(load_virtbase, load_base, size), so the original
-// load_base allocation is still mapped, still writable, and backed by the same
-// physical pages as the RX view. Writing through load_base and flushing is the
-// ordinary way around W^X and touches no permissions at all.
-static uint32_t *fly_patch_slot(int i) {
-  const uintptr_t off = fly_patch_addr[i] - (uintptr_t)game_mod.load_virtbase;
-  return (uint32_t *)((uintptr_t)game_mod.load_base + off);
-}
-
-static int fly_patch_write(const uint32_t *words) {
-  if (!fly_patch_ok || !game_mod.load_base || !game_mod.load_virtbase)
-    return 0;
-
-  for (int i = 0; i < 2; i++) {
-    uint32_t *w = fly_patch_slot(i);
-    *w = words[i];
-    armDCacheFlush(w, sizeof(*w));
   }
-  // Invalidated on the executable view, which is what the CPU fetches from.
-  for (int i = 0; i < 2; i++)
-    armICacheInvalidate((void *)fly_patch_addr[i], sizeof(uint32_t));
-  return 1;
+
+  // Executable addresses for the PC-relative maths, load_base addresses to write
+  // through, because load_virtbase is not mapped yet.
+  const uintptr_t virt = (uintptr_t)game_mod.load_virtbase;
+  const uintptr_t base = (uintptr_t)game_mod.load_base;
+  uint32_t *const cap_movz = (uint32_t *)(base + (fc + FLY_OFF_CAP_MOVZ - virt));
+  uint32_t *const cap_fmov = (uint32_t *)(base + (fc + FLY_OFF_CAP_FMOV - virt));
+  uint32_t *const flr_movz = (uint32_t *)(base + (fc + FLY_OFF_FLOOR_MOVZ - virt));
+  uint32_t *const flr_fmov = (uint32_t *)(base + (fc + FLY_OFF_FLOOR_FMOV - virt));
+
+  // Only touch it if all four instructions are exactly what this build's
+  // disassembly says. Anything else and the offsets have drifted.
+  if (*cap_movz != FLY_CAP_STOCK || *cap_fmov != FMOV_S2_W8 ||
+      *flr_movz != FLY_FLOOR_STOCK || *flr_fmov != FMOV_S2_W8) {
+    debugPrintf("MENU: flying ceiling NOT patched, found %08x %08x %08x %08x\n",
+                *cap_movz, *cap_fmov, *flr_movz, *flr_fmov);
+    return;
+  }
+
+  const unsigned off = (unsigned)(data & 0xfff);
+  if (off + 4 > 0xffc) {
+    debugPrintf("MENU: flying ceiling data lands badly in its page (%u)\n", off);
+    return;
+  }
+
+  *cap_movz = fly_adrp(fc + FLY_OFF_CAP_MOVZ, data, 8);
+  *cap_fmov = fly_ldr_s(2, 8, off);
+  *flr_movz = fly_adrp(fc + FLY_OFF_FLOOR_MOVZ, data, 8);
+  *flr_fmov = fly_ldr_s(2, 8, off + 4);
+
+  // Same numbers the code used to hold, so nothing changes until it is toggled.
+  fly_ceiling_data = (float *)(base + (data - virt));
+  fly_ceiling_data[0] = FLY_CAP_OFF;
+  fly_ceiling_data[1] = FLY_FLOOR_OFF;
+
+  // From here on the floats are read and written through the executable mapping,
+  // which is an ordinary RW data page once so_finalize has run.
+  fly_ceiling_data = (float *)data;
+  fly_patch_ok = 1;
+  debugPrintf("MENU: flying ceiling patched, reads from %s+%u\n",
+              FLY_DATA_SYM, off);
+}
+
+static void fly_patch_set(int high) {
+  if (!fly_patch_ok || !fly_ceiling_data)
+    return;
+  fly_ceiling_data[0] = high ? FLY_CAP_ON : FLY_CAP_OFF;
+  fly_ceiling_data[1] = high ? FLY_FLOOR_ON : FLY_FLOOR_OFF;
+  fly_patch_applied = high;
+  debugPrintf("MENU: flying ceiling -> %.0f\n", (double)fly_ceiling_data[0]);
 }
 
 // ---- always-on toggles ----
@@ -418,17 +460,10 @@ static void menu_apply_ammo_edges(void *ped) {
 
 // Runs every frame while the game is live, menu open or not.
 static void menu_apply_toggles(void) {
-  // The ceiling lives in the game's code, so it is switched when the toggle
-  // changes rather than reasserted every frame.
+  // Two floats in a data page, switched when the toggle changes.
   const int want_high = menu_toggle_on[MENU_TOG_HELI_CEILING];
-  if (fly_patch_ok && want_high != fly_patch_applied) {
-    if (fly_patch_write(want_high ? fly_patch_high : fly_patch_stock)) {
-      fly_patch_applied = want_high;
-      debugPrintf("MENU: flying ceiling -> %s\n", want_high ? "300" : "80");
-    } else {
-      menu_toggle_on[MENU_TOG_HELI_CEILING] = fly_patch_applied;
-    }
-  }
+  if (want_high != fly_patch_applied)
+    fly_patch_set(want_high);
 
   if (!find_player_ped)
     return;
@@ -682,7 +717,9 @@ static const char *const place_cat_name[PLACE_NUM_CATS] = {
   "1 - Portland", "2 - Staunton Island", "3 - Shoreside Vale",
 };
 
-typedef int (*level_from_pos_fn)(const float *pos);
+// Takes gpTheZones as `this`; the vector is the second argument. Passing the
+// vector as `this` returned garbage levels and then faulted outright.
+typedef int (*level_from_pos_fn)(void *zones, const float *pos);
 static level_from_pos_fn level_from_position = NULL;
 
 // ---- the map marker ----
@@ -758,9 +795,10 @@ static void menu_label_places(void) {
     // will not place falls back to Portland rather than off the end of the
     // category array.
     place_cat[i] = PLACE_CAT_PORTLAND;
-    if (level_from_position) {
+    if (level_from_position && gp_the_zones) {
       const float pos[3] = { place_x[i], place_y[i], 0.0f };
-      const int level = level_from_position(pos);
+      void *zones = gp_the_zones ? *gp_the_zones : NULL;
+      const int level = zones ? level_from_position(zones, pos) : 0;
       if (level >= 1 && level <= PLACE_NUM_CATS)
         place_cat[i] = level - 1;
       else
@@ -1770,7 +1808,6 @@ void menu_tick(int in_game) {
   if (!menu_open) {
     if (pressed & HidNpadButton_Minus) {
       menu_resolve_vehicles();
-      fly_patch_probe();
       menu_open = 1;
       g_menu_open = 1;
       menu_cursor = 0;
@@ -1854,20 +1891,11 @@ void menu_init(void) {
   ctext_instance = (void **)need_sym("_ZN5CText10msInstanceE");
 
   gp_the_zones = (void **)need_sym("gpTheZones");
-  // Address only. Reading through it here would fault: so_try_find_addr_rx
-  // returns a load_virtbase address and menu_init runs from patch_game, which
-  // is before so_finalize maps that region. Every other symbol resolved in this
-  // function is stored and not dereferenced until a frame is running, which is
-  // why nothing else has ever tripped over it. The verify happens in
-  // fly_patch_probe, on the lazy path.
-  const uintptr_t fc = so_try_find_addr_rx(&game_mod,
-                                           "_ZN8CVehicle13FlyingControlE12eFlightModel");
-  if (fc) {
-    fly_patch_addr[0] = fc + FLY_CEILING_OFF_CAP;
-    fly_patch_addr[1] = fc + FLY_CEILING_OFF_FLOOR;
-  } else {
-    debugPrintf("MENU: CVehicle::FlyingControl not found\n");
-  }
+  // Reads and writes game memory, so it goes through load_base: this runs from
+  // patch_game, and load_virtbase is not mapped until so_finalize. Every other
+  // symbol resolved in this function is only stored, never dereferenced, which
+  // is why nothing else here has ever tripped over that.
+  fly_patch_install();
 
   gp_the_paths = (void **)need_sym("gpThePaths");
   level_from_position =
