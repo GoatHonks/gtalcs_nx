@@ -191,171 +191,30 @@ static menu_cheat menu_cheats[] = {
 
 static int cheats_ready = 0;
 
-// ---- the flying ceiling ----
+// ---- the flying ceiling: removed, and why ----
 //
-// CVehicle::FlyingControl+0x69c caps altitude:
+// "Fly higher" patched CVehicle::FlyingControl to read its altitude cap from two
+// floats instead of holding them as MOVZ immediates, and parked those floats in
+// VehicleNames -- 0x46e bytes of .data I had convinced myself nothing used.
 //
-//   movz w8, #0x42a0, lsl #16     ; 80.0
-//   fmov s2, w8
-//   ldr  s1, [x19, #72]           ; the vehicle's z
-//   fcmp s1, s2
-//   b.le skip
-//   movz w8, #0xc28c, lsl #16     ; -70.0
-//   fmov s2, w8
-//   fadd s1, s1, s2               ; z - 70
-//   fmov s2, #10.0
-//   fdiv s1, s2, s1               ; 10 / (z - 70)
-//   fmul s0, s0, s1               ; and lift is scaled by that
+// Nothing used it *in the same translation unit*. That is all I actually
+// checked: a grep for `adrp x8, 81a000` paired with `add #0x1c8`. Cross-module
+// access goes through the GOT, and `objdump -R` lists a GLOB_DAT relocation for
+// VehicleNames with five readers (0x343b6c, 0x3a07e8, 0x474268, 0x4ba4d4,
+// 0x4ba604). It sits between HandlingFilename and BOAT_BUOYANCY_DAMPING, in the
+// middle of the vehicle handling data.
 //
-// Both numbers have to move together: at the cap the divisor must still be 10,
-// or lift collapses the moment you reach it.
+// So the menu wrote floats over live vehicle data at init and then every frame,
+// and every vehicle in the world -- ours and the game's own traffic -- lost its
+// collision and fell through the map. Spawned cars falling was that, and so was
+// the empty street. The user spotted the correlation ("this only started when
+// you added the fly higher limit") long before I did; I was busy proving the
+// spawn code innocent, which it was.
 //
-// Two earlier attempts patched the immediates at runtime and both were wrong.
-// Flipping the pages RX -> RW -> RX fails coming back (0xd401) -- so_util.c says
-// "the kernel forbids W->X on code memory". Writing through load_base fails too:
-// svcMapProcessCodeMemory takes those pages when it maps them at load_virtbase,
-// so the original allocation is no longer yours to write once the game is
-// running.
-//
-// What is always safe is patching *before* so_finalize, from menu_init, through
-// load_base -- that is where the port does all its own patching. So the code is
-// rewritten once, at init, to stop holding the numbers at all:
-//
-//   adrp x8, <page of the two floats>
-//   ldr  s2, [x8, #off]           ; replaces movz + fmov, same two slots
-//
-// and the toggle then only ever writes two floats into a data page, which is
-// plain RW memory at runtime. No code is modified after boot.
-#define FLY_OFF_CAP_MOVZ   0x69c
-#define FLY_OFF_CAP_FMOV   0x6a0
-#define FLY_OFF_FLOOR_MOVZ 0x6ac
-#define FLY_OFF_FLOOR_FMOV 0x6b0
-
-// movz w8, #imm16, lsl #16  ==  0x52a00000 | (imm16 << 5) | 8
-#define MOVZ_W8_HI(imm16) (0x52a00000u | ((uint32_t)(imm16) << 5) | 8u)
-#define FMOV_S2_W8        0x1e270102u
-
-#define FLY_CAP_STOCK   MOVZ_W8_HI(0x42a0)   //  80.0
-#define FLY_FLOOR_STOCK MOVZ_W8_HI(0xc28c)   // -70.0
-
-#define FLY_CAP_ON      300.0f
-#define FLY_FLOOR_ON   -290.0f
-#define FLY_CAP_OFF      80.0f
-#define FLY_FLOOR_OFF   -70.0f
-
-// The two floats live in VehicleNames: 0x200 bytes of zeroed .data that nothing
-// in this build reads or relocates -- CHud::SetVehicleName has no callers either,
-// so the whole mechanism it belonged to is dead code. It is inside the image, so
-// ADRP reaches it from FlyingControl with room to spare.
-#define FLY_DATA_SYM "VehicleNames"
-
-static float *fly_ceiling_data = NULL;   // [0] = cap, [1] = floor
-static int fly_patch_ok = 0;
-static int fly_patch_applied = 0;
-
-static uint32_t fly_adrp(uintptr_t pc, uintptr_t target, int rd) {
-  const int64_t delta = (int64_t)(target & ~(uintptr_t)0xfff) -
-                        (int64_t)(pc & ~(uintptr_t)0xfff);
-  const int64_t imm21 = delta >> 12;
-  return 0x90000000u | ((uint32_t)(imm21 & 3) << 29) |
-         (((uint32_t)(imm21 >> 2) & 0x7ffffu) << 5) | (uint32_t)rd;
-}
-
-// ldr s<rt>, [x<rn>, #off]
-static uint32_t fly_ldr_s(int rt, int rn, unsigned off) {
-  return 0xbd400000u | ((off / 4u) << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
-}
-
-// Called from menu_init, while the image is still only mapped at load_base.
-static void fly_patch_install(void) {
-  const uintptr_t fc =
-      so_try_find_addr_rx(&game_mod, "_ZN8CVehicle13FlyingControlE12eFlightModel");
-  const uintptr_t data = so_try_find_addr_rx(&game_mod, FLY_DATA_SYM);
-  if (!fc || !data || !game_mod.load_base || !game_mod.load_virtbase) {
-    debugPrintf("MENU: flying ceiling not patched (missing symbol)\n");
-    return;
-  }
-
-  // Executable addresses for the PC-relative maths, load_base addresses to write
-  // through, because load_virtbase is not mapped yet.
-  const uintptr_t virt = (uintptr_t)game_mod.load_virtbase;
-  const uintptr_t base = (uintptr_t)game_mod.load_base;
-  uint32_t *const cap_movz = (uint32_t *)(base + (fc + FLY_OFF_CAP_MOVZ - virt));
-  uint32_t *const cap_fmov = (uint32_t *)(base + (fc + FLY_OFF_CAP_FMOV - virt));
-  uint32_t *const flr_movz = (uint32_t *)(base + (fc + FLY_OFF_FLOOR_MOVZ - virt));
-  uint32_t *const flr_fmov = (uint32_t *)(base + (fc + FLY_OFF_FLOOR_FMOV - virt));
-
-  // Only touch it if all four instructions are exactly what this build's
-  // disassembly says. Anything else and the offsets have drifted.
-  if (*cap_movz != FLY_CAP_STOCK || *cap_fmov != FMOV_S2_W8 ||
-      *flr_movz != FLY_FLOOR_STOCK || *flr_fmov != FMOV_S2_W8) {
-    debugPrintf("MENU: flying ceiling NOT patched, found %08x %08x %08x %08x\n",
-                *cap_movz, *cap_fmov, *flr_movz, *flr_fmov);
-    return;
-  }
-
-  const unsigned off = (unsigned)(data & 0xfff);
-  if (off + 4 > 0xffc) {
-    debugPrintf("MENU: flying ceiling data lands badly in its page (%u)\n", off);
-    return;
-  }
-
-  *cap_movz = fly_adrp(fc + FLY_OFF_CAP_MOVZ, data, 8);
-  *cap_fmov = fly_ldr_s(2, 8, off);
-  *flr_movz = fly_adrp(fc + FLY_OFF_FLOOR_MOVZ, data, 8);
-  *flr_fmov = fly_ldr_s(2, 8, off + 4);
-
-  // Same numbers the code used to hold, so nothing changes until it is toggled.
-  fly_ceiling_data = (float *)(base + (data - virt));
-  fly_ceiling_data[0] = FLY_CAP_OFF;
-  fly_ceiling_data[1] = FLY_FLOOR_OFF;
-
-  // From here on the floats are read and written through the executable mapping,
-  // which is an ordinary RW data page once so_finalize has run.
-  fly_ceiling_data = (float *)data;
-  fly_patch_ok = 1;
-  debugPrintf("MENU: flying ceiling patched, reads from %s+%u\n",
-              FLY_DATA_SYM, off);
-}
-
-static void fly_patch_set(int high) {
-  if (!fly_patch_ok || !fly_ceiling_data)
-    return;
-  fly_ceiling_data[0] = high ? FLY_CAP_ON : FLY_CAP_OFF;
-  fly_ceiling_data[1] = high ? FLY_FLOOR_ON : FLY_FLOOR_OFF;
-  fly_patch_applied = high;
-  debugPrintf("MENU: flying ceiling -> %.0f\n", (double)fly_ceiling_data[0]);
-}
-
-// Re-asserted every frame, and loudly the first time it is found changed.
-//
-// The two floats sit in a data array that nothing in this build appears to read
-// or write -- but "appears" is doing a lot of work there, and if anything does
-// touch it the numbers become garbage. FlyingControl then compares altitude
-// against a garbage cap, and a NaN makes the b.le fall through into the clamp
-// with a garbage divisor, which multiplies lift by nonsense: a helicopter
-// spawned and gone in a frame looks exactly like that. Two stores per frame is
-// nothing, and it turns a mystery into a log line.
-static void fly_patch_hold(void) {
-  if (!fly_patch_ok || !fly_ceiling_data)
-    return;
-
-  const float cap = fly_patch_applied ? FLY_CAP_ON : FLY_CAP_OFF;
-  const float floor_ = fly_patch_applied ? FLY_FLOOR_ON : FLY_FLOOR_OFF;
-
-  static int complained = 0;
-  if (!complained &&
-      (fly_ceiling_data[0] != cap || fly_ceiling_data[1] != floor_)) {
-    complained = 1;
-    debugPrintf("MENU: flying ceiling data was clobbered (%f %f, wanted %f %f) "
-                "-- %s is not the dead array it looked like\n",
-                (double)fly_ceiling_data[0], (double)fly_ceiling_data[1],
-                (double)cap, (double)floor_, FLY_DATA_SYM);
-  }
-
-  fly_ceiling_data[0] = cap;
-  fly_ceiling_data[1] = floor_;
-}
+// The 80.0 cap is real and at FlyingControl+0x69c if this is ever revisited.
+// What it needs is somewhere safe to keep two floats, and **"I grepped and found
+// no readers" is not a proof of that** -- check `objdump -R` for a GOT entry
+// before believing any data symbol is dead.
 
 // ---- always-on toggles ----
 //
@@ -458,7 +317,6 @@ typedef enum {
   MENU_TOG_INVINCIBLE,
   MENU_TOG_AMMO,
   MENU_TOG_NEVER_WANTED,
-  MENU_TOG_HELI_CEILING,
   MENU_NUM_TOGGLES
 } menu_toggle;
 
@@ -468,7 +326,6 @@ static const char *const menu_toggle_name[MENU_NUM_TOGGLES] = {
   "Invincible",
   "Unlimited ammo",
   "Never wanted",
-  "Fly higher",
 };
 
 static int menu_toggle_on[MENU_NUM_TOGGLES];
@@ -490,12 +347,6 @@ static void menu_apply_ammo_edges(void *ped) {
 
 // Runs every frame while the game is live, menu open or not.
 static void menu_apply_toggles(void) {
-  // Two floats in a data page, switched when the toggle changes.
-  const int want_high = menu_toggle_on[MENU_TOG_HELI_CEILING];
-  if (want_high != fly_patch_applied)
-    fly_patch_set(want_high);
-  fly_patch_hold();
-
   if (!find_player_ped)
     return;
 
@@ -2147,12 +1998,6 @@ void menu_init(void) {
   ctext_instance = (void **)need_sym("_ZN5CText10msInstanceE");
 
   gp_the_zones = (void **)need_sym("gpTheZones");
-  // Reads and writes game memory, so it goes through load_base: this runs from
-  // patch_game, and load_virtbase is not mapped until so_finalize. Every other
-  // symbol resolved in this function is only stored, never dereferenced, which
-  // is why nothing else here has ever tripped over that.
-  fly_patch_install();
-
   gp_the_paths = (void **)need_sym("gpThePaths");
   level_from_position =
       (level_from_pos_fn)need_sym("_ZN9CTheZones20GetLevelFromPositionEPK7CVector");
