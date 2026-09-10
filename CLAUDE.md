@@ -282,6 +282,11 @@ at an `END_THREAD` stub instead and let the game retire it.
   Ped type is `PEDTYPE_GANG1` (7) with `CPopulation::ChooseGangOccupation(0)`
   picking the model, and `CPed::SetPlayerToFollow(0)` doing the following.
 - **Strong tyres** — candidate flags are `CVehicle::bCheat3`…`bCheat10`, unnamed.
+- **Make the Dodo fly** — asked for, not started. It is model 164, typed as a
+  car, and `MODINFO/dodo fly.csa` is **840 bytes of script**: a whole flight
+  model that reads the pad, does vector maths on the vehicle matrix and applies
+  forces every frame. Porting it is writing a flight controller in C, not
+  flipping a flag — a real feature, not a quick one.
 - **Vehicle editor** — asked for (colour, speed, handling) and not started. The
   handling data pointer is at `vehicle+400` (`CHeli`'s constructor writes it from
   an array indexed by model info `+102`, stride `0xe0`), and `cHandlingDataMgr`

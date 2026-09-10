@@ -745,6 +745,9 @@ static uint8_t *menu_target_on = NULL;
 static float *menu_target_pos = NULL;
 static float *radar_map_waypoint = NULL;   // CRadar::MapWayPoint, two floats
 static int *menu_target_blip_index = NULL;
+// The map target, two floats inside the RadarMap object.
+#define RADARMAP_TARGET 128
+
 static void **gp_radar_map = NULL;   // GRadarMap
 
 // Where the marker you place actually lives is still unknown, so this reports
@@ -810,17 +813,24 @@ static int menu_find_marker(float *out_x, float *out_y) {
   // than guess which is the target, dump the object and read the answer off the
   // numbers: with a marker placed, its coordinates are in here somewhere and
   // they will look like the world coordinates they are.
+  // Found it. Dumping the object next to the player's position made it obvious:
+  // with a marker placed north-west of a player at 1117.7, -1104.6, GRadarMap
+  // +128 held 818.8, -492.8. Everything else in there was zero, a denormal, or
+  // a zoom factor.
+  //
+  // It is the target rather than the map centre: RadarMap::MoveMapCenter writes
+  // +108, +112, +140 and +144, and never +128. RadarMap::Update writes +128 as a
+  // single eight-byte store, which is what a CVector2D looks like.
   if (gp_radar_map && *gp_radar_map) {
-    const float *m = (const float *)*gp_radar_map;
-    void *ped = find_player_ped ? find_player_ped() : NULL;
-    if (ped) {
-      const float *p = (const float *)((uintptr_t)ped + PED_POS);
-      debugPrintf("MENU: player at %g, %g\n", (double)p[0], (double)p[1]);
+    const float *target = (const float *)((uintptr_t)*gp_radar_map + RADARMAP_TARGET);
+    debugPrintf("MENU: GRadarMap target = %g, %g\n", (double)target[0],
+                (double)target[1]);
+    if (menu_pos_sane(target[0], target[1]) &&
+        (target[0] != 0.0f || target[1] != 0.0f)) {
+      *out_x = target[0];
+      *out_y = target[1];
+      return 1;
     }
-    for (int off = 0; off < 192; off += 16)
-      debugPrintf("MENU: GRadarMap+%3d: %g %g %g %g\n", off,
-                  (double)m[off / 4], (double)m[off / 4 + 1],
-                  (double)m[off / 4 + 2], (double)m[off / 4 + 3]);
   }
 
   if (menu_target_on && menu_target_pos && *menu_target_on &&
@@ -980,10 +990,12 @@ static const char *const veh_kind_name[] = { "Car", "Bike", "Boat", "Helicopter"
 // Streaming and classification are still ours -- the list is built from the
 // model table and peds are loaded the same way -- but nothing here constructs a
 // vehicle any more. SpawnInModel does that, and does it correctly.
+typedef void *(*get_model_info_fn)(const char *name, int *id_out);
 typedef void (*request_model_fn)(int model, int flags);
 typedef void (*load_all_models_fn)(int prio);
 typedef char (*is_model_fn)(int model);
 
+static get_model_info_fn get_model_info = NULL;
 static request_model_fn request_model = NULL;
 static load_all_models_fn load_all_models = NULL;
 static is_model_fn is_car_model = NULL;
@@ -1249,6 +1261,30 @@ static void menu_resolve_vehicles(void) {
   for (int i = named; i < vehicles_ready; i++)
     debugPrintf("MENU: unnamed %s, model %d\n",
                 veh_kind_name[veh_list[i].kind], veh_list[i].id);
+
+  // Vehicles said to exist in LCS but not normally reachable. The spawn list is
+  // built by walking the model table and keeping whatever the Is*Model
+  // predicates call a vehicle, so anything present *and* typed as a vehicle is
+  // already in it -- but a model that exists with some other type would be
+  // skipped silently. Asking by name settles both questions at once: the id if
+  // the game knows the name at all, and the classification if it does.
+  if (get_model_info) {
+    static const char *const probe[] = {
+      "corpse", "mafiablood", "mini", "speakermav", "topfun", "deaddodo",
+      "escape",
+    };
+    for (int i = 0; i < (int)(sizeof(probe) / sizeof(probe[0])); i++) {
+      int id = -1;
+      if (!get_model_info(probe[i], &id) || id < 0) {
+        debugPrintf("MENU: extra model \"%s\" is not in this build\n", probe[i]);
+        continue;
+      }
+      const int kind = veh_classify(id);
+      debugPrintf("MENU: extra model \"%s\" = %d, %s, cd image %d\n", probe[i],
+                  id, kind < 0 ? "NOT a spawnable vehicle" : veh_kind_name[kind],
+                  is_in_cd_image ? is_in_cd_image(id) : -1);
+    }
+  }
 
   // One probe with a key the game itself uses (VehicleCheat passes "CHEAT1" to
   // CText::Get), so a zone-name miss can be told apart from the text system not
@@ -2247,6 +2283,8 @@ void menu_init(void) {
   pools_get_vehicle_ref =
       (get_vehicle_ref_fn)need_sym("_ZN6CPools13GetVehicleRefEP8CVehicle");
   pools_get_vehicle = (get_vehicle_fn)need_sym("_ZN6CPools10GetVehicleEi");
+  get_model_info =
+      (get_model_info_fn)need_sym("_ZN10CModelInfo12GetModelInfoEPKcPi");
   request_model = (request_model_fn)need_sym("_ZN10CStreaming12RequestModelEii");
   load_all_models = (load_all_models_fn)need_sym("_ZN10CStreaming22LoadAllRequestedModelsEb");
   is_car_model = (is_model_fn)need_sym("_ZN10CModelInfo10IsCarModelEi");
