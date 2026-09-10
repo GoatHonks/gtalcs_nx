@@ -219,7 +219,7 @@ at an `END_THREAD` stub instead and let the game retire it.
 
 ## Outstanding
 
-- **Bodyguards** — crashed twice. The second time the log stopped straight after
+- **Bodyguards** — crashed three times. The second time the log stopped straight after
   the chosen ped model, so the fault is in `AddPed` building against a model that
   requesting alone did not make resident. `model_has_clump()` now applies the
   game's own test (`CBaseModelInfo` vtable entry 6 returns the clump;

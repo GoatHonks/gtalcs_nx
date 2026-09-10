@@ -252,36 +252,36 @@ static void fly_patch_probe(void) {
               got[0], got[1], FLY_CAP_STOCK, FLY_FLOOR_STOCK);
 }
 
+// Writes instruction words into the game's code through the writable alias.
+//
+// The first attempt flipped the pages RX -> RW -> RX with
+// svcSetProcessMemoryPermission. The way back failed with 0xd401 and left
+// FlyingControl non-executable. so_util.c explains why in its own comment --
+// "The kernel forbids W->X on code memory" -- so that path was never going to
+// work, and reading it first would have saved a bad build.
+//
+// It is also unnecessary. so_finalize maps the image a *second* time, with
+// svcMapProcessCodeMemory(load_virtbase, load_base, size), so the original
+// load_base allocation is still mapped, still writable, and backed by the same
+// physical pages as the RX view. Writing through load_base and flushing is the
+// ordinary way around W^X and touches no permissions at all.
+static uint32_t *fly_patch_slot(int i) {
+  const uintptr_t off = fly_patch_addr[i] - (uintptr_t)game_mod.load_virtbase;
+  return (uint32_t *)((uintptr_t)game_mod.load_base + off);
+}
+
 static int fly_patch_write(const uint32_t *words) {
-  if (!fly_patch_ok)
+  if (!fly_patch_ok || !game_mod.load_base || !game_mod.load_virtbase)
     return 0;
 
-  uintptr_t lo = fly_patch_addr[0], hi = fly_patch_addr[0];
-  for (int i = 1; i < 2; i++) {
-    if (fly_patch_addr[i] < lo) lo = fly_patch_addr[i];
-    if (fly_patch_addr[i] > hi) hi = fly_patch_addr[i];
+  for (int i = 0; i < 2; i++) {
+    uint32_t *w = fly_patch_slot(i);
+    *w = words[i];
+    armDCacheFlush(w, sizeof(*w));
   }
-  const u64 page_lo = (u64)(lo & ~(uintptr_t)0xfff);
-  const u64 page_hi = (u64)((hi + 4 + 0xfff) & ~(uintptr_t)0xfff);
-  const u64 size = page_hi - page_lo;
-
-  Result rc = svcSetProcessMemoryPermission(envGetOwnProcessHandle(),
-                                            page_lo, size, Perm_Rw);
-  if (R_FAILED(rc)) {
-    debugPrintf("MENU: could not make FlyingControl writable (%08x)\n", rc);
-    return 0;
-  }
-
+  // Invalidated on the executable view, which is what the CPU fetches from.
   for (int i = 0; i < 2; i++)
-    *(uint32_t *)fly_patch_addr[i] = words[i];
-
-  rc = svcSetProcessMemoryPermission(envGetOwnProcessHandle(),
-                                     page_lo, size, Perm_Rx);
-  __builtin___clear_cache((char *)page_lo, (char *)page_hi);
-  if (R_FAILED(rc)) {
-    debugPrintf("MENU: could not restore FlyingControl to RX (%08x)\n", rc);
-    return 0;
-  }
+    armICacheInvalidate((void *)fly_patch_addr[i], sizeof(uint32_t));
   return 1;
 }
 
@@ -305,10 +305,74 @@ static int fly_patch_write(const uint32_t *words) {
 // CWeaponInfo::GetWeaponInfo and returns early when the type has none, so
 // refilling by type is safe: slots the player does not own are skipped by the
 // game's own check rather than by us poking the ped struct.
-typedef void (*set_ammo_fn)(void *ped, int weapon_type, unsigned count);
-static set_ammo_fn ped_set_ammo = NULL;
 #define WEAPON_TYPE_MAX 36
 #define AMMO_TOPUP      9999
+
+typedef void (*set_ammo_fn)(void *ped, int weapon_type, unsigned count);
+static set_ammo_fn ped_set_ammo = NULL;
+
+// Turning unlimited ammo off used to leave everything at 9999, because nothing
+// remembered what you had. CPed::SetAmmo shows where it goes:
+//
+//   x0 = CWeaponInfo::GetWeaponInfo(type)
+//   ldrsw x8, [x0, #96]        ; the ped's weapon slot for that type, -1 if none
+//   madd  x10, x8, #28, x19    ; ped + slot * 28
+//   str   w20, [x10, #1716]    ; ammo
+//
+// so the counts can be read back the same way and put back on the way out.
+// Snapshotting per slot rather than per type matters: several types share a
+// slot, and saving per type would restore whichever one happened to be last.
+typedef void *(*get_weapon_info_fn)(int weapon_type);
+static get_weapon_info_fn get_weapon_info = NULL;
+
+#define WEAPONINFO_SLOT   96
+#define PED_WEAPON_BASE   1716
+#define PED_WEAPON_STRIDE 28
+#define MAX_WEAPON_SLOTS  32
+
+static int ammo_backup[MAX_WEAPON_SLOTS];
+static uint8_t ammo_backup_valid[MAX_WEAPON_SLOTS];
+static int ammo_was_on = 0;
+
+static int weapon_slot_of(int type) {
+  if (!get_weapon_info)
+    return -1;
+  const void *info = get_weapon_info(type);
+  if (!info)
+    return -1;
+  const int slot = *(const int32_t *)((uintptr_t)info + WEAPONINFO_SLOT);
+  return (slot >= 0 && slot < MAX_WEAPON_SLOTS) ? slot : -1;
+}
+
+static int *ammo_cell(void *ped, int slot) {
+  return (int *)((uintptr_t)ped + PED_WEAPON_BASE +
+                 (size_t)slot * PED_WEAPON_STRIDE);
+}
+
+static void ammo_snapshot(void *ped) {
+  memset(ammo_backup_valid, 0, sizeof(ammo_backup_valid));
+  int n = 0;
+  for (int t = 1; t <= WEAPON_TYPE_MAX; t++) {
+    const int slot = weapon_slot_of(t);
+    if (slot < 0 || ammo_backup_valid[slot])
+      continue;
+    ammo_backup[slot] = *ammo_cell(ped, slot);
+    ammo_backup_valid[slot] = 1;
+    n++;
+  }
+  debugPrintf("MENU: saved ammo for %d weapon slots\n", n);
+}
+
+static void ammo_restore(void *ped) {
+  int n = 0;
+  for (int slot = 0; slot < MAX_WEAPON_SLOTS; slot++) {
+    if (!ammo_backup_valid[slot])
+      continue;
+    *ammo_cell(ped, slot) = ammo_backup[slot];
+    n++;
+  }
+  debugPrintf("MENU: restored ammo for %d weapon slots\n", n);
+}
 
 // CWanted lives at ped+0x928: WantedLevelDownCheat does FindPlayerPed(),
 // add x0,#0x928, then CheatWantedLevel(0) -- which is exactly "clear it".
@@ -337,6 +401,21 @@ static const char *const menu_toggle_name[MENU_NUM_TOGGLES] = {
 
 static int menu_toggle_on[MENU_NUM_TOGGLES];
 
+// Save on the way in, put back on the way out. Kept out of the slow tick above
+// so the snapshot happens the instant the toggle flips, before anything has
+// been overwritten with 9999.
+static void menu_apply_ammo_edges(void *ped) {
+  const int on = menu_toggle_on[MENU_TOG_AMMO];
+  if (on == ammo_was_on)
+    return;
+  ammo_was_on = on;
+
+  if (on)
+    ammo_snapshot(ped);
+  else
+    ammo_restore(ped);
+}
+
 // Runs every frame while the game is live, menu open or not.
 static void menu_apply_toggles(void) {
   // The ceiling lives in the game's code, so it is switched when the toggle
@@ -364,6 +443,8 @@ static void menu_apply_toggles(void) {
     if (*energy < *max)
       *energy = *max;
   }
+
+  menu_apply_ammo_edges(ped);
 
   float *health = (float *)((uintptr_t)ped + PED_HEALTH);
   float *armour = (float *)((uintptr_t)ped + PED_ARMOUR);
@@ -397,6 +478,7 @@ static void menu_apply_toggles(void) {
       ped_set_ammo(ped, t, AMMO_TOPUP);
   }
 }
+
 
 // ---- teleport ----
 //
@@ -1519,23 +1601,47 @@ static void menu_spawn_bodyguards(void) {
     // constructor down. CPopulation::AddPedInCar falls back when it sees a
     // null; we skip the guard instead, which is the honest thing to do when
     // there is nothing to fall back to.
+    // Logged step by step. This has crashed three times and each log stopped at
+    // the same place -- right after the model was chosen -- which narrows it to
+    // "one of the next four calls" and no further. Guessing between them has not
+    // worked, so each one now announces itself and the next log will name the
+    // one that does not come back.
+    if (is_in_cd_image && !is_in_cd_image(model)) {
+      debugPrintf("MENU: ped model %d is not in the cd image, skipped\n", model);
+      continue;
+    }
+
+    debugPrintf("MENU: ped %d: requesting model\n", model);
     if (request_model && load_all_models) {
       request_model(model, 1);
+      debugPrintf("MENU: ped %d: requested, loading\n", model);
       load_all_models(0);
+      debugPrintf("MENU: ped %d: loaded\n", model);
+    }
+
+    const uint8_t *pinfo = model_info_for(model);
+    debugPrintf("MENU: ped %d: model info %p\n", model, (const void *)pinfo);
+    if (!pinfo) {
+      debugPrintf("MENU: ped model %d has no model info, skipped\n", model);
+      continue;
     }
     if (!model_has_clump(model)) {
       debugPrintf("MENU: ped model %d did not load, skipping this bodyguard\n",
                   model);
       continue;
     }
+    debugPrintf("MENU: ped %d: clump present\n", model);
 
     float pos[3];
     pos[0] = ppos[0] + dx[i];
     pos[1] = ppos[1] + dy[i];
     pos[2] = find_ground_z ? find_ground_z(pos[0], pos[1]) + 1.0f : ppos[2];
 
+    debugPrintf("MENU: ped %d: AddPed(type %d) at %.1f, %.1f, %.1f\n",
+                model, PEDTYPE_GANG1 + BODYGUARD_GANG, pos[0], pos[1], pos[2]);
     void *guard = population_add_ped(PEDTYPE_GANG1 + BODYGUARD_GANG,
                                      (unsigned)model, pos, 0, 0);
+    debugPrintf("MENU: ped %d: AddPed returned %p\n", model, guard);
     if (!guard) {
       debugPrintf("MENU: AddPed(model %d) returned NULL\n", model);
       continue;
@@ -1738,6 +1844,8 @@ void menu_init(void) {
   hud_help_message = (uint16_t *)need_sym("_ZN4CHud13m_HelpMessageE");
 
   ped_set_ammo = (set_ammo_fn)need_sym("_ZN4CPed7SetAmmoE11eWeaponTypej");
+  get_weapon_info =
+      (get_weapon_info_fn)need_sym("_ZN11CWeaponInfo13GetWeaponInfoE11eWeaponType");
   cheat_wanted_level = (cheat_wanted_fn)need_sym("_ZN7CWanted16CheatWantedLevelEi");
   find_ground_z = (find_ground_z_fn)need_sym("_ZN6CWorld19FindGroundZForCoordEff");
   find_player_ped = (find_player_ped_fn)need_sym("_Z13FindPlayerPedv");
