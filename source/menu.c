@@ -745,6 +745,7 @@ static uint8_t *menu_target_on = NULL;
 static float *menu_target_pos = NULL;
 static float *radar_map_waypoint = NULL;   // CRadar::MapWayPoint, two floats
 static int *menu_target_blip_index = NULL;
+static void **gp_radar_map = NULL;   // GRadarMap
 
 // Where the marker you place actually lives is still unknown, so this reports
 // every candidate at once rather than guessing at a fourth.
@@ -798,6 +799,29 @@ static int menu_find_marker(float *out_x, float *out_y) {
   // and LoadAllRadarBlips, and what it holds is whatever was left in that
   // memory -- garbage that has already, once as -1.29e16 and once as a hair
   // either side of zero, been mistaken for a destination.
+
+  // The map screen is a class of its own: RadarMap, reached through the global
+  // GRadarMap. That is how the CLEO teleport script found the marker -- the
+  // string "GRadarMap" sits at the end of the script, right after "Map Marker",
+  // and it resolves the symbol and reads an offset out of the object.
+  //
+  // RadarMap::Update stores an eight-byte pair at +128 and single floats at
+  // +108/+112/+116/+124, which are the centre and zoom in some order. Rather
+  // than guess which is the target, dump the object and read the answer off the
+  // numbers: with a marker placed, its coordinates are in here somewhere and
+  // they will look like the world coordinates they are.
+  if (gp_radar_map && *gp_radar_map) {
+    const float *m = (const float *)*gp_radar_map;
+    void *ped = find_player_ped ? find_player_ped() : NULL;
+    if (ped) {
+      const float *p = (const float *)((uintptr_t)ped + PED_POS);
+      debugPrintf("MENU: player at %g, %g\n", (double)p[0], (double)p[1]);
+    }
+    for (int off = 0; off < 192; off += 16)
+      debugPrintf("MENU: GRadarMap+%3d: %g %g %g %g\n", off,
+                  (double)m[off / 4], (double)m[off / 4 + 1],
+                  (double)m[off / 4 + 2], (double)m[off / 4 + 3]);
+  }
 
   if (menu_target_on && menu_target_pos && *menu_target_on &&
       menu_pos_sane(menu_target_pos[0], menu_target_pos[1])) {
@@ -2202,6 +2226,7 @@ void menu_init(void) {
   menu_target_on = (uint8_t *)need_sym("_ZN12CMenuManager12m_TargetIsOnE");
   menu_target_pos = (float *)need_sym("_ZN12CMenuManager12m_fTargetPosE");
   radar_map_waypoint = (float *)need_sym("_ZN6CRadar11MapWayPointE");
+  gp_radar_map = (void **)need_sym("GRadarMap");
   menu_target_blip_index =
       (int *)need_sym("_ZN12CMenuManager17m_TargetBlipIndexE");
   fly_raise_hard_cap();
