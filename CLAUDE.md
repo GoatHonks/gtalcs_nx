@@ -147,8 +147,24 @@ up silently.
 - **`TankCheat` is not a tank cheat.** It walks a counter over the vehicle model
   range (130..216, skipping planes) and hands the result to `VehicleCheat`, so it
   spawns a *different* vehicle each press. It is listed as "Random vehicle".
-- **`SpawnInModel(int model, CVector &pos)` is the game's own vehicle spawner —
-  use it.** Building a vehicle by hand (operator new, constructor, matrix,
+- **Spawn with `VehicleCheat(modelId)`. Nothing else has ever worked.** Both
+  alternatives produce a vehicle with **no collision**: it falls straight down,
+  x and y frozen, until `CWorld::RemoveFallenCars` takes it below −100 about 3.5
+  seconds later. That is true of hand-building it (operator new, constructor,
+  matrix, `CWorld::Add`) *and* of `SpawnInModel`, which is the game's own
+  spawner but has **zero callers** in this build, so nothing ever exercised it.
+  Ruled out along the way, each by a log rather than an argument: the status
+  word, the island byte (`+390`, not the `+126` that `SetupBigBuilding` uses),
+  and the matrix — its rows logged as a clean rotation and it still fell.
+  `VehicleCheat`'s two costs are real and worth paying: it **crashes on boats**
+  (builds them as `CAutomobile`), so those still go through `SpawnInModel`, and
+  it places the vehicle on a path node up to 100 units away rather than next to
+  you.
+- **The vehicle pool**, from `CCarCtrl::RemoveDistantCars`: entries at `+0`, flag
+  bytes at `+8`, count at `+16`, stride 1968, negative flag means free. Snapshot
+  the taken slots before a spawn to find the vehicle afterwards — neither
+  spawner returns one.
+- **`SpawnInModel(int model, CVector &pos)`** Building a vehicle by hand (operator new, constructor, matrix,
   `CWorld::Add`) produced one that **fell straight through the map**: x and y
   frozen, z 11.7 → 10.5 → 4.6 → −6.4 → −43.5 until `CWorld::RemoveFallenCars`
   swept it below −100, about 3.5 seconds later. Boats came out with `z = NaN`.

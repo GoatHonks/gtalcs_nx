@@ -908,6 +908,10 @@ typedef enum { VEH_AUTO = 0, VEH_BIKE, VEH_BOAT, VEH_HELI } veh_kind;
 typedef void (*spawn_in_model_fn)(int model, float *pos);
 static spawn_in_model_fn spawn_in_model = NULL;
 
+// The one that works. TankCheat and TrashmasterCheat both go through it.
+typedef void (*vehicle_cheat_fn)(int model);
+static vehicle_cheat_fn vehicle_cheat = NULL;
+
 static const char *const veh_kind_name[] = { "Car", "Bike", "Boat", "Helicopter" };
 
 // Streaming and classification are still ours -- the list is built from the
@@ -1672,6 +1676,52 @@ static void *veh_pool_find_new(void) {
   return NULL;
 }
 
+// Dumps the fields a vehicle is made of, so ours can be held next to one the
+// game made.
+//
+// Every theory so far has been wrong: it is not the status word, not the island
+// byte, not the construction path (SpawnInModel is the game's own and its
+// vehicles fall too), and not the matrix -- the rows logged as a clean rotation,
+// (0.67 0.74 0)(-0.74 0.67 0)(0 0 1). What is left is that ours does not collide
+// with the world while the traffic parked around it does, so the difference is
+// in a field, and the fastest way to find a difference is to print both.
+static void veh_dump(const char *what, const uint8_t *veh) {
+  if (!veh) {
+    debugPrintf("MENU: %-8s vehicle: none\n", what);
+    return;
+  }
+  const float *pos = (const float *)(veh + VEH_POS);
+  debugPrintf("MENU: %-8s model %d  flags88 %016llx  rwobj %p  col %p\n",
+              what, (int)*(const int16_t *)(veh + 124),
+              (unsigned long long)*(const uint64_t *)(veh + VEH_FLAGS),
+              *(void *const *)(veh + 112),
+              (void *)(model_info_for(*(const int16_t *)(veh + 124))
+                           ? *(void *const *)(model_info_for(
+                                                  *(const int16_t *)(veh + 124)) +
+                                              MODELINFO_COL_MODEL)
+                           : NULL));
+  debugPrintf("MENU: %-8s w717 %08x  lvl390 %u  lvl126 %u  status784 %d  "
+              "pos %.1f %.1f %.1f\n",
+              what, *(const uint32_t *)(veh + 717), veh[390], veh[126],
+              *(const int *)(veh + 784), pos[0], pos[1], pos[2]);
+}
+
+// Any vehicle that was already in the pool before we spawned ours -- i.e. one
+// the game itself put there.
+static const uint8_t *veh_pool_find_existing(const void *skip) {
+  uint8_t *entries;
+  const int8_t *flags;
+  int size;
+  if (!veh_pool(&entries, &flags, &size))
+    return NULL;
+  for (int i = 0; i < size; i++) {
+    uint8_t *e = entries + (size_t)i * VEHPOOL_STRIDE;
+    if (flags[i] >= 0 && veh_slot_taken[i] && (const void *)e != skip)
+      return e;
+  }
+  return NULL;
+}
+
 static void menu_spawn_vehicle(int idx) {
   if (idx < 0 || idx >= vehicles_ready)
     return;
@@ -1697,28 +1747,47 @@ static void menu_spawn_vehicle(int idx) {
   pos[1] = ppos[1] + fwd[1] * SPAWN_AHEAD;
   pos[2] = -1000.0f;
 
+  // VehicleCheat for anything it can handle, because it demonstrably works:
+  // it is what TankCheat and TrashmasterCheat call, and the cars it spawned in
+  // the earliest builds were solid enough to drive away.
+  //
+  // Replacing it was a mistake. It was replaced for two real reasons -- it
+  // builds a boat as a CAutomobile and kills the game, and it drops the vehicle
+  // on a path node up to 100 units off, which is the "spawned out of view"
+  // complaint -- but the replacement lost the one thing that mattered, which is
+  // that the vehicle sits on the ground instead of falling through it. Neither
+  // hand-building nor SpawnInModel produced a vehicle that collides; both fall
+  // straight down until CWorld::RemoveFallenCars takes them at -100.
+  //
+  // So: the proven path for everything except boats, and SpawnInModel only for
+  // those, since VehicleCheat is the thing that crashes on them. The placement
+  // is the game's choice again, which is a step back in convenience and a step
+  // forward in existing.
   veh_pool_snapshot();
-  spawn_in_model(v->id, pos);
+  if (v->kind == VEH_BOAT && spawn_in_model)
+    spawn_in_model(v->id, pos);
+  else if (vehicle_cheat)
+    vehicle_cheat(v->id);
+  else
+    return;
   void *veh = veh_pool_find_new();
 
   debugPrintf("MENU: spawn %s (model %d) -> %.1f, %.1f, %.1f, vehicle %p\n",
               v->label, v->id, pos[0], pos[1], pos[2], veh);
 
   if (veh) {
-    // SpawnInModel never touches the rotation, and it has no callers anywhere in
-    // this build -- so nothing has ever exercised whatever the constructor
-    // leaves in the matrix. The hand-built version set it from the player and
-    // was at least visible before it fell; this one is not visible at all, which
-    // is what a degenerate matrix looks like. Give it the player's rotation,
-    // which is also how it ends up facing the right way.
-    memcpy((char *)veh + VEH_MATRIX, (const char *)ped + VEH_MATRIX, 48);
-
+    // Nothing is written to it. The matrix theory is dead -- the rows logged
+    // last time were a clean rotation, (0.67 0.74 0)(-0.74 0.67 0)(0 0 1), and
+    // it still fell. VehicleCheat sets up its own vehicle correctly, so the one
+    // useful thing to do with it is look, not touch.
     const float *m = (const float *)((uintptr_t)veh + VEH_MATRIX);
     const float *p = (const float *)((uintptr_t)veh + VEH_POS);
     debugPrintf("MENU: %s rows (%.2f %.2f %.2f)(%.2f %.2f %.2f)(%.2f %.2f %.2f) "
                 "pos %.1f %.1f %.1f\n",
                 v->label, m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10],
                 p[0], p[1], p[2]);
+    veh_dump("ours", (const uint8_t *)veh);
+    veh_dump("game's", veh_pool_find_existing(veh));
     veh_track_begin(veh, v->label);
   }
 
@@ -2063,6 +2132,7 @@ void menu_init(void) {
   ms_model_info_ptrs = (void ***)need_sym("_ZN10CModelInfo16ms_modelInfoPtrsE");
 
   spawn_in_model = (spawn_in_model_fn)need_sym("_Z12SpawnInModeli7CVector");
+  vehicle_cheat = (vehicle_cheat_fn)need_sym("_Z12VehicleCheati");
   ms_p_vehicle_pool = (void **)need_sym("_ZN6CPools15ms_pVehiclePoolE");
   pools_get_vehicle_ref =
       (get_vehicle_ref_fn)need_sym("_ZN6CPools13GetVehicleRefEP8CVehicle");
