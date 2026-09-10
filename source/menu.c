@@ -825,6 +825,21 @@ static int menu_find_marker(float *out_x, float *out_y) {
     const float *target = (const float *)((uintptr_t)*gp_radar_map + RADARMAP_TARGET);
     debugPrintf("MENU: GRadarMap target = %g, %g\n", (double)target[0],
                 (double)target[1]);
+
+    // Clearing the marker leaves +128 holding the old coordinates, so it still
+    // teleports. Something else must say whether one is set, and nothing in
+    // RadarMap writes a flag near the target -- there are no stores to +132 or
+    // +136 anywhere in the class.
+    //
+    // So dump the object as raw words. Doing this once with a marker and once
+    // without makes the difference a diff rather than a guess, which is how the
+    // target itself was found.
+    const uint32_t *w = (const uint32_t *)*gp_radar_map;
+    for (int off = 0; off < 256; off += 32)
+      debugPrintf("MENU: GRadarMap+%3d: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                  off, w[off / 4 + 0], w[off / 4 + 1], w[off / 4 + 2],
+                  w[off / 4 + 3], w[off / 4 + 4], w[off / 4 + 5],
+                  w[off / 4 + 6], w[off / 4 + 7]);
     if (menu_pos_sane(target[0], target[1]) &&
         (target[0] != 0.0f || target[1] != 0.0f)) {
       *out_x = target[0];
@@ -1907,16 +1922,42 @@ static void menu_spawn_vehicle(int idx) {
   // is the game's choice again, which is a step back in convenience and a step
   // forward in existing.
   veh_pool_snapshot();
-  if (v->kind == VEH_BOAT && spawn_in_model)
+  const char *how = "VehicleCheat";
+  if (v->kind == VEH_BOAT && spawn_in_model) {
+    how = "SpawnInModel";
     spawn_in_model(v->id, pos);
-  else if (vehicle_cheat)
+  } else if (vehicle_cheat) {
     vehicle_cheat(v->id);
-  else
+  } else {
     return;
+  }
+
   void *veh = veh_pool_find_new();
 
-  debugPrintf("MENU: spawn %s (model %d) -> %.1f, %.1f, %.1f, vehicle %p\n",
-              v->label, v->id, pos[0], pos[1], pos[2], veh);
+  // VehicleCheat places the vehicle on the nearest path node within 100 units
+  // and gives up entirely when there is none, which is why standing away from a
+  // road produced "spawned" and nothing to show for it. SpawnInModel has no such
+  // requirement -- it drops the vehicle at the coordinates it is handed.
+  //
+  // It gets used as the fallback rather than as the default because its
+  // vehicles fell through the world when it was last tried. That turned out to
+  // be the VehicleNames corruption rather than anything about SpawnInModel, but
+  // "probably fine now" is not a reason to replace a path that works.
+  if (!veh && spawn_in_model) {
+    debugPrintf("MENU: VehicleCheat found no path node, falling back\n");
+    how = "SpawnInModel (no road nearby)";
+    spawn_in_model(v->id, pos);
+    veh = veh_pool_find_new();
+  }
+
+  debugPrintf("MENU: spawn %s (model %d) via %s -> %g, %g, vehicle %p\n",
+              v->label, v->id, how, (double)pos[0], (double)pos[1], veh);
+
+  if (!veh) {
+    snprintf(toast, sizeof(toast), "Could not place %s here", v->label);
+    toast_pending = 1;
+    return;
+  }
 
   if (veh) {
     // Nothing is written to it. The matrix theory is dead -- the rows logged

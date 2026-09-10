@@ -161,8 +161,11 @@ up silently.
   spawns a *different* vehicle each press. It is listed as "Random vehicle".
 - **Spawn with `VehicleCheat(modelId)`** — the path `TrashmasterCheat` uses.
   It **crashes on boats** (builds them as `CAutomobile`), so those go through
-  `SpawnInModel`, and it places the vehicle on a path node up to 100 units away
-  rather than next to you. Both costs are worth paying: a long detour spent
+  `SpawnInModel`; it places the vehicle on a path node up to 100 units away
+  rather than next to you; and **it gives up silently when there is no path node
+  within 100 units**, which is why spawning away from a road produced a toast and
+  no vehicle. `SpawnInModel` is the fallback for that case — detected by the pool
+  scan finding nothing new. Both costs are worth paying: a long detour spent
   hand-rolling a spawner and then swapping in `SpawnInModel` achieved nothing,
   because the vehicles were falling for a reason that had nothing to do with how
   they were built (see the `VehicleNames` entry).
