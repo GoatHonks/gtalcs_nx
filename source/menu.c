@@ -327,6 +327,36 @@ static void fly_patch_set(int high) {
   debugPrintf("MENU: flying ceiling -> %.0f\n", (double)fly_ceiling_data[0]);
 }
 
+// Re-asserted every frame, and loudly the first time it is found changed.
+//
+// The two floats sit in a data array that nothing in this build appears to read
+// or write -- but "appears" is doing a lot of work there, and if anything does
+// touch it the numbers become garbage. FlyingControl then compares altitude
+// against a garbage cap, and a NaN makes the b.le fall through into the clamp
+// with a garbage divisor, which multiplies lift by nonsense: a helicopter
+// spawned and gone in a frame looks exactly like that. Two stores per frame is
+// nothing, and it turns a mystery into a log line.
+static void fly_patch_hold(void) {
+  if (!fly_patch_ok || !fly_ceiling_data)
+    return;
+
+  const float cap = fly_patch_applied ? FLY_CAP_ON : FLY_CAP_OFF;
+  const float floor_ = fly_patch_applied ? FLY_FLOOR_ON : FLY_FLOOR_OFF;
+
+  static int complained = 0;
+  if (!complained &&
+      (fly_ceiling_data[0] != cap || fly_ceiling_data[1] != floor_)) {
+    complained = 1;
+    debugPrintf("MENU: flying ceiling data was clobbered (%f %f, wanted %f %f) "
+                "-- %s is not the dead array it looked like\n",
+                (double)fly_ceiling_data[0], (double)fly_ceiling_data[1],
+                (double)cap, (double)floor_, FLY_DATA_SYM);
+  }
+
+  fly_ceiling_data[0] = cap;
+  fly_ceiling_data[1] = floor_;
+}
+
 // ---- always-on toggles ----
 //
 // CPlayerPed::RestoreSprintEnergy (0x45cc28) reads the current sprint energy
@@ -464,6 +494,7 @@ static void menu_apply_toggles(void) {
   const int want_high = menu_toggle_on[MENU_TOG_HELI_CEILING];
   if (want_high != fly_patch_applied)
     fly_patch_set(want_high);
+  fly_patch_hold();
 
   if (!find_player_ped)
     return;
@@ -1177,7 +1208,10 @@ static choose_gang_fn choose_gang_occupation = NULL;
 // CPed::SetPlayerToFollow(int) is the follow-the-player primitive: it stores the
 // player index at +473 and moves the ped into the follow state at +988.
 typedef void (*set_player_to_follow_fn)(void *ped, int player);
-static set_player_to_follow_fn ped_set_player_to_follow = NULL;
+// CPed::SetLeader(CPed*) -- one store, null-checked. Unlike
+// SetPlayerToFollow, which dereferences a field a new ped does not have.
+typedef void (*set_leader_fn)(void *ped, void *leader);
+static set_leader_fn ped_set_leader = NULL;
 typedef void (*give_weapon_fn)(void *ped, int weapon, unsigned ammo, int select);
 static give_weapon_fn ped_give_weapon = NULL;
 typedef void (*set_current_weapon_fn)(void *ped, int weapon);
@@ -1602,7 +1636,7 @@ static void menu_spawn_vehicle(int idx) {
 
 static void menu_spawn_bodyguards(void) {
   if (!population_add_ped || !choose_gang_occupation || !find_player_ped ||
-      !ped_set_player_to_follow) {
+      !ped_set_leader) {
     snprintf(toast, sizeof(toast), "Bodyguards unavailable");
     toast_pending = 1;
     return;
@@ -1685,11 +1719,34 @@ static void menu_spawn_bodyguards(void) {
       continue;
     }
 
-    ped_set_player_to_follow(guard, 0);
-    if (ped_give_weapon)
+    // NOT SetPlayerToFollow. That is what has been crashing all along, and the
+    // instrumented log finally showed it: AddPed returns a valid ped, and the
+    // next call dies. Its body is
+    //
+    //   ldr   x10, [x19, #1552]
+    //   ldrsh w8,  [x10, #124]     ; and more: ldp q0,q1,[x10,#48] ...
+    //
+    // with no null check on x10. A ped fresh out of AddPed has nothing at
+    // +1552, so it dereferences null immediately. The function expects a ped
+    // the game has already set up, not a new one.
+    //
+    // CPed::SetLeader is the safe equivalent and is what the game's own
+    // CPopulation::PlaceGangMembersInFormation uses to make gang members
+    // follow: one store to +672, a null check, and a reference registration.
+    if (ped_set_leader)
+      ped_set_leader(guard, ped);
+
+    // The weapon type was a guess and never got tested, because the crash came
+    // first. Ask CWeaponInfo whether it is real before handing it over.
+    const int wslot = weapon_slot_of(BODYGUARD_WEAPON);
+    if (wslot >= 0 && ped_give_weapon) {
       ped_give_weapon(guard, BODYGUARD_WEAPON, AMMO_TOPUP, 1);
-    if (ped_set_current_weapon)
-      ped_set_current_weapon(guard, BODYGUARD_WEAPON);
+      if (ped_set_current_weapon)
+        ped_set_current_weapon(guard, BODYGUARD_WEAPON);
+    } else {
+      debugPrintf("MENU: weapon type %d has no slot (%d), bodyguard unarmed\n",
+                  BODYGUARD_WEAPON, wslot);
+    }
 
     debugPrintf("MENU: bodyguard %d model %d weapon %d at %.1f, %.1f, %.1f\n",
                 i, model, BODYGUARD_WEAPON, pos[0], pos[1], pos[2]);
@@ -1931,8 +1988,7 @@ void menu_init(void) {
       (add_ped_fn)need_sym("_ZN11CPopulation6AddPedE8ePedTypejRK7CVectorib");
   choose_gang_occupation =
       (choose_gang_fn)need_sym("_ZN11CPopulation20ChooseGangOccupationEi");
-  ped_set_player_to_follow =
-      (set_player_to_follow_fn)need_sym("_ZN4CPed17SetPlayerToFollowEi");
+  ped_set_leader = (set_leader_fn)need_sym("_ZN4CPed9SetLeaderEPS_");
   ped_give_weapon = (give_weapon_fn)need_sym("_ZN4CPed10GiveWeaponE11eWeaponTypejb");
   ped_set_current_weapon =
       (set_current_weapon_fn)need_sym("_ZN4CPed16SetCurrentWeaponE11eWeaponType");

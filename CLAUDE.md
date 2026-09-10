@@ -223,7 +223,13 @@ at an `END_THREAD` stub instead and let the game retire it.
 
 ## Outstanding
 
-- **Bodyguards** — crashed three times. The second time the log stopped straight after
+- **Bodyguards** — crashed four times, all on the same call. The instrumented
+  log settled it: `AddPed` **succeeds**, and `CPed::SetPlayerToFollow` then dies
+  on `ldr x10,[x19,#1552]` / `ldrsh w8,[x10,#124]` with no null check — a ped
+  fresh from `AddPed` has nothing at `+1552`. Use `CPed::SetLeader`, which is
+  one null-checked store and is what `PlaceGangMembersInFormation` uses.
+  **Read the callee's first few instructions before handing it a new object.**
+  Old note said the crash was streaming; it was not. The second time the log stopped straight after
   the chosen ped model, so the fault is in `AddPed` building against a model that
   requesting alone did not make resident. `model_has_clump()` now applies the
   game's own test (`CBaseModelInfo` vtable entry 6 returns the clump;
