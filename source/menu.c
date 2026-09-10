@@ -779,22 +779,25 @@ static int menu_pos_sane(float x, float y) {
 }
 
 static int menu_find_marker(float *out_x, float *out_y) {
+  // Printed with %g, not %.1f. The last build showed MapWayPoint as "-0.0" and I
+  // read that as zero; it was a tiny non-zero value rounding to -0.0, so the
+  // "is it non-zero" test passed, the range check waved it through -- the origin
+  // is a perfectly ordinary coordinate -- and the teleport landed at 0,0, which
+  // is Aspatria. Rounded output hid the one digit that mattered.
   if (radar_map_waypoint)
-    debugPrintf("MENU: CRadar::MapWayPoint = %.1f, %.1f\n",
-                radar_map_waypoint[0], radar_map_waypoint[1]);
+    debugPrintf("MENU: CRadar::MapWayPoint = %g, %g\n",
+                (double)radar_map_waypoint[0], (double)radar_map_waypoint[1]);
   if (menu_target_blip_index)
     debugPrintf("MENU: m_TargetBlipIndex = %d\n", *menu_target_blip_index);
   if (menu_target_on && menu_target_pos)
-    debugPrintf("MENU: m_TargetIsOn=%u m_fTargetPos = %.1f, %.1f\n",
-                *menu_target_on, menu_target_pos[0], menu_target_pos[1]);
+    debugPrintf("MENU: m_TargetIsOn=%u m_fTargetPos = %g, %g\n",
+                *menu_target_on, (double)menu_target_pos[0],
+                (double)menu_target_pos[1]);
 
-  if (radar_map_waypoint &&
-      (radar_map_waypoint[0] != 0.0f || radar_map_waypoint[1] != 0.0f) &&
-      menu_pos_sane(radar_map_waypoint[0], radar_map_waypoint[1])) {
-    *out_x = radar_map_waypoint[0];
-    *out_y = radar_map_waypoint[1];
-    return 1;
-  }
+  // MapWayPoint is *not* a source. It has no writers anywhere outside Shutdown
+  // and LoadAllRadarBlips, and what it holds is whatever was left in that
+  // memory -- garbage that has already, once as -1.29e16 and once as a hair
+  // either side of zero, been mistaken for a destination.
 
   if (menu_target_on && menu_target_pos && *menu_target_on &&
       menu_pos_sane(menu_target_pos[0], menu_target_pos[1])) {
@@ -815,8 +818,8 @@ static int menu_find_marker(float *out_x, float *out_y) {
       continue;
 
     const uint16_t sprite = *(const uint16_t *)(b + BLIP_SPRITE);
-    debugPrintf("MENU: blip %2d use=%u sprite=%u at %.1f, %.1f\n", i,
-                b[BLIP_INUSE], sprite, x, y);
+    debugPrintf("MENU: blip %2d use=%u sprite=%u at %g, %g\n", i,
+                b[BLIP_INUSE], sprite, (double)x, (double)y);
 
     if (b[BLIP_INUSE] && sprite == BLIP_SPRITE_WAYPOINT &&
         menu_pos_sane(x, y)) {
