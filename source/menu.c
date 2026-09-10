@@ -191,7 +191,49 @@ static menu_cheat menu_cheats[] = {
 
 static int cheats_ready = 0;
 
-// ---- the flying ceiling: removed, and why ----
+// ---- the flying ceiling, second attempt ----
+//
+// The user's read of this was right and mine was wrong: it is not a property of
+// flying, it is a height limit the game keeps in a variable. The CLEO
+// "Unlimited Flying" script is eighteen bytes and all it does is write the float
+// 8000.0 to one address and end.
+//
+// That address in this build is CVehicle::rcHeliHeightLimit -- a named, exported
+// four-byte float, which FlyingControl loads and compares the vehicle's z
+// against before any of the hardcoded 80.0 business:
+//
+//   ldr  x9, [x9, #1200]      ; -> CVehicle::rcHeliHeightLimit
+//   ldr  s2, [x9]
+//   ldr  s1, [x19, #72]       ; z
+//   fcmp s1, s2
+//
+// So the toggle is now a four-byte write to a variable that exists for exactly
+// this purpose. No code patching, and nothing borrowed from a neighbour: the
+// last attempt parked two floats in VehicleNames and took every vehicle's
+// collision with it.
+#define FLY_LIMIT_HIGH 8000.0f
+
+static float *fly_height_limit = NULL;
+static float fly_height_stock = 0.0f;
+static int fly_height_saved = 0;
+static int fly_height_applied = 0;
+
+static void fly_limit_set(int high) {
+  if (!fly_height_limit)
+    return;
+
+  if (!fly_height_saved) {
+    fly_height_stock = *fly_height_limit;
+    fly_height_saved = 1;
+    debugPrintf("MENU: rcHeliHeightLimit was %.1f\n", (double)fly_height_stock);
+  }
+
+  *fly_height_limit = high ? FLY_LIMIT_HIGH : fly_height_stock;
+  fly_height_applied = high;
+  debugPrintf("MENU: rcHeliHeightLimit -> %.1f\n", (double)*fly_height_limit);
+}
+
+// ---- the first attempt at the flying ceiling, and why it is gone ----
 //
 // "Fly higher" patched CVehicle::FlyingControl to read its altitude cap from two
 // floats instead of holding them as MOVZ immediates, and parked those floats in
@@ -317,6 +359,7 @@ typedef enum {
   MENU_TOG_INVINCIBLE,
   MENU_TOG_AMMO,
   MENU_TOG_NEVER_WANTED,
+  MENU_TOG_FLY_HIGHER,
   MENU_NUM_TOGGLES
 } menu_toggle;
 
@@ -326,6 +369,7 @@ static const char *const menu_toggle_name[MENU_NUM_TOGGLES] = {
   "Invincible",
   "Unlimited ammo",
   "Never wanted",
+  "Fly higher",
 };
 
 static int menu_toggle_on[MENU_NUM_TOGGLES];
@@ -347,6 +391,10 @@ static void menu_apply_ammo_edges(void *ped) {
 
 // Runs every frame while the game is live, menu open or not.
 static void menu_apply_toggles(void) {
+  const int want_high = menu_toggle_on[MENU_TOG_FLY_HIGHER];
+  if (want_high != fly_height_applied)
+    fly_limit_set(want_high);
+
   if (!find_player_ped)
     return;
 
@@ -615,12 +663,23 @@ static level_from_pos_fn level_from_position = NULL;
 // the array testing +43 for a free slot and writes the position at +12; +40 is
 // the blip type, where 4 is a coordinate blip -- the kind a marker you place on
 // the map is, as opposed to the char blip (2) a mission contact gets.
-#define BLIP_STRIDE     60
-#define BLIP_COUNT      75
-#define BLIP_INUSE      43
-#define BLIP_POS        12
-#define BLIP_TYPE       40
-#define BLIP_TYPE_COORD 4
+#define BLIP_STRIDE 60
+#define BLIP_COUNT  75
+#define BLIP_INUSE  43
+#define BLIP_POS    12
+
+// The marker *you* place, as opposed to the ones the game puts on the map for
+// home, missions and shops. CRadar::SetTargetBlip stamps sprite 49 at +56:
+//
+//   mov  w12, #0x31            ; 49
+//   strh w12, [x8, #56]
+//
+// and no other blip gets that sprite. The previous version matched on +40 being
+// 4, which is why it happily teleported to the home marker: +40 is not a blip
+// type at all, it is a generation counter that SetTargetBlip reads, increments
+// and writes back. Small values there meant nothing.
+#define BLIP_SPRITE          56
+#define BLIP_SPRITE_WAYPOINT 49
 
 static uint8_t *radar_trace = NULL;
 
@@ -631,11 +690,17 @@ static int menu_find_marker(float *out_x, float *out_y) {
   int found = 0;
   for (int i = 0; i < BLIP_COUNT; i++) {
     const uint8_t *b = radar_trace + (size_t)i * BLIP_STRIDE;
-    if (!b[BLIP_INUSE] || b[BLIP_TYPE] != BLIP_TYPE_COORD)
+    if (!b[BLIP_INUSE])
       continue;
 
-    // The last one rather than the first: a mission can own a coordinate blip
-    // too, and the marker you just placed is the more recent.
+    const uint16_t sprite = *(const uint16_t *)(b + BLIP_SPRITE);
+    debugPrintf("MENU: blip %d sprite %u at %.1f, %.1f\n", i, sprite,
+                *(const float *)(b + BLIP_POS),
+                *(const float *)(b + BLIP_POS + 4));
+
+    if (sprite != BLIP_SPRITE_WAYPOINT)
+      continue;
+
     *out_x = *(const float *)(b + BLIP_POS);
     *out_y = *(const float *)(b + BLIP_POS + 4);
     found = 1;
@@ -2002,6 +2067,7 @@ void menu_init(void) {
   level_from_position =
       (level_from_pos_fn)need_sym("_ZN9CTheZones20GetLevelFromPositionEPK7CVector");
   radar_trace = (uint8_t *)need_sym("_ZN6CRadar13ms_RadarTraceE");
+  fly_height_limit = (float *)need_sym("_ZN8CVehicle17rcHeliHeightLimitE");
   find_node_closest =
       (find_node_fn)need_sym("_ZN9CPathFind22FindNodeClosestToCoorsE7CVectorhfbbbb");
   find_zone_by_label =
