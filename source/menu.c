@@ -1716,10 +1716,46 @@ static const uint8_t *veh_pool_find_existing(const void *skip) {
     return NULL;
   for (int i = 0; i < size; i++) {
     uint8_t *e = entries + (size_t)i * VEHPOOL_STRIDE;
-    if (flags[i] >= 0 && veh_slot_taken[i] && (const void *)e != skip)
-      return e;
+    if (flags[i] < 0 || (const void *)e == skip)
+      continue;
+    // An in-use slot is not necessarily a vehicle: the first comparison came
+    // back model 0, no clump, position 0,0,0. Insist on something real.
+    if (*(const int16_t *)(e + 124) <= 0 || !*(void *const *)(e + 112))
+      continue;
+    return e;
   }
   return NULL;
+}
+
+// How much traffic exists at all.
+//
+// The interesting question is no longer "why does our vehicle fall" but "does
+// anything else in this world stay up". The video shows a street with
+// pedestrians on it and not one moving car, and the first attempt to compare
+// against a game-made vehicle found none to compare with. If the pool is empty
+// apart from ours, then vehicles falling through the map is the port's problem
+// and not the menu's, and no amount of changing how the menu spawns them will
+// help.
+static void veh_pool_census(void) {
+  uint8_t *entries;
+  const int8_t *flags;
+  int size;
+  if (!veh_pool(&entries, &flags, &size)) {
+    debugPrintf("MENU: vehicle pool unavailable\n");
+    return;
+  }
+
+  int used = 0, real = 0;
+  for (int i = 0; i < size; i++) {
+    if (flags[i] < 0)
+      continue;
+    used++;
+    const uint8_t *e = entries + (size_t)i * VEHPOOL_STRIDE;
+    if (*(const int16_t *)(e + 124) > 0 && *(void *const *)(e + 112))
+      real++;
+  }
+  debugPrintf("MENU: vehicle pool: %d slots, %d in use, %d with a model\n",
+              size, used, real);
 }
 
 static void menu_spawn_vehicle(int idx) {
@@ -1786,6 +1822,7 @@ static void menu_spawn_vehicle(int idx) {
                 "pos %.1f %.1f %.1f\n",
                 v->label, m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10],
                 p[0], p[1], p[2]);
+    veh_pool_census();
     veh_dump("ours", (const uint8_t *)veh);
     veh_dump("game's", veh_pool_find_existing(veh));
     veh_track_begin(veh, v->label);
