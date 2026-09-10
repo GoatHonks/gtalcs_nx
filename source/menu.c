@@ -761,6 +761,23 @@ static int *menu_target_blip_index = NULL;
 // Something draws that pin on the map and on the radar, so the data exists. The
 // blip sweep below now reports any slot with a non-zero position regardless of
 // its in-use byte, in case the marker is stored with a different convention.
+// Liberty City fits comfortably inside +/-3000 on both axes, so anything
+// outside that is not a place -- it is a field that happens to be non-zero.
+//
+// CRadar::MapWayPoint read back as -12921941685960704.0, my "non-zero means
+// valid" test accepted it, and the teleport that followed took the game down.
+// Any coordinate that comes from guessing at a field has to be checked before it
+// reaches CPed::Teleport, and honestly all of them should be.
+#define WORLD_LIMIT 3000.0f
+
+static int menu_pos_sane(float x, float y) {
+  // NaN fails every comparison, which is what the first test is for.
+  if (!(x == x) || !(y == y))
+    return 0;
+  return x > -WORLD_LIMIT && x < WORLD_LIMIT &&
+         y > -WORLD_LIMIT && y < WORLD_LIMIT;
+}
+
 static int menu_find_marker(float *out_x, float *out_y) {
   if (radar_map_waypoint)
     debugPrintf("MENU: CRadar::MapWayPoint = %.1f, %.1f\n",
@@ -772,13 +789,15 @@ static int menu_find_marker(float *out_x, float *out_y) {
                 *menu_target_on, menu_target_pos[0], menu_target_pos[1]);
 
   if (radar_map_waypoint &&
-      (radar_map_waypoint[0] != 0.0f || radar_map_waypoint[1] != 0.0f)) {
+      (radar_map_waypoint[0] != 0.0f || radar_map_waypoint[1] != 0.0f) &&
+      menu_pos_sane(radar_map_waypoint[0], radar_map_waypoint[1])) {
     *out_x = radar_map_waypoint[0];
     *out_y = radar_map_waypoint[1];
     return 1;
   }
 
-  if (menu_target_on && menu_target_pos && *menu_target_on) {
+  if (menu_target_on && menu_target_pos && *menu_target_on &&
+      menu_pos_sane(menu_target_pos[0], menu_target_pos[1])) {
     *out_x = menu_target_pos[0];
     *out_y = menu_target_pos[1];
     return 1;
@@ -799,7 +818,8 @@ static int menu_find_marker(float *out_x, float *out_y) {
     debugPrintf("MENU: blip %2d use=%u sprite=%u at %.1f, %.1f\n", i,
                 b[BLIP_INUSE], sprite, x, y);
 
-    if (b[BLIP_INUSE] && sprite == BLIP_SPRITE_WAYPOINT) {
+    if (b[BLIP_INUSE] && sprite == BLIP_SPRITE_WAYPOINT &&
+        menu_pos_sane(x, y)) {
       *out_x = x;
       *out_y = y;
       found = 1;
@@ -1528,6 +1548,14 @@ static void menu_teleport_xy(float x, float y, int snap_to_road,
                              const char *what) {
   if (!find_ground_z || !find_player_ped || !ped_teleport) {
     snprintf(toast, sizeof(toast), "Teleport unavailable");
+    toast_pending = 1;
+    return;
+  }
+
+  if (!menu_pos_sane(x, y)) {
+    debugPrintf("MENU: refusing to teleport to %s at %.1f, %.1f -- not a place\n",
+                what, x, y);
+    snprintf(toast, sizeof(toast), "That is not a valid location");
     toast_pending = 1;
     return;
   }
