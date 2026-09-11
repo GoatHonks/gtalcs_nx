@@ -441,6 +441,7 @@ typedef enum {
   MENU_TOG_AMMO,
   MENU_TOG_NEVER_WANTED,
   MENU_TOG_FLY_HIGHER,
+  MENU_TOG_DODO_FLY,
   MENU_NUM_TOGGLES
 } menu_toggle;
 
@@ -451,6 +452,7 @@ static const char *const menu_toggle_name[MENU_NUM_TOGGLES] = {
   "Unlimited ammo",
   "Never wanted",
   "Fly higher",
+  "Dodo flies",
 };
 
 static int menu_toggle_on[MENU_NUM_TOGGLES];
@@ -1057,9 +1059,10 @@ static void ***ms_model_info_ptrs = NULL;
 // (Models 198 and 199, the two the game does type as helicopters, are the ones
 // you cannot fly: they are scripted traffic and take off by themselves.)
 //
-// Three have no textures in this build and look unfinished, which the labels
-// say so the entry is not a wasted trip. Labelling any of them by model number
-// was worse than useless: it said car, and what appeared was a Hunter.
+// 211, 212 and 216 have no textures in this build. That is the game's data
+// missing, not something the menu should be apologising for in its own list, so
+// the names are just the names. Labelling any of them by model number was worse
+// than useless: it said car, and what appeared was a Hunter.
 // Model 198 crashes the game on spawn. Both it and 199 are typed as
 // helicopters and both go through the identical CHeli path, so the class is not
 // the problem -- 198 itself is incomplete, like the untextured models nearby.
@@ -1110,12 +1113,12 @@ static const struct { int id; const char *name; } veh_extra_names[] = {
   // 211 and 212 are not the same model twice: DEFAULT.IDE calls them rcgoblin
   // and rcraider. Both ship without textures in this build.
   { 164, "Dodo" },                  // a plane, filed under Air; it cannot fly yet
-  { 211, "RC Goblin (no tex)" },
-  { 212, "RC Raider (no tex)" },
+  { 211, "RC Goblin" },
+  { 212, "RC Raider" },
   { 213, "Hunter" },             // olive attack helicopter, rockets and minigun
   { 214, "Maverick" },           // civilian, cream with a blue stripe
   { 215, "Police Maverick" },    // LCPD markings, tail number P619PD
-  { 216, "News Maverick (no tex)" }, // its vcnmav textures are missing
+  { 216, "News Maverick" },      // its vcnmav textures are missing in this build
 };
 #define NUM_VEH_EXTRA_NAMES \
   ((int)(sizeof(veh_extra_names) / sizeof(veh_extra_names[0])))
@@ -2288,6 +2291,168 @@ static void menu_spawn_bodyguards(void) {
   toast_pending = 1;
 }
 
+// ---- making the Dodo fly ----
+//
+// The Dodo is model 164, a plane the model table calls a car, so the game builds
+// it as a CAutomobile and it drives. Nothing in this build flies it: CPlane has
+// no callers at all, and the vehicle type field only picks the class.
+//
+// So this is a flight model written here, per frame, on the vehicle the game is
+// already simulating. It is **entirely additive** -- it only ever runs while the
+// toggle is on and you are sitting in a Dodo, and it touches nothing else. Turn
+// it off and the Dodo is exactly the vehicle the game shipped.
+//
+// It works on the velocity at +144 and the rotation rows at +16 directly rather
+// than through ApplyMoveForce/ApplyTurnForce. Forces would be more physical, but
+// every constant here has to be guessed and then tried on hardware, and velocity
+// is the one that can be reasoned about: the game's own gravity is
+// m_vecMoveSpeed.z -= 0.008 * ms_fTimeStep (CPhysical::ApplyGravity, the
+// constant is 0xbc03126f), so cancelling it is a subtraction I can write down
+// rather than a force divided by a mass I would also be guessing at.
+//
+// Matrix convention, from CPlaceable::SetHeading: row0 = right, row1 = forward,
+// row2 = up, and at heading 0 they are x, y, z. So up = cross(right, forward)
+// and right = cross(forward, up), which is what keeps the rows orthonormal below.
+#define DODO_MODEL       164
+#define ENTITY_MODEL_ID  124     // int16, proven by the pool census logging
+
+#define VEH_ROW_RIGHT    0       // float indices into the rows at VEH_MATRIX
+#define VEH_ROW_FORWARD  4
+#define VEH_ROW_UP       8
+
+#define GAME_GRAVITY      0.008f   // CPhysical::ApplyGravity, per time step
+#define DODO_TAKEOFF      0.30f    // forward speed at which the wing holds it up
+#define DODO_THRUST       0.0040f
+#define DODO_AIRBRAKE     0.0025f
+#define DODO_PITCH_RATE   0.020f
+#define DODO_ROLL_RATE    0.035f
+#define DODO_YAW_FROM_BANK 0.015f  // banking turns you, as it should
+#define DODO_TRACK_NOSE   0.05f    // how fast velocity swings round to the nose
+#define DODO_STICK_MAX    128.0f
+#define DODO_PEDAL_MAX    255.0f
+
+typedef void *(*pad_get_fn)(int which);
+typedef int (*pad_axis_fn)(void *pad);
+static pad_get_fn pad_get_pad = NULL;
+static pad_axis_fn pad_steer_ud = NULL;
+static pad_axis_fn pad_steer_lr = NULL;
+static pad_axis_fn pad_accelerate = NULL;
+static pad_axis_fn pad_brake = NULL;
+static const float *game_time_step = NULL;
+
+static float dodo_len(const float *v) {
+  return __builtin_sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+}
+
+static void dodo_normalise(float *v) {
+  const float l = dodo_len(v);
+  if (l > 0.0001f) {
+    v[0] /= l; v[1] /= l; v[2] /= l;
+  }
+}
+
+// Rotate a pair of axes about the third, which is all a pitch or a roll is.
+static void dodo_spin(float *a, float *b, float angle) {
+  const float c = __builtin_cosf(angle), sn = __builtin_sinf(angle);
+  for (int i = 0; i < 3; i++) {
+    const float ai = a[i], bi = b[i];
+    a[i] = ai * c + bi * sn;
+    b[i] = bi * c - ai * sn;
+  }
+}
+
+static void dodo_fly_tick(void) {
+  if (!menu_toggle_on[MENU_TOG_DODO_FLY] || !find_player_vehicle || !pad_get_pad)
+    return;
+
+  uint8_t *veh = (uint8_t *)find_player_vehicle();
+  if (!veh || *(const int16_t *)(veh + ENTITY_MODEL_ID) != DODO_MODEL)
+    return;
+
+  void *pad = pad_get_pad(0);
+  if (!pad)
+    return;
+
+  const float step = game_time_step ? *game_time_step : 1.0f;
+  float *rows = (float *)(veh + VEH_MATRIX);
+  float *vel = (float *)(veh + VEH_MOVESPEED);
+  float *right = rows + VEH_ROW_RIGHT;
+  float *fwd = rows + VEH_ROW_FORWARD;
+  float *up = rows + VEH_ROW_UP;
+
+  // Stick up puts the nose down, the way every flight control works.
+  const float pitch_in =
+      pad_steer_ud ? -(float)pad_steer_ud(pad) / DODO_STICK_MAX : 0.0f;
+  const float roll_in =
+      pad_steer_lr ? (float)pad_steer_lr(pad) / DODO_STICK_MAX : 0.0f;
+  const float accel =
+      pad_accelerate ? (float)pad_accelerate(pad) / DODO_PEDAL_MAX : 0.0f;
+  const float brake = pad_brake ? (float)pad_brake(pad) / DODO_PEDAL_MAX : 0.0f;
+
+  // Thrust and airbrake along the nose.
+  const float push = (accel * DODO_THRUST - brake * DODO_AIRBRAKE) * step;
+  for (int i = 0; i < 3; i++)
+    vel[i] += fwd[i] * push;
+
+  // Lift, proportional to how fast you are going *forwards*. So it still sits on
+  // the runway at rest, it still stalls if you climb until the speed bleeds off,
+  // and it never becomes a hover. At takeoff speed it exactly cancels gravity.
+  const float fspeed = vel[0] * fwd[0] + vel[1] * fwd[1] + vel[2] * fwd[2];
+  float lift = fspeed / DODO_TAKEOFF;
+  if (lift < 0.0f) lift = 0.0f;
+  if (lift > 1.0f) lift = 1.0f;
+  vel[2] += GAME_GRAVITY * lift * step;
+
+  // Attitude. Roll also yaws you, which is how an aircraft actually turns, and
+  // saves needing a rudder on a pad with no axis left to give it.
+  if (pitch_in != 0.0f)
+    dodo_spin(fwd, up, pitch_in * DODO_PITCH_RATE * step);
+  if (roll_in != 0.0f)
+    dodo_spin(right, up, roll_in * DODO_ROLL_RATE * step);
+
+  const float bank = right[2];          // how far the wing is tipped from level
+  if (lift > 0.0f) {
+    const float yaw = -bank * DODO_YAW_FROM_BANK * step * lift;
+    const float c = __builtin_cosf(yaw), sn = __builtin_sinf(yaw);
+    for (int i = 0; i < 2; i++) {       // about world z, so x and y only
+      float *r = (i == 0) ? right : fwd;
+      const float x = r[0], y = r[1];
+      r[0] = x * c - y * sn;
+      r[1] = x * sn + y * c;
+    }
+  }
+
+  // Rebuild the rows orthonormal. Spinning pairs of axes every frame in floats
+  // drifts, and a matrix that is no longer orthonormal shears the model.
+  dodo_normalise(fwd);
+  const float d = up[0] * fwd[0] + up[1] * fwd[1] + up[2] * fwd[2];
+  for (int i = 0; i < 3; i++)
+    up[i] -= fwd[i] * d;
+  dodo_normalise(up);
+  right[0] = fwd[1] * up[2] - fwd[2] * up[1];
+  right[1] = fwd[2] * up[0] - fwd[0] * up[2];
+  right[2] = fwd[0] * up[1] - fwd[1] * up[0];
+
+  // Velocity swings round to follow the nose. Without this, pitching up leaves
+  // you still travelling the way you were and the plane flies sideways.
+  const float speed = dodo_len(vel);
+  if (speed > 0.01f) {
+    const float k = DODO_TRACK_NOSE * step * lift;
+    for (int i = 0; i < 3; i++)
+      vel[i] += (fwd[i] * speed - vel[i]) * k;
+  }
+
+  // Twice a second, so the constants above can be tuned against what actually
+  // happened rather than against how it felt.
+  static int dodo_log = 0;
+  if (++dodo_log >= 30) {
+    dodo_log = 0;
+    debugPrintf("MENU: dodo fwd %.3f lift %.2f pitch %.2f roll %.2f z %.1f\n",
+                (double)fspeed, (double)lift, (double)pitch_in, (double)roll_in,
+                (double)((const float *)(veh + VEH_POS))[2]);
+  }
+}
+
 static void menu_vehicle_edit(int action) {
   if (!find_player_vehicle) {
     snprintf(toast, sizeof(toast), "Vehicle editing unavailable");
@@ -2445,6 +2610,12 @@ static void menu_activate(void) {
 
 // ---- per-frame ----
 void menu_tick(int in_game) {
+  // Not in menu_apply_toggles: that function is defined above the vehicle field
+  // offsets this needs, and moving the offsets up to meet it would scatter them
+  // away from everything else that uses them.
+  if (in_game)
+    dodo_fly_tick();
+
   if (!menu_ready())
     return;
 
@@ -2557,6 +2728,12 @@ void menu_init(void) {
   bike_fix = (veh_void_fn)need_sym("_ZN5CBike3FixEv");
   automobile_teleport = (void *)need_sym("_ZN11CAutomobile8TeleportE7CVector");
   bike_teleport = (void *)need_sym("_ZN5CBike8TeleportE7CVector");
+  pad_get_pad = (pad_get_fn)need_sym("_ZN4CPad6GetPadEi");
+  pad_steer_ud = (pad_axis_fn)need_sym("_ZN4CPad17GetSteeringUpDownEv");
+  pad_steer_lr = (pad_axis_fn)need_sym("_ZN4CPad20GetSteeringLeftRightEv");
+  pad_accelerate = (pad_axis_fn)need_sym("_ZN4CPad13GetAccelerateEv");
+  pad_brake = (pad_axis_fn)need_sym("_ZN4CPad8GetBrakeEv");
+  game_time_step = (const float *)need_sym("_ZN6CTimer12ms_fTimeStepE");
   ped_teleport = (ped_teleport_fn)need_sym("_ZN4CPed8TeleportE7CVector");
   world_remove = (world_entity_fn)need_sym("_ZN6CWorld6RemoveEP7CEntity");
   world_add = (world_entity_fn)need_sym("_ZN6CWorld3AddEP7CEntity");

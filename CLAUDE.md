@@ -278,6 +278,8 @@ at an `END_THREAD` stub instead and let the game retire it.
   they still fly when entered. Flight comes from the handling data, not the
   vehicle type, so *do not* assume the type field gates behaviour — it only picks
   the class. 211, 212 and 216 have no textures in this build.
+  211, 212 and 216 having no textures is the game's own data missing; the menu
+  does not annotate its list with it.
   **198 and 199, the two the game does type as helicopters, are the useless
   ones**: 199 takes off by itself the moment it exists, and **198 crashes the
   game on spawn** and is excluded from the list. Both go through the identical
@@ -297,11 +299,9 @@ at an `END_THREAD` stub instead and let the game retire it.
   makes them appear on their own. That IDE is also the authority on names —
   it is what says 211 is `rcgoblin` and 212 `rcraider`, two different RC
   vehicles rather than the duplicate I had assumed.
-- **Make the Dodo fly** — asked for, not started. It is model 164, typed as a
-  car, and `MODINFO/dodo fly.csa` is **840 bytes of script**: a whole flight
-  model that reads the pad, does vector maths on the vehicle matrix and applies
-  forces every frame. Porting it is writing a flight controller in C, not
-  flipping a flag — a real feature, not a quick one.
+- **Make the Dodo fly** — done, as the toggle "Dodo flies". See the section
+  below. Untuned: every constant in it was picked by reasoning, not by flying,
+  so expect to adjust them against the log it prints.
 - **Vehicle editor** — done: colours, top speed, flip upright. The
   handling data pointer is at `vehicle+400` (`CHeli`'s constructor writes it from
   an array indexed by model info `+102`, stride `0xe0`), and `cHandlingDataMgr`
@@ -414,3 +414,40 @@ Ruled out for good, by resolving every GOT reference rather than grepping:
 (`LoadSaveData`). They are save-game fields. The marker is also **not a blip**:
 with one placed, `ms_RadarTrace` holds only the player (sprite 40) and the home
 icon (19).
+
+## The Dodo flight model
+
+Model 164 is a plane the model table calls a car, so the game builds it as a
+`CAutomobile` and it drives. Nothing in this build flies it — `CPlane` has no
+callers at all — so `dodo_fly_tick()` is a flight model written in `menu.c` and
+run per frame on the vehicle the game is already simulating.
+
+It is **purely additive**: it runs only while the toggle is on *and* the player is
+sitting in model 164, and touches nothing else. Off, the Dodo is exactly the
+vehicle the game shipped. That was the requirement.
+
+It writes the velocity at `+144` and the rotation rows at `+16` directly rather
+than going through `ApplyMoveForce`/`ApplyTurnForce`. Forces are more physical,
+but every constant here is a guess until it is flown, and velocity is the one
+that can be reasoned about: gravity is `m_vecMoveSpeed.z -= 0.008 * ms_fTimeStep`
+(`CPhysical::ApplyGravity`, constant `0xbc03126f`), so cancelling it is a
+subtraction rather than a force divided by a mass that would also be guessed.
+
+- **Lift is proportional to forward speed**, clamped to 1 at `DODO_TAKEOFF`. That
+  single choice gives a runway roll, a stall if you climb until the speed bleeds
+  off, and no hovering — none of which needed special-casing.
+- **Roll yaws you.** A banked turn is how an aircraft actually turns, and the pad
+  has no axis left for a rudder.
+- **The rows are re-orthonormalised every frame.** Spinning pairs of axes in
+  floats drifts, and a non-orthonormal matrix shears the model.
+- **Velocity tracks the nose**, or pitching up leaves you travelling the old way
+  and the plane flies sideways.
+
+Input is `CPad::GetPad(0)` with `GetSteeringUpDown` / `GetSteeringLeftRight`
+(±128) and `GetAccelerate` / `GetBrake` (0–255).
+
+`dodo_fly_tick` is called from `menu_tick`, not `menu_apply_toggles`: that
+function is defined above the vehicle field offsets this needs.
+
+It prints speed, lift, stick and altitude twice a second so the constants can be
+tuned against what happened rather than against how it felt.
