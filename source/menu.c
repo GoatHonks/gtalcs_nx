@@ -2293,115 +2293,69 @@ static void menu_spawn_bodyguards(void) {
 
 // ---- making the Dodo fly ----
 //
-// The first version of this was a flight model written by hand -- lift, pitch,
-// roll, matrix re-orthonormalisation, the lot. It flew, after a fashion, but the
-// controls inverted at random and it was never going to feel like the game.
-//
-// It was also **fighting the game's own flight model**, which turns out to have
-// been running on the Dodo the entire time. CAutomobile::ProcessControl:
+// LCS already has a Dodo flight model, keyed on the model number, and it runs
+// every frame. CAutomobile::ProcessControl:
 //
 //   4cbb14: ldrh w9, [x19, #124]     the model index
 //   4cbb18: cmp  w9, #0xa4           164 -- the Dodo, by name
-//   4cbb1c: b.eq <flying path>       and it skips the handling-flag check others need
+//   4cbb1c: b.eq <flying path>       skipping the handling-flag check others need
 //   4cbbfc: mov  w1, wzr             eFlightModel 0, the Dodo model
 //   4cbc6c: bl   CVehicle::FlyingControl
 //
-// (The other global in that branch is CVehicle::bAllDodosCheat, the "all cars
-// fly" cheat, which routes every car through the same path.)
+// (The helicopters reach the same function through handling+206 bit 1, which is
+// what makes 211-216 fly despite being typed as cars. They pass eFlightModel 6;
+// the RC models 211/212 pass 2.)
 //
-// So LCS has a Dodo flight model, keyed on the model number, already wired up.
-// What it does not have is a flying handling record worth using. FlyingControl
-// opens with
+// **So the difference between the Dodo and a helicopter is the flight model
+// number, and nothing else.** FlyingControl dispatches on it:
 //
-//   ldr x8, [x0, #400] / cbz x8, <return>
+//   tst w9, #0x3a    models 1,3,4,5   read the stick for a winged aircraft
+//   tst w9, #0x44    models 2 and 6   the helicopter path
+//   ...              model 0          the Dodo's own, which barely lifts it
 //
-// and +400 is the **flying** handling pointer -- distinct from +392, the ordinary
-// one. CAutomobile's constructor fills it from
-// cHandlingDataMgr::GetFlyingPointer(handlingId), and that function is
+// A previous attempt swapped the vehicle's flying handling record at +400 for a
+// helicopter's, on the theory that the Dodo was flying on a bad record. The log
+// killed it in one line:
 //
-//   idx = id - 75;  if (idx < 6) record = base + idx * 88;  else record = base
+//   MENU: dodo flying handling 0x273f4e990 -> 0x273f4e990 (from model 214)
 //
-// -- a *fallback to record 0* rather than a null. So the Dodo never fails the
-// null check, always flies, and always flies on whatever record 0 happens to be.
-// That is exactly the shape of "technically flyable, unusable in practice", and
-// it is why a CLEO script exists to fix it.
+// The same pointer. GetFlyingPointer is `idx = id - 75; idx < 6 ? base + idx*88
+// : base`, and **both** the Dodo's and the Maverick's handling ids are outside
+// 75..80, so both get the fallback record. The helicopters fly on that same
+// record. The record was never the difference, and the swap was a no-op -- worth
+// remembering that a "fix" whose before and after print identical is not a fix.
 //
-// So the fix is not a flight model at all. **Point the Dodo at the helicopter's
-// flying handling record while the toggle is on, and put the original back when
-// it is off.** The flight code, the constants, the feel and the control mapping
-// are then all the game's own -- the helicopters at 213-215 fly well on this
-// exact record -- and "off" restores a pointer rather than undoing physics.
-//
-// Model info +102 is the handling id (CCam::GetBoatLook_L_R_HeightOffset reads it
-// the same way to reach GetBoatPointer), so the helicopter's record is looked up
-// from a helicopter's own model rather than by hardcoding an index.
-#define DODO_MODEL        164
-#define ENTITY_MODEL_ID   124    // int16, proven by the pool census logging
-#define VEH_FLYING_HANDLING 400  // NOT +392: that is the ordinary handling record
-#define MODELINFO_HANDLING_ID 102
-#define DODO_DONOR_MODEL  214    // the Maverick, for its flying handling record
+// So: while the toggle is on, call the game's own FlyingControl with the
+// helicopter model. No physics of ours, no state to unwind -- switching it off
+// simply stops calling, and the frame after that is stock.
+#define DODO_MODEL         164
+#define ENTITY_MODEL_ID    124   // int16, proven by the pool census logging
+#define FLIGHT_MODEL_HELI  6     // what 213-215 are given, and they fly well
 
-typedef void *(*get_flying_ptr_fn)(void *mgr, unsigned char handling_id);
-static get_flying_ptr_fn get_flying_pointer = NULL;
-static void **pmod_handling_manager = NULL;
-
-// What we replaced, and on which vehicle, so it can be put back exactly.
-static void *dodo_patched_veh = NULL;
-static void *dodo_saved_flying = NULL;
-
-static void dodo_restore(void) {
-  if (!dodo_patched_veh)
-    return;
-  *(void **)((uintptr_t)dodo_patched_veh + VEH_FLYING_HANDLING) = dodo_saved_flying;
-  debugPrintf("MENU: dodo flying handling restored to %p\n", dodo_saved_flying);
-  dodo_patched_veh = NULL;
-  dodo_saved_flying = NULL;
-}
-
-// The helicopter's flying handling record, found through a helicopter's model.
-static void *dodo_donor_flying(void) {
-  if (!get_flying_pointer || !pmod_handling_manager || !*pmod_handling_manager)
-    return NULL;
-
-  const uint8_t *info = model_info_for(DODO_DONOR_MODEL);
-  if (!info)
-    return NULL;
-
-  const unsigned char id = info[MODELINFO_HANDLING_ID];
-  return get_flying_pointer(*pmod_handling_manager, id);
-}
+typedef void (*flying_control_fn)(void *veh, int flight_model);
+static flying_control_fn flying_control = NULL;
 
 static void dodo_fly_tick(void) {
-  // Off, or out of the plane, or in something else: put the pointer back. This
-  // runs before any of the enabling checks so there is no path that leaves a
-  // borrowed record installed on a vehicle.
-  if (!menu_toggle_on[MENU_TOG_DODO_FLY] || !find_player_vehicle) {
-    dodo_restore();
+  if (!menu_toggle_on[MENU_TOG_DODO_FLY] || !flying_control || !find_player_vehicle)
     return;
-  }
 
   uint8_t *veh = (uint8_t *)find_player_vehicle();
-  if (!veh || *(const int16_t *)(veh + ENTITY_MODEL_ID) != DODO_MODEL) {
-    dodo_restore();
+  if (!veh || *(const int16_t *)(veh + ENTITY_MODEL_ID) != DODO_MODEL)
     return;
+
+  flying_control(veh, FLIGHT_MODEL_HELI);
+
+  // Once a second is enough to confirm it is running without burying the log.
+  static u64 next = 0;
+  const u64 ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
+  if (ms >= next) {
+    next = ms + 1000;
+    const float *p = (const float *)(veh + VEH_POS);
+    const float *v = (const float *)(veh + VEH_MOVESPEED);
+    debugPrintf("MENU: dodo FlyingControl(%d) z %.1f vel %.3f %.3f %.3f\n",
+                FLIGHT_MODEL_HELI, (double)p[2], (double)v[0], (double)v[1],
+                (double)v[2]);
   }
-
-  if (dodo_patched_veh == veh)
-    return;                      // already flying; nothing to do per frame
-
-  dodo_restore();                // a different Dodo: unpatch the old one first
-
-  void *donor = dodo_donor_flying();
-  if (!donor)
-    return;
-
-  void **slot = (void **)(veh + VEH_FLYING_HANDLING);
-  dodo_patched_veh = veh;
-  dodo_saved_flying = *slot;
-  *slot = donor;
-
-  debugPrintf("MENU: dodo flying handling %p -> %p (from model %d)\n",
-              dodo_saved_flying, donor, DODO_DONOR_MODEL);
 }
 
 static void menu_vehicle_edit(int action) {
@@ -2679,9 +2633,8 @@ void menu_init(void) {
   bike_fix = (veh_void_fn)need_sym("_ZN5CBike3FixEv");
   automobile_teleport = (void *)need_sym("_ZN11CAutomobile8TeleportE7CVector");
   bike_teleport = (void *)need_sym("_ZN5CBike8TeleportE7CVector");
-  get_flying_pointer =
-      (get_flying_ptr_fn)need_sym("_ZN16cHandlingDataMgr16GetFlyingPointerEh");
-  pmod_handling_manager = (void **)need_sym("pmod_HandlingManager");
+  flying_control =
+      (flying_control_fn)need_sym("_ZN8CVehicle13FlyingControlE12eFlightModel");
   ped_teleport = (ped_teleport_fn)need_sym("_ZN4CPed8TeleportE7CVector");
   world_remove = (world_entity_fn)need_sym("_ZN6CWorld6RemoveEP7CEntity");
   world_add = (world_entity_fn)need_sym("_ZN6CWorld3AddEP7CEntity");

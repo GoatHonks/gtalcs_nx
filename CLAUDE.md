@@ -433,26 +433,38 @@ fly" cheat routes every car through the same path. Helicopters reach it instead
 via **`handling+206` bit 1**, which is the flag that makes 211–216 fly despite
 being typed as cars.
 
-What the Dodo lacks is a flying handling record worth using. `FlyingControl`
-opens with `ldr x8,[x0,#400]` / `cbz x8,<return>`, and **`+400` is the *flying*
-handling pointer — not `+392`, the ordinary one.** `CAutomobile`'s constructor
-fills it from `GetFlyingPointer(handlingId)`, which is
+**The difference between the Dodo and a helicopter is the flight model number,
+and nothing else.** `FlyingControl` dispatches on it:
 
 ```
-idx = id - 75;  if (idx < 6) record = base + idx*88;  else record = base
+tst w9, #0x3a    models 1,3,4,5   stick handling for a winged aircraft
+tst w9, #0x44    models 2 and 6   the helicopter path
+...              model 0          the Dodo's own, which barely lifts it
 ```
 
-— a **fallback to record 0, never a null**. So the Dodo never fails the check,
-always flies, and always flies on whatever record 0 is. That is precisely
-"technically flyable, unusable", and why a CLEO script exists for it.
+So the toggle calls `CVehicle::FlyingControl(veh, 6)` — the helicopter model,
+the one 213–215 fly on — every frame while it is on. No physics of ours and no
+state to unwind: switching it off stops calling, and the next frame is stock.
 
-So the feature is **not a flight model**. The toggle points `+400` at the
-*helicopter's* flying handling record and restores the original when off. The
-flight code, constants, feel and control mapping are all the game's own, and
-"off" restores a pointer rather than unwinding physics. The donor record is
-found through a helicopter's own model info (`+102` is the handling id, the way
-`CCam::GetBoatLook_L_R_HeightOffset` reads it to reach `GetBoatPointer`), not by
-hardcoding an index.
+### The flying-handling record was a red herring
+
+The attempt before that swapped `vehicle+400`, the *flying* handling pointer, for
+a helicopter's, on the theory that the Dodo was flying on a bad record. The log
+killed it in one line:
+
+```
+MENU: dodo flying handling 0x273f4e990 -> 0x273f4e990 (from model 214)
+```
+
+The same pointer. `GetFlyingPointer` is `idx = id - 75; idx < 6 ? base + idx*88 :
+base`, and **both** the Dodo's and the Maverick's handling ids fall outside
+75..80, so both get the fallback record — and the helicopters fly on that very
+record. **A fix whose before and after print identical is not a fix**; printing
+both is what made that obvious instead of another test flight.
+
+(`+400` is still worth knowing: it is the flying handling pointer, distinct from
+`+392`, and `FlyingControl` opens `ldr x8,[x0,#400]` / `cbz x8,<return>` — but it
+is never null for a `CAutomobile`, because of that fallback.)
 
 ### What the hand-rolled version cost
 
