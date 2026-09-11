@@ -415,7 +415,35 @@ Ruled out for good, by resolving every GOT reference rather than grepping:
 with one placed, `ms_RadarTrace` holds only the player (sprite 40) and the home
 icon (19).
 
-## The Dodo: the game already flies it
+## Flying: the model number is the whole feature
+
+LCS has the flight code and more variants than it uses.
+`CAutomobile::ProcessControl` matches the Dodo by model number and passes
+`eFlightModel` **0**, the one variant that barely lifts anything; helicopters
+reach the same `CVehicle::FlyingControl` through **`handling+206` bit 1** and
+pass **6**; the "all cars fly" cheat (`CVehicle::bAllDodosCheat`, the branch
+beside the Dodo's) passes **5**.
+
+So "make it fly" is one call per frame with a number of our choosing. The seven
+models, read off `FlyingControl`'s own dispatch:
+
+| Models | Selected by | What it is |
+|---|---|---|
+| 1, 3, 4, 5 | `tst w9, #0x3a` | winged — stick is pitch and roll |
+| 2, 6 | `tst w9, #0x44` | helicopter — collective, tilt to accelerate |
+| 0 | fallthrough | the Dodo's own |
+
+Within the winged set, **4 and 5 scale the control forces down** (`cmp w20,#5` →
+×0.1, `cmp w20,#4` → ×0.3) while **1 and 3 are capped low** — 1 tops out at 50
+units, 3 at 80 — which is what makes those the RC models. So the useful three are
+5, 4 and 6, and the menu offers exactly those under "Flight style".
+
+**Skip any vehicle the game already flies** (`handling+206` bit 1). It is already
+getting `FlyingControl` every frame from `ProcessControl`, and a second call with
+a different model means two flight models fighting over one matrix — the same
+mistake the hand-rolled Dodo model made.
+
+## History: how the Dodo got there
 
 **LCS has a Dodo flight model, keyed on the model number, and it runs every
 frame.** `CAutomobile::ProcessControl`:

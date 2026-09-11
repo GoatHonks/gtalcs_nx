@@ -441,7 +441,7 @@ typedef enum {
   MENU_TOG_AMMO,
   MENU_TOG_NEVER_WANTED,
   MENU_TOG_FLY_HIGHER,
-  MENU_TOG_DODO_FLY,
+  MENU_TOG_FLY_ANY,
   MENU_NUM_TOGGLES
 } menu_toggle;
 
@@ -452,7 +452,7 @@ static const char *const menu_toggle_name[MENU_NUM_TOGGLES] = {
   "Unlimited ammo",
   "Never wanted",
   "Fly higher",
-  "Dodo flies",
+  "Vehicles fly",
 };
 
 static int menu_toggle_on[MENU_NUM_TOGGLES];
@@ -1416,6 +1416,7 @@ static void menu_repair_vehicle(void *veh) {
 typedef enum {
   VEDIT_UPRIGHT = 0,
   VEDIT_REPAIR,
+  VEDIT_FLY_STYLE,
   VEDIT_COLOUR1,
   VEDIT_COLOUR2,
   VEDIT_COLOUR_RANDOM,
@@ -1425,6 +1426,7 @@ typedef enum {
 static const char *const veh_edit_name[VEDIT_NUM] = {
   "Flip upright",
   "Repair",
+  "Flight style",
   "Next colour 1",
   "Next colour 2",
   "Random colours",
@@ -2291,70 +2293,86 @@ static void menu_spawn_bodyguards(void) {
   toast_pending = 1;
 }
 
-// ---- making the Dodo fly ----
+// ---- making vehicles fly ----
 //
-// LCS already has a Dodo flight model, keyed on the model number, and it runs
-// every frame. CAutomobile::ProcessControl:
+// LCS already has the flight code, and more of it than it uses. It began as
+// "make the Dodo fly": CAutomobile::ProcessControl matches model 164 by name and
+// hands it CVehicle::FlyingControl with eFlightModel 0 --
 //
 //   4cbb14: ldrh w9, [x19, #124]     the model index
-//   4cbb18: cmp  w9, #0xa4           164 -- the Dodo, by name
-//   4cbb1c: b.eq <flying path>       skipping the handling-flag check others need
-//   4cbbfc: mov  w1, wzr             eFlightModel 0, the Dodo model
+//   4cbb18: cmp  w9, #0xa4           164 -- the Dodo
+//   4cbbfc: mov  w1, wzr             eFlightModel 0
 //   4cbc6c: bl   CVehicle::FlyingControl
 //
-// (The helicopters reach the same function through handling+206 bit 1, which is
-// what makes 211-216 fly despite being typed as cars. They pass eFlightModel 6;
-// the RC models 211/212 pass 2.)
+// -- and model 0 is the one variant that barely lifts anything. Helicopters
+// reach the same function through handling+206 bit 1 and pass 6; the "all cars
+// fly" cheat (CVehicle::bAllDodosCheat, the branch right next to the Dodo's)
+// passes 5. **The flight model number is the whole difference between a Dodo
+// that will not leave the ground and a helicopter that flies well**, so this is
+// one call per frame with a number of our choosing, on whatever is being driven.
 //
-// **So the difference between the Dodo and a helicopter is the flight model
-// number, and nothing else.** FlyingControl dispatches on it:
+// What the seven models are, read out of FlyingControl's own dispatch:
 //
-//   tst w9, #0x3a    models 1,3,4,5   read the stick for a winged aircraft
-//   tst w9, #0x44    models 2 and 6   the helicopter path
-//   ...              model 0          the Dodo's own, which barely lifts it
+//   tst w9, #0x3a   1,3,4,5   winged: reads the stick as pitch and roll
+//   tst w9, #0x44   2,6       helicopter: collective, tilt to accelerate
+//   otherwise       0         the Dodo's own
 //
-// A previous attempt swapped the vehicle's flying handling record at +400 for a
-// helicopter's, on the theory that the Dodo was flying on a bad record. The log
-// killed it in one line:
+// and within the winged set, 4 and 5 scale the control forces down (`cmp w20,#5`
+// -> x0.1, `cmp w20,#4` -> x0.3) while 1 and 3 are full strength but capped low
+// -- 1 tops out at 50 units and 3 at 80 (`cmp w20,#1` / `mov w8,#0x42480000`),
+// which is what makes them the RC models. So the ones worth offering are the two
+// undamped-ceiling winged variants and the helicopter.
 //
-//   MENU: dodo flying handling 0x273f4e990 -> 0x273f4e990 (from model 214)
-//
-// The same pointer. GetFlyingPointer is `idx = id - 75; idx < 6 ? base + idx*88
-// : base`, and **both** the Dodo's and the Maverick's handling ids are outside
-// 75..80, so both get the fallback record. The helicopters fly on that same
-// record. The record was never the difference, and the swap was a no-op -- worth
-// remembering that a "fix" whose before and after print identical is not a fix.
-//
-// So: while the toggle is on, call the game's own FlyingControl with the
-// helicopter model. No physics of ours, no state to unwind -- switching it off
-// simply stops calling, and the frame after that is stock.
-#define DODO_MODEL         164
-#define ENTITY_MODEL_ID    124   // int16, proven by the pool census logging
-#define FLIGHT_MODEL_HELI  6     // what 213-215 are given, and they fly well
+// A helicopter takes off vertically and accelerates by tilting; a plane needs a
+// run-up and holds its speed. That is a real difference in feel and not
+// something to guess at from a disassembly, so the style is **chosen in the
+// menu** rather than picked here.
+#define ENTITY_MODEL_ID 124    // int16, proven by the pool census logging
+#define DODO_MODEL      164
+#define VEH_HANDLING    392
+#define HANDLING_FLAGS  206    // bit 1: the game already flies this vehicle
 
 typedef void (*flying_control_fn)(void *veh, int flight_model);
 static flying_control_fn flying_control = NULL;
 
-static void dodo_fly_tick(void) {
-  if (!menu_toggle_on[MENU_TOG_DODO_FLY] || !flying_control || !find_player_vehicle)
+static const struct { int model; const char *name; } fly_style[] = {
+  { 5, "Plane" },        // the "all cars fly" cheat's own model
+  { 4, "Plane (sharp)" },// same, with three times the control authority
+  { 6, "Helicopter" },   // what 213-215 fly on
+};
+#define NUM_FLY_STYLES ((int)(sizeof(fly_style) / sizeof(fly_style[0])))
+
+static int fly_style_idx = 0;
+
+static void fly_any_tick(void) {
+  if (!menu_toggle_on[MENU_TOG_FLY_ANY] || !flying_control || !find_player_vehicle)
     return;
 
   uint8_t *veh = (uint8_t *)find_player_vehicle();
-  if (!veh || *(const int16_t *)(veh + ENTITY_MODEL_ID) != DODO_MODEL)
+  if (!veh)
     return;
 
-  flying_control(veh, FLIGHT_MODEL_HELI);
+  // Leave anything the game already flies alone. Helicopters get FlyingControl
+  // from ProcessControl every frame via handling+206 bit 1, and adding a second
+  // call with a different model would have two flight models fighting over one
+  // matrix -- which is exactly what the hand-rolled Dodo model did, and how it
+  // earned its random control inversions.
+  const uint8_t *handling = *(const uint8_t *const *)(veh + VEH_HANDLING);
+  if (handling && (handling[HANDLING_FLAGS] & 2))
+    return;
 
-  // Once a second is enough to confirm it is running without burying the log.
+  flying_control(veh, fly_style[fly_style_idx].model);
+
   static u64 next = 0;
   const u64 ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
   if (ms >= next) {
     next = ms + 1000;
     const float *p = (const float *)(veh + VEH_POS);
     const float *v = (const float *)(veh + VEH_MOVESPEED);
-    debugPrintf("MENU: dodo FlyingControl(%d) z %.1f vel %.3f %.3f %.3f\n",
-                FLIGHT_MODEL_HELI, (double)p[2], (double)v[0], (double)v[1],
-                (double)v[2]);
+    debugPrintf("MENU: flying model %d (%s) on model %d, z %.1f vel %.3f %.3f %.3f\n",
+                fly_style[fly_style_idx].model, fly_style[fly_style_idx].name,
+                (int)*(const int16_t *)(veh + ENTITY_MODEL_ID),
+                (double)p[2], (double)v[0], (double)v[1], (double)v[2]);
   }
 }
 
@@ -2422,6 +2440,17 @@ static void menu_vehicle_edit(int action) {
     case VEDIT_REPAIR:
       menu_repair_vehicle(veh);
       snprintf(toast, sizeof(toast), "Repaired");
+      break;
+
+    case VEDIT_FLY_STYLE:
+      // A global setting rather than an edit to this vehicle, so it holds when
+      // you get into the next one. It lives here because this is the vehicle
+      // menu; like the rest of it, you have to be sitting in something.
+      fly_style_idx = (fly_style_idx + 1) % NUM_FLY_STYLES;
+      snprintf(toast, sizeof(toast), "Flight style: %s",
+               fly_style[fly_style_idx].name);
+      debugPrintf("MENU: flight style -> %d (%s)\n",
+                  fly_style[fly_style_idx].model, fly_style[fly_style_idx].name);
       break;
 
     default:
@@ -2519,7 +2548,7 @@ void menu_tick(int in_game) {
   // offsets this needs, and moving the offsets up to meet it would scatter them
   // away from everything else that uses them.
   if (in_game)
-    dodo_fly_tick();
+    fly_any_tick();
 
   if (!menu_ready())
     return;
