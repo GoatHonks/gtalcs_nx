@@ -71,6 +71,13 @@ static find_player_ped_fn find_player_ped = NULL;
 // the callee dereferencing whatever happened to be sitting in x1, which is why
 // teleporting never worked no matter which blip we picked. The blip was never
 // the bug.
+// CEntity::Teleport, called through the vtable. Every entity class overrides it
+// in the *same* slot -- _ZTV4CPed, _ZTV11CAutomobile, _ZTV5CBike and _ZTV5CBoat
+// all carry their Teleport at vtable+0x78 -- so one signature moves a ped on
+// foot or the car he is driving. The CVector is by pointer here too
+// (CAutomobile::Teleport: ldr d0,[x19] / ldr s1,[x19,#8]).
+#define ENTITY_VT_TELEPORT (0x78 / 8)
+
 typedef void (*ped_teleport_fn)(void *ped, const float *pos);
 static ped_teleport_fn ped_teleport = NULL;
 
@@ -747,6 +754,8 @@ static float *radar_map_waypoint = NULL;   // CRadar::MapWayPoint, two floats
 static int *menu_target_blip_index = NULL;
 // The map target, two floats inside the RadarMap object.
 #define RADARMAP_TARGET 128
+// And the flag one word past it that says the marker exists at all.
+#define RADARMAP_TARGET_SET 136
 
 static void **gp_radar_map = NULL;   // GRadarMap
 
@@ -823,29 +832,32 @@ static int menu_find_marker(float *out_x, float *out_y) {
   // single eight-byte store, which is what a CVector2D looks like.
   if (gp_radar_map && *gp_radar_map) {
     const float *target = (const float *)((uintptr_t)*gp_radar_map + RADARMAP_TARGET);
-    debugPrintf("MENU: GRadarMap target = %g, %g\n", (double)target[0],
-                (double)target[1]);
-
-    // Clearing the marker leaves +128 holding the old coordinates, so it still
-    // teleports. Something else must say whether one is set, and nothing in
-    // RadarMap writes a flag near the target -- there are no stores to +132 or
-    // +136 anywhere in the class.
+    // Clearing the marker leaves +128 holding the old coordinates, so the
+    // position alone cannot say whether one is set -- it teleported to a stale
+    // marker for exactly that reason. Dumping the object twice, once with a
+    // marker and once without, made the flag obvious:
     //
-    // So dump the object as raw words. Doing this once with a marker and once
-    // without makes the difference a diff rather than a guess, which is how the
-    // target itself was found.
-    const uint32_t *w = (const uint32_t *)*gp_radar_map;
-    for (int off = 0; off < 256; off += 32)
-      debugPrintf("MENU: GRadarMap+%3d: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-                  off, w[off / 4 + 0], w[off / 4 + 1], w[off / 4 + 2],
-                  w[off / 4 + 3], w[off / 4 + 4], w[off / 4 + 5],
-                  w[off / 4 + 6], w[off / 4 + 7]);
-    if (menu_pos_sane(target[0], target[1]) &&
-        (target[0] != 0.0f || target[1] != 0.0f)) {
+    //   no marker:  +128 00000000 +132 00000000 +136 00000000
+    //   marker set: +128 444eb00b +132 c3f73f96 +136 00000001
+    //
+    // 0x444eb00b is 826.75 and 0xc3f73f96 is -494.50, which is where the pin
+    // was. So **+136 is the "a marker exists" flag**, sitting immediately after
+    // the CVector2D. Nothing in RadarMap stores to it, which is why grepping
+    // the class for writers found nothing and the diff had to settle it.
+    const uint32_t set = *(const uint32_t *)((uintptr_t)*gp_radar_map +
+                                             RADARMAP_TARGET_SET);
+    debugPrintf("MENU: GRadarMap target = %g, %g (set=%u)\n",
+                (double)target[0], (double)target[1], set);
+
+    if (set && menu_pos_sane(target[0], target[1])) {
       *out_x = target[0];
       *out_y = target[1];
       return 1;
     }
+    // An unset marker is a definite answer, not a reason to keep looking: the
+    // fallbacks below are the blip sweep, and the blips are the game's own
+    // icons (home, mission) which are exactly what should not be teleported to.
+    return 0;
   }
 
   if (menu_target_on && menu_target_pos && *menu_target_on &&
@@ -1367,21 +1379,74 @@ static set_current_weapon_fn ped_set_current_weapon = NULL;
 #define VEH_COLOUR1   576
 #define VEH_COLOUR2   577
 #define VEH_MOVESPEED 144
-#define VEH_MASS      240
 #define VEH_NUM_COLOURS 128
+
+// ---- top speed ----
+//
+// "Speed boost" and "stop dead" were the wrong feature: a one-off shove and a
+// handbrake, when what was asked for was the car's actual top speed. That lives
+// in the handling record, and the chain to it is short and checkable:
+//
+//   CBoat::DisplayHandlingData      ldr x0, [x0, #392]   -> tHandlingData *
+//   ConvertDataToGameUnits          ldr s6, [x1, #136]
+//                                   fmul s2, s6, s7      (s7 = 0x3bb60b6a, 1/180)
+//                                   str s2, [x1, #136]
+//
+// Dividing by 180 is the km/h-to-game-units conversion, so **+136 is
+// fMaxVelocity**, held in game units once the file has been loaded.
+//
+// The gearbox is not a separate copy of it: cTransmission sits inline at
+// handling+52 and InitGearRatios reads its own +84, which is the same word
+// (52 + 84 = 136). It rebuilds the gear ratio table from that value, so writing
+// the field without re-running it leaves the car geared for its old top speed
+// and nothing much changes. Call it after every write.
+//
+// **Handling records are shared by every vehicle of that model.** Raising the
+// Banshee's top speed raises it for every Banshee in the city, the AI's
+// included. That is a property of the game's data, not something worth faking
+// per-vehicle, so the menu just says which model it changed.
+#define VEH_HANDLING        392
+#define HANDLING_MAXVELOCITY 136
+#define HANDLING_TRANSMISSION 52
+
+#define SPEED_STEP  0.25f
+#define SPEED_MIN   0.50f
+#define SPEED_MAX   4.00f
 
 typedef void *(*find_player_vehicle_fn)(void);
 static find_player_vehicle_fn find_player_vehicle = NULL;
-typedef void (*apply_move_force_fn)(void *phys, float x, float y, float z);
-static apply_move_force_fn apply_move_force = NULL;
+typedef void (*init_gear_ratios_fn)(void *transmission);
+static init_gear_ratios_fn init_gear_ratios = NULL;
+
+// Stock top speeds, so "reset" is a real reset and the steps compound from the
+// original rather than from whatever it was left at. Keyed by the record's
+// address because that is what identifies a model's handling: several models can
+// share one record, and scaling it once is the honest behaviour.
+#define SPEED_SAVED_MAX 24
+static struct { void *handling; float stock; float mult; } speed_saved[SPEED_SAVED_MAX];
+static int speed_saved_count = 0;
+
+static int speed_slot_for(void *handling) {
+  for (int i = 0; i < speed_saved_count; i++)
+    if (speed_saved[i].handling == handling)
+      return i;
+  if (speed_saved_count >= SPEED_SAVED_MAX)
+    return -1;
+  const int i = speed_saved_count++;
+  speed_saved[i].handling = handling;
+  speed_saved[i].stock = *(const float *)((uintptr_t)handling + HANDLING_MAXVELOCITY);
+  speed_saved[i].mult = 1.0f;
+  return i;
+}
 
 typedef enum {
   VEDIT_COLOUR1 = 0,
   VEDIT_COLOUR2,
   VEDIT_COLOUR_RANDOM,
-  VEDIT_BOOST,
+  VEDIT_SPEED_UP,
+  VEDIT_SPEED_DOWN,
+  VEDIT_SPEED_RESET,
   VEDIT_UPRIGHT,
-  VEDIT_STOP,
   VEDIT_NUM
 } veh_edit_action;
 
@@ -1389,9 +1454,10 @@ static const char *const veh_edit_name[VEDIT_NUM] = {
   "Next colour 1",
   "Next colour 2",
   "Random colours",
-  "Speed boost",
+  "Faster",
+  "Slower",
+  "Stock speed",
   "Flip upright",
-  "Stop dead",
 };
 
 
@@ -1712,6 +1778,27 @@ static void menu_teleport_xy(float x, float y, int snap_to_road,
   if (!ped)
     return;
 
+  // Teleporting the ped while he is sitting in a car left the car behind and
+  // did nothing visible, because a driving ped takes its position from the
+  // vehicle every frame. So move the vehicle instead and the player rides
+  // along -- which is also what you want: you keep the car.
+  //
+  // Teleport is virtual, and it is the **same slot for every entity**: each of
+  // CPed, CAutomobile, CBike and CBoat has its override at vtable+0x78
+  // (_ZTV4CPed+0x78, _ZTV11CAutomobile+0x78, ...), so one indirect call moves
+  // whichever of them the player currently is. Picking the function by class
+  // the way the spawner has to would work too, but it would need a fourth
+  // branch for CHeli and a fifth for anything added later.
+  void *subject = ped;
+  const char *riding = "";
+  if (find_player_vehicle) {
+    void *veh = find_player_vehicle();
+    if (veh) {
+      subject = veh;
+      riding = " with the vehicle";
+    }
+  }
+
   float pos[3];
   const char *how = "ground";
   if (snap_to_road && road_near(x, y, 0.0f, pos)) {
@@ -1723,11 +1810,25 @@ static void menu_teleport_xy(float x, float y, int snap_to_road,
     pos[2] = find_ground_z(x, y) + 1.5f;
   }
 
-  debugPrintf("MENU: teleport to %s at %.1f, %.1f, %.1f (%s)\n",
-              what, pos[0], pos[1], pos[2], how);
-  ped_teleport(ped, pos);
+  // A car dropped at ped height scrapes into the road; give it a little more
+  // clearance and let the suspension settle it.
+  if (subject != ped)
+    pos[2] += 1.0f;
 
-  snprintf(toast, sizeof(toast), "Teleported to %s", what);
+  debugPrintf("MENU: teleport to %s at %.1f, %.1f, %.1f (%s)%s\n",
+              what, pos[0], pos[1], pos[2], how, riding);
+
+  void *const *vtable = *(void *const **)subject;
+  ((ped_teleport_fn)vtable[ENTITY_VT_TELEPORT])(subject, pos);
+
+  // The vehicle arrives stationary. Without this it keeps the velocity it had
+  // when you opened the menu and drives off on its own.
+  if (subject != ped) {
+    float *vel = (float *)((uintptr_t)subject + VEH_MOVESPEED);
+    vel[0] = vel[1] = vel[2] = 0.0f;
+  }
+
+  snprintf(toast, sizeof(toast), "Teleported to %s%s", what, riding);
   toast_pending = 1;
 }
 
@@ -1760,6 +1861,7 @@ typedef void *(*get_vehicle_fn)(int ref);
 static get_vehicle_ref_fn pools_get_vehicle_ref = NULL;
 static get_vehicle_fn pools_get_vehicle = NULL;
 
+#define VEH_TRACK_MS 12000   // long enough to see a fall, short enough to read
 static int veh_track_ref = 0;
 static u64 veh_track_t0 = 0;
 static u64 veh_track_next_report = 0;
@@ -1798,6 +1900,17 @@ static void veh_track_tick(void) {
   // ground level to -100 takes about that long. If these numbers march
   // downwards, the vehicle is falling through the map and the fix belongs at
   // the spawn, not in whatever deletes it afterwards.
+  // Twice a second, but not forever: this ran for a hundred seconds on a car
+  // that had been parked and working the whole time, and buried everything
+  // else in the log. The question it answers is whether a fresh spawn falls,
+  // and that is settled within a few seconds either way.
+  if (ms > VEH_TRACK_MS) {
+    debugPrintf("MENU: %s still alive at %llu ms, no longer watching\n",
+                veh_track_label, (unsigned long long)ms);
+    veh_track_ref = 0;
+    return;
+  }
+
   if (ms >= veh_track_next_report) {
     veh_track_next_report = ms + 500;
     const float *p = (const float *)((uintptr_t)veh + VEH_POS);
@@ -2191,8 +2304,8 @@ static void menu_vehicle_edit(int action) {
   }
 
   float *vel = (float *)(veh + VEH_MOVESPEED);
-  const float mass = *(const float *)(veh + VEH_MASS);
   float *rows = (float *)(veh + VEH_MATRIX);
+  void *handling = *(void **)(veh + VEH_HANDLING);
 
   switch (action) {
     case VEDIT_COLOUR1:
@@ -2206,8 +2319,6 @@ static void menu_vehicle_edit(int action) {
       break;
 
     case VEDIT_COLOUR_RANDOM: {
-      // The frame counter is as good a source of noise as anything here, and it
-      // avoids dragging in the game's RNG.
       static unsigned seed = 12345;
       seed = seed * 1103515245u + 12345u;
       veh[VEH_COLOUR1] = (uint8_t)((seed >> 16) % VEH_NUM_COLOURS);
@@ -2217,15 +2328,42 @@ static void menu_vehicle_edit(int action) {
       break;
     }
 
-    case VEDIT_BOOST: {
-      // Along the vehicle's own forward vector, through the game's own force
-      // routine so the result is a push rather than a teleport. ApplyMoveForce
-      // divides by mass, so multiplying by it asks for an acceleration.
-      const float *fwd = rows + 4;   // row 1, the forward row
-      if (apply_move_force)
-        apply_move_force(veh, fwd[0] * mass * 0.35f, fwd[1] * mass * 0.35f,
-                         fwd[2] * mass * 0.35f);
-      snprintf(toast, sizeof(toast), "Boost");
+    case VEDIT_SPEED_UP:
+    case VEDIT_SPEED_DOWN:
+    case VEDIT_SPEED_RESET: {
+      if (!handling) {
+        snprintf(toast, sizeof(toast), "This vehicle has no handling data");
+        break;
+      }
+      const int slot = speed_slot_for(handling);
+      if (slot < 0) {
+        snprintf(toast, sizeof(toast), "Too many vehicles edited");
+        break;
+      }
+
+      float m = speed_saved[slot].mult;
+      if (action == VEDIT_SPEED_UP)        m += SPEED_STEP;
+      else if (action == VEDIT_SPEED_DOWN) m -= SPEED_STEP;
+      else                                m  = 1.0f;
+      if (m < SPEED_MIN) m = SPEED_MIN;
+      if (m > SPEED_MAX) m = SPEED_MAX;
+      speed_saved[slot].mult = m;
+
+      // Always from the stock value, never from the current one: scaling what
+      // is already there drifts, and makes "reset" impossible.
+      const float want = speed_saved[slot].stock * m;
+      *(float *)((uintptr_t)handling + HANDLING_MAXVELOCITY) = want;
+
+      // The gear table is derived from that word, so it has to be rebuilt or
+      // the car stays geared for its old top speed.
+      if (init_gear_ratios)
+        init_gear_ratios((void *)((uintptr_t)handling + HANDLING_TRANSMISSION));
+
+      snprintf(toast, sizeof(toast), "Top speed %d%% (all of this model)",
+               (int)(m * 100.0f + 0.5f));
+      debugPrintf("MENU: top speed x%.2f -> %g game units (stock %g), handling %p\n",
+                  (double)m, (double)want, (double)speed_saved[slot].stock,
+                  handling);
       break;
     }
 
@@ -2247,18 +2385,10 @@ static void menu_vehicle_edit(int action) {
       break;
     }
 
-    case VEDIT_STOP:
-      vel[0] = vel[1] = vel[2] = 0.0f;
-      snprintf(toast, sizeof(toast), "Stopped");
-      break;
-
     default:
       return;
   }
 
-  debugPrintf("MENU: vehicle edit %d -> colours %u/%u, vel %g %g %g\n", action,
-              veh[VEH_COLOUR1], veh[VEH_COLOUR2], (double)vel[0], (double)vel[1],
-              (double)vel[2]);
   toast_pending = 1;
 }
 
@@ -2452,8 +2582,8 @@ void menu_init(void) {
   find_player_ped = (find_player_ped_fn)need_sym("_Z13FindPlayerPedv");
   find_player_vehicle =
       (find_player_vehicle_fn)need_sym("_Z17FindPlayerVehiclev");
-  apply_move_force =
-      (apply_move_force_fn)need_sym("_ZN9CPhysical14ApplyMoveForceEfff");
+  init_gear_ratios =
+      (init_gear_ratios_fn)need_sym("_ZN13cTransmission14InitGearRatiosEv");
   ped_teleport = (ped_teleport_fn)need_sym("_ZN4CPed8TeleportE7CVector");
 
   ctext_instance = (void **)need_sym("_ZN5CText10msInstanceE");

@@ -112,6 +112,11 @@ All derived by disassembling the named function in this build.
 | ped position | `ped+64` (x,y) / `ped+72` (z) | `CPed::Teleport` `str d0,[x20,#64]` |
 | radar blips | `CRadar::ms_RadarTrace`, 75 × 60 | `CRadar::SetTargetBlip` |
 | blip type / pos | `+40` (2=char, 4=coord) / `+12,+16,+20` | ditto + runtime dump |
+| map marker | `GRadarMap+128` (x,y), **`+136` = is-set** | `RadarMap::Update`; with/without diff |
+| vehicle handling | `vehicle+392` | `CBoat::DisplayHandlingData` `ldr x0,[x0,#392]` |
+| top speed | `tHandlingData+136` | `ConvertDataToGameUnits` `fmul` by 1/180 |
+| gearbox | `tHandlingData+52`, reads its own `+84` | `cTransmission::InitGearRatios` |
+| `Teleport` (virtual) | **`vtable+0x78` for every entity class** | `_ZTV4CPed`/`11CAutomobile`/`5CBike`/`5CBoat` relocs |
 
 **A data symbol is not dead just because you grepped for it.** "Fly higher"
 stored two floats in `VehicleNames`, on the strength of a grep for `adrp` +
@@ -297,7 +302,7 @@ at an `END_THREAD` stub instead and let the game retire it.
   model that reads the pad, does vector maths on the vehicle matrix and applies
   forces every frame. Porting it is writing a flight controller in C, not
   flipping a flag — a real feature, not a quick one.
-- **Vehicle editor** — asked for (colour, speed, handling) and not started. The
+- **Vehicle editor** — done: colours, top speed, flip upright. The
   handling data pointer is at `vehicle+400` (`CHeli`'s constructor writes it from
   an array indexed by model info `+102`, stride `0xe0`), and `cHandlingDataMgr`
   exposes `GetFlyingPointer` / `GetBoatPointer` / `ModifyHandlingValue`. Note
@@ -310,3 +315,39 @@ Change one thing, build, test on hardware, read `debug.log`. Nearly every bug in
 this project was found by adding a log line and looking, not by reasoning: the
 off-by-one in menu selection, the marker blip type, the latched analogue sticks,
 the tip overwriting the menu. When a theory and a log disagree, the log is right.
+
+## Top speed, and why it is per model
+
+`fMaxVelocity` is `tHandlingData+136`, reached through `vehicle+392`.
+`ConvertDataToGameUnits` multiplies it by `0x3bb60b6a` (1/180), which is the
+km/h-to-game-units conversion and is what identifies the field.
+
+**Writing it is not enough.** `cTransmission` sits *inline* at `handling+52` and
+`InitGearRatios` reads its own `+84` — the same word, since 52 + 84 = 136. The
+gear ratio table is derived from it, so without re-running `InitGearRatios` the
+car stays geared for its old top speed and barely changes. Call it after every
+write.
+
+**Handling records are shared per model**, so this changes every vehicle of that
+type including the AI's. That is how the game's data is shaped; the menu says so
+in the toast rather than pretending otherwise. Stock values are cached per record
+address so "Stock speed" is a real reset and the steps compound from the original.
+
+## Teleport moves whatever the player is
+
+A ped riding in a car takes its position from the vehicle every frame, so
+teleporting the ped while driving moved nothing. `menu_teleport_xy` now calls
+`Teleport` on the **vehicle** when `FindPlayerVehicle()` returns one.
+
+`Teleport` is virtual and lands in the **same vtable slot, `+0x78`, for every
+entity class** — checked against the `R_AARCH64_ABS64` relocations in `_ZTV4CPed`,
+`_ZTV11CAutomobile`, `_ZTV5CBike` and `_ZTV5CBoat`. So one indirect call handles
+ped, car, bike, boat and `CHeli` without a class switch. The `CVector` is by
+pointer here too. Zero the velocity at `+144` afterwards or the car keeps the
+speed it had when the menu opened.
+
+## The spawn watchdog is time-limited
+
+It logged a parked, perfectly healthy car twice a second for over 100 seconds and
+buried everything else in the log. `VEH_TRACK_MS` stops it at 12 s — a spawn that
+is going to fall does so in about 3.5.
