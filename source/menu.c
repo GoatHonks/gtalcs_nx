@@ -76,7 +76,16 @@ static find_player_ped_fn find_player_ped = NULL;
 // all carry their Teleport at vtable+0x78 -- so one signature moves a ped on
 // foot or the car he is driving. The CVector is by pointer here too
 // (CAutomobile::Teleport: ldr d0,[x19] / ldr s1,[x19,#8]).
-#define ENTITY_VT_TELEPORT (0x78 / 8)
+// The `_ZTV...` symbol points at the vtable **object**, not at its first function
+// pointer: `+0` is offset-to-top, `+8` is the RTTI pointer, and the entries start
+// at `+0x10` (`_ZTI11CAutomobile` is at `_ZTV11CAutomobile+8`, and slot 0,
+// `CPhysical::Add`, is at `+0x10`). What an object stores is `symbol + 0x10`.
+//
+// So a relocation at `symbol+0x78` is index **13** counting from the pointer in
+// the object, not 15. Indexing by 15 called `Render()` -- two slots further on --
+// which is why every teleport logged its destination, returned cleanly, and moved
+// nobody. Subtract the 0x10 header before dividing.
+#define ENTITY_VT_TELEPORT ((0x78 - 0x10) / 8)
 
 // But the slot is not always filled in. `CEntity::Teleport` is a bare `ret` --
 // one instruction, no body -- and it is what `_ZTV5CHeli`, `_ZTV6CPlane`,
@@ -1405,83 +1414,67 @@ static set_current_weapon_fn ped_set_current_weapon = NULL;
 #define VEH_MOVESPEED 144
 #define VEH_NUM_COLOURS 128
 
-// ---- top speed ----
+// ---- repairing ----
 //
-// "Speed boost" and "stop dead" were the wrong feature: a one-off shove and a
-// handbrake, when what was asked for was the car's actual top speed. That lives
-// in the handling record, and the chain to it is short and checkable:
+// `CVehicle::ExtinguishCarFire` is the whole "fix my car" feature in one exported
+// call, and reading it gives up the field offsets at the same time:
 //
-//   CBoat::DisplayHandlingData      ldr x0, [x0, #392]   -> tHandlingData *
-//   ConvertDataToGameUnits          ldr s6, [x1, #136]
-//                                   fmul s2, s6, s7      (s7 = 0x3bb60b6a, 1/180)
-//                                   str s2, [x1, #136]
+//   ldr s0, [x0, #736]   / fmaxnm s0, s0, 300.0 / str s0, [x0, #736]   health
+//   ldr x0, [x0, #696]   / CFire::Extinguish                           the fire
+//   add x20, x19, #0x3b0 / CDamageManager::Get/SetEngineStatus         the engine
+//   str wzr, [x19, #1804]                                              burn timer
 //
-// Dividing by 180 is the km/h-to-game-units conversion, so **+136 is
-// fMaxVelocity**, held in game units once the file has been loaded.
+// It only lifts health to 300, which is a third of full, so write the health
+// afterwards. The burn timer at +1804 is the thing that actually matters here:
+// flipping a car that has been rolling leaves it on fire with that counter
+// already running, and it explodes a moment later.
 //
-// The gearbox is not a separate copy of it: cTransmission sits inline at
-// handling+52 and InitGearRatios reads its own +84, which is the same word
-// (52 + 84 = 136). It rebuilds the gear ratio table from that value, so writing
-// the field without re-running it leaves the car geared for its old top speed
-// and nothing much changes. Call it after every write.
-//
-// **Handling records are shared by every vehicle of that model.** Raising the
-// Banshee's top speed raises it for every Banshee in the city, the AI's
-// included. That is a property of the game's data, not something worth faking
-// per-vehicle, so the menu just says which model it changed.
-#define VEH_HANDLING        392
-#define HANDLING_MAXVELOCITY 136
-#define HANDLING_TRANSMISSION 52
-
-#define SPEED_STEP  0.25f
-#define SPEED_MIN   0.50f
-#define SPEED_MAX   4.00f
+// `Fix` is **not virtual** -- `CAutomobile::Fix` and `CBike::Fix` appear only as
+// PLT entries, in no vtable -- so it has to be chosen by class. The Teleport slot
+// already identifies the class for free: whichever override is sitting in it says
+// what the vehicle is, with no vtable symbols to resolve.
+#define VEH_HEALTH      736
+#define VEH_HEALTH_FULL 1000.0f
 
 typedef void *(*find_player_vehicle_fn)(void);
 static find_player_vehicle_fn find_player_vehicle = NULL;
-typedef void (*init_gear_ratios_fn)(void *transmission);
-static init_gear_ratios_fn init_gear_ratios = NULL;
+typedef void (*veh_void_fn)(void *veh);
+static veh_void_fn extinguish_car_fire = NULL;
+static veh_void_fn automobile_fix = NULL;
+static veh_void_fn bike_fix = NULL;
+static void *automobile_teleport = NULL;
+static void *bike_teleport = NULL;
 
-// Stock top speeds, so "reset" is a real reset and the steps compound from the
-// original rather than from whatever it was left at. Keyed by the record's
-// address because that is what identifies a model's handling: several models can
-// share one record, and scaling it once is the honest behaviour.
-#define SPEED_SAVED_MAX 24
-static struct { void *handling; float stock; float mult; } speed_saved[SPEED_SAVED_MAX];
-static int speed_saved_count = 0;
+// Health, fire and body damage, on whatever class the vehicle turns out to be.
+static void menu_repair_vehicle(void *veh) {
+  if (extinguish_car_fire)
+    extinguish_car_fire(veh);
 
-static int speed_slot_for(void *handling) {
-  for (int i = 0; i < speed_saved_count; i++)
-    if (speed_saved[i].handling == handling)
-      return i;
-  if (speed_saved_count >= SPEED_SAVED_MAX)
-    return -1;
-  const int i = speed_saved_count++;
-  speed_saved[i].handling = handling;
-  speed_saved[i].stock = *(const float *)((uintptr_t)handling + HANDLING_MAXVELOCITY);
-  speed_saved[i].mult = 1.0f;
-  return i;
+  *(float *)((uintptr_t)veh + VEH_HEALTH) = VEH_HEALTH_FULL;
+
+  void *const *vtable = *(void *const **)veh;
+  void *impl = vtable[ENTITY_VT_TELEPORT];
+  if (impl == automobile_teleport && automobile_fix)
+    automobile_fix(veh);
+  else if (impl == bike_teleport && bike_fix)
+    bike_fix(veh);
 }
 
 typedef enum {
-  VEDIT_COLOUR1 = 0,
+  VEDIT_UPRIGHT = 0,
+  VEDIT_REPAIR,
+  VEDIT_COLOUR1,
   VEDIT_COLOUR2,
   VEDIT_COLOUR_RANDOM,
-  VEDIT_SPEED_UP,
-  VEDIT_SPEED_DOWN,
-  VEDIT_SPEED_RESET,
-  VEDIT_UPRIGHT,
   VEDIT_NUM
 } veh_edit_action;
 
 static const char *const veh_edit_name[VEDIT_NUM] = {
+  "Flip upright",
+  "Repair",
   "Next colour 1",
   "Next colour 2",
   "Random colours",
-  "Faster",
-  "Slower",
-  "Stock speed",
-  "Flip upright",
 };
 
 
@@ -2361,7 +2354,6 @@ static void menu_vehicle_edit(int action) {
 
   float *vel = (float *)(veh + VEH_MOVESPEED);
   float *rows = (float *)(veh + VEH_MATRIX);
-  void *handling = *(void **)(veh + VEH_HANDLING);
 
   switch (action) {
     case VEDIT_COLOUR1:
@@ -2384,45 +2376,6 @@ static void menu_vehicle_edit(int action) {
       break;
     }
 
-    case VEDIT_SPEED_UP:
-    case VEDIT_SPEED_DOWN:
-    case VEDIT_SPEED_RESET: {
-      if (!handling) {
-        snprintf(toast, sizeof(toast), "This vehicle has no handling data");
-        break;
-      }
-      const int slot = speed_slot_for(handling);
-      if (slot < 0) {
-        snprintf(toast, sizeof(toast), "Too many vehicles edited");
-        break;
-      }
-
-      float m = speed_saved[slot].mult;
-      if (action == VEDIT_SPEED_UP)        m += SPEED_STEP;
-      else if (action == VEDIT_SPEED_DOWN) m -= SPEED_STEP;
-      else                                m  = 1.0f;
-      if (m < SPEED_MIN) m = SPEED_MIN;
-      if (m > SPEED_MAX) m = SPEED_MAX;
-      speed_saved[slot].mult = m;
-
-      // Always from the stock value, never from the current one: scaling what
-      // is already there drifts, and makes "reset" impossible.
-      const float want = speed_saved[slot].stock * m;
-      *(float *)((uintptr_t)handling + HANDLING_MAXVELOCITY) = want;
-
-      // The gear table is derived from that word, so it has to be rebuilt or
-      // the car stays geared for its old top speed.
-      if (init_gear_ratios)
-        init_gear_ratios((void *)((uintptr_t)handling + HANDLING_TRANSMISSION));
-
-      snprintf(toast, sizeof(toast), "Top speed %d%% (all of this model)",
-               (int)(m * 100.0f + 0.5f));
-      debugPrintf("MENU: top speed x%.2f -> %g game units (stock %g), handling %p\n",
-                  (double)m, (double)want, (double)speed_saved[slot].stock,
-                  handling);
-      break;
-    }
-
     case VEDIT_UPRIGHT: {
       // Rebuild the rotation from the heading it already has, which is what
       // CPlaceable::SetHeading does: row0 = (cos, sin, 0), row1 = (-sin, cos, 0).
@@ -2437,9 +2390,19 @@ static void menu_vehicle_edit(int action) {
       rows[4] = fx;  rows[5] = fy;  rows[6] = 0.0f;
       rows[8] = 0.0f; rows[9] = 0.0f; rows[10] = 1.0f;
       vel[2] = 0.2f;   // a nudge upward so it does not resolve into the ground
-      snprintf(toast, sizeof(toast), "Flipped upright");
+
+      // A car only ends up on its roof by rolling, which means it arrives here
+      // damaged and often already burning -- righting it and watching it
+      // explode a second later is not much of a rescue. Repair comes with it.
+      menu_repair_vehicle(veh);
+      snprintf(toast, sizeof(toast), "Flipped upright and repaired");
       break;
     }
+
+    case VEDIT_REPAIR:
+      menu_repair_vehicle(veh);
+      snprintf(toast, sizeof(toast), "Repaired");
+      break;
 
     default:
       return;
@@ -2638,8 +2601,12 @@ void menu_init(void) {
   find_player_ped = (find_player_ped_fn)need_sym("_Z13FindPlayerPedv");
   find_player_vehicle =
       (find_player_vehicle_fn)need_sym("_Z17FindPlayerVehiclev");
-  init_gear_ratios =
-      (init_gear_ratios_fn)need_sym("_ZN13cTransmission14InitGearRatiosEv");
+  extinguish_car_fire =
+      (veh_void_fn)need_sym("_ZN8CVehicle17ExtinguishCarFireEv");
+  automobile_fix = (veh_void_fn)need_sym("_ZN11CAutomobile3FixEv");
+  bike_fix = (veh_void_fn)need_sym("_ZN5CBike3FixEv");
+  automobile_teleport = (void *)need_sym("_ZN11CAutomobile8TeleportE7CVector");
+  bike_teleport = (void *)need_sym("_ZN5CBike8TeleportE7CVector");
   ped_teleport = (ped_teleport_fn)need_sym("_ZN4CPed8TeleportE7CVector");
   world_remove = (world_entity_fn)need_sym("_ZN6CWorld6RemoveEP7CEntity");
   world_add = (world_entity_fn)need_sym("_ZN6CWorld3AddEP7CEntity");

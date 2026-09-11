@@ -316,22 +316,15 @@ this project was found by adding a log line and looking, not by reasoning: the
 off-by-one in menu selection, the marker blip type, the latched analogue sticks,
 the tip overwriting the menu. When a theory and a log disagree, the log is right.
 
-## Top speed, and why it is per model
+## Top speed: tried, removed
 
-`fMaxVelocity` is `tHandlingData+136`, reached through `vehicle+392`.
-`ConvertDataToGameUnits` multiplies it by `0x3bb60b6a` (1/180), which is the
-km/h-to-game-units conversion and is what identifies the field.
-
-**Writing it is not enough.** `cTransmission` sits *inline* at `handling+52` and
-`InitGearRatios` reads its own `+84` — the same word, since 52 + 84 = 136. The
-gear ratio table is derived from it, so without re-running `InitGearRatios` the
-car stays geared for its old top speed and barely changes. Call it after every
-write.
-
-**Handling records are shared per model**, so this changes every vehicle of that
-type including the AI's. That is how the game's data is shaped; the menu says so
-in the toast rather than pretending otherwise. Stock values are cached per record
-address so "Stock speed" is a real reset and the steps compound from the original.
+`fMaxVelocity` is `tHandlingData+136` (via `vehicle+392`), identified by the 1/180
+km/h conversion in `ConvertDataToGameUnits`, and `cTransmission` sits inline at
+`handling+52` reading that same word at its own `+84`, so `InitGearRatios` has to
+be re-run after writing it. All of that worked. It was **removed on request**:
+handling records are shared per model, so it changed every vehicle of that type
+including the AI's, and that is not a per-car edit however it is presented. The
+offsets are recorded here in case it is ever wanted again; the feature is not.
 
 ## Teleport moves whatever the player is
 
@@ -339,10 +332,18 @@ A ped riding in a car takes its position from the vehicle every frame, so
 teleporting the ped while driving moved nothing. `menu_teleport_xy` now calls
 `Teleport` on the **vehicle** when `FindPlayerVehicle()` returns one.
 
-`Teleport` is virtual and lands in the **same vtable slot, `+0x78`, for every
-entity class** — checked against the `R_AARCH64_ABS64` relocations in `_ZTV4CPed`,
-`_ZTV11CAutomobile`, `_ZTV5CBike` and `_ZTV5CBoat`. So one indirect call handles
-ped, car, bike, boat and `CHeli` without a class switch. The `CVector` is by
+`Teleport` is virtual and lands in the **same vtable slot for every entity
+class** — `R_AARCH64_ABS64` relocations at `_ZTV4CPed+0x78`,
+`_ZTV11CAutomobile+0x78`, `_ZTV5CBike+0x78`, `_ZTV5CBoat+0x78`. So one indirect
+call handles ped, car, bike, boat and `CHeli` without a class switch.
+
+**But `_ZTV...` is the address of the vtable object, not of its first function
+pointer.** `+0` is offset-to-top, `+8` is RTTI, entries start at `+0x10`
+(`_ZTI11CAutomobile` sits at `_ZTV11CAutomobile+8`, and slot 0, `CPhysical::Add`,
+at `+0x10`). The pointer an object stores is `symbol + 0x10`. So a relocation at
+`symbol+0x78` is index **13**, not 15. Indexing by 15 called `Render()`, two slots
+on: every teleport logged its destination, returned cleanly, and moved nobody —
+no crash, no error, just nothing. **Subtract the 0x10 header before dividing.** The `CVector` is by
 pointer here too. Zero the velocity at `+144` afterwards or the car keeps the
 speed it had when the menu opened.
 
@@ -368,3 +369,17 @@ the real override; it is only 198/199 that need the fallback.
 Teleporting a flying vehicle onto the ground is a crash, so when it is more than
 `AIRBORNE_MIN` (8 units) clear of the ground it keeps its altitude above the
 destination instead.
+
+## Repairing a vehicle
+
+`CVehicle::ExtinguishCarFire` is the whole feature in one exported call, and
+reading it hands over the offsets: health `+736` (raised to 300 by `fmaxnm`), the
+`CFire *` at `+696`, `CDamageManager` at `+0x3b0`, and the **burn timer at
+`+1804`**, which is the one that matters — a rolled car arrives already alight
+with that counter running and explodes moments after being righted. Write health
+to 1000 afterwards; the call only lifts it to 300.
+
+`Fix` is **not virtual**: `CAutomobile::Fix` and `CBike::Fix` exist only as PLT
+entries, in no vtable, so it has to be chosen by class. The Teleport slot does
+that for free — whichever override is sitting in it names the class, with no
+`_ZTV` symbols to resolve. "Flip upright" repairs as part of the same action.
