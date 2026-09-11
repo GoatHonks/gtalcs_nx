@@ -514,3 +514,41 @@ where the stick is −124. Dividing that by 128 gave −511 instead of −0.97, 
 the matrix ten radians a frame, and left the Dodo standing on its nose in the
 road. **Cast pad accessor returns to `int16_t`**; `FlyingControl` itself does
 exactly that (`sxth w8, w0`), which is the confirmation.
+
+## Vehicle invincibility, and dying in your own car
+
+`CVehicle::InflictDamage` opens with
+
+```
+ldrb w8, [x0, #719] / tbnz w8, #6, <carry on> / <return>
+```
+
+so **bit 6 of `vehicle+719` is "can be damaged"**, and clearing it turns the whole
+damage path into a no-op — bullets, collisions, fire, all of it.
+
+That is also the answer to *dying when your car explodes with Invincible on*.
+`CPed::InflictDamage` has **no equivalent early-out** to flip, and the menu's
+Invincible works by pinning health each frame, which cannot undo being dead by
+the time the next frame runs. A car that cannot be damaged never explodes, so
+the situation does not arise. Health, the `CFire *` at `+696` and the burn timer
+at `+1804` are pinned alongside the flag, because a vehicle already alight when
+the toggle came on would otherwise keep burning down on a timer that damage
+flags have no say over.
+
+## The winged flight models need a winged handling record
+
+Flight models 4 and 5 do not fly a vehicle, they launch it — velocity pinned at
+the game's own 4.0 clamp on all three axes. The reason is in what `FlyingControl`
+reads from the flying handling record at `+400`:
+
+```
+heli path (2,6):        ldr s0,[x8,#48]                      one field
+winged path (1,3,4,5):  +4 +8 +12 +16 +20 +24 +28 +32 +36 +40 +44
+```
+
+Every ordinary vehicle gets `GetFlyingPointer`'s **fallback** record, which is
+evidently sane where the helicopter path looks and not where the winged path
+does. **A plane is not a different model number on the same record** — it needs a
+genuine winged record. There are exactly six (handling ids 75–80, 88 bytes each);
+`fly_probe_records()` dumps all of them, and which record each interesting model
+resolves to, so the choice can come from data rather than a fourth guess.

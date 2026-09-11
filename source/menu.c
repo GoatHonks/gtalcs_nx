@@ -442,6 +442,7 @@ typedef enum {
   MENU_TOG_NEVER_WANTED,
   MENU_TOG_FLY_HIGHER,
   MENU_TOG_FLY_ANY,
+  MENU_TOG_VEH_INVINCIBLE,
   MENU_NUM_TOGGLES
 } menu_toggle;
 
@@ -453,6 +454,7 @@ static const char *const menu_toggle_name[MENU_NUM_TOGGLES] = {
   "Never wanted",
   "Fly higher",
   "Vehicles fly",
+  "Vehicle invincible",
 };
 
 static int menu_toggle_on[MENU_NUM_TOGGLES];
@@ -1388,6 +1390,8 @@ static set_current_weapon_fn ped_set_current_weapon = NULL;
 // what the vehicle is, with no vtable symbols to resolve.
 #define VEH_HEALTH      736
 #define VEH_HEALTH_FULL 1000.0f
+#define VEH_FIRE        696    // CFire *, from ExtinguishCarFire's own ldr
+#define MODELINFO_HANDLING_ID 102  // CCam::GetBoatLook_L_R_HeightOffset reads it
 
 typedef void *(*find_player_vehicle_fn)(void);
 static find_player_vehicle_fn find_player_vehicle = NULL;
@@ -2335,14 +2339,126 @@ static void menu_spawn_bodyguards(void) {
 typedef void (*flying_control_fn)(void *veh, int flight_model);
 static flying_control_fn flying_control = NULL;
 
+// Helicopter first because it is the one confirmed to fly properly. The two
+// winged models launch the vehicle instead of flying it -- velocity pinned at
+// the game's own 4.0 clamp on all three axes -- and the reason is visible in
+// what FlyingControl reads from the flying handling record at +400:
+//
+//   heli path (2,6):    ldr s0,[x8,#48]          one field
+//   winged path (1,3,4,5): +4 +8 +12 +16 +20 +24 +28 +32 +36 +40 +44
+//
+// The record every ordinary vehicle gets is GetFlyingPointer's **fallback**,
+// which is sane where the helicopter path looks and evidently not where the
+// winged path does. So a plane needs a genuine winged record, not a different
+// model number on the same one. fly_probe_records() below dumps all six so the
+// right one can be picked from data instead of another guess.
 static const struct { int model; const char *name; } fly_style[] = {
-  { 5, "Plane" },        // the "all cars fly" cheat's own model
-  { 4, "Plane (sharp)" },// same, with three times the control authority
-  { 6, "Helicopter" },   // what 213-215 fly on
+  { 6, "Helicopter" },   // what 213-215 fly on; confirmed good
+  { 5, "Plane" },        // the "all cars fly" cheat's model -- see above
+  { 4, "Plane (sharp)" },
 };
 #define NUM_FLY_STYLES ((int)(sizeof(fly_style) / sizeof(fly_style[0])))
 
 static int fly_style_idx = 0;
+
+// One-shot dump of every flying handling record, so the winged models can be
+// fixed from data. GetFlyingPointer is `idx = id - 75; idx < 6 ? base + idx*88 :
+// base`, so there are exactly six, 88 bytes each, and the handling id that
+// selects one lives at model info +102.
+typedef void *(*get_flying_ptr_fn)(void *mgr, unsigned char handling_id);
+static get_flying_ptr_fn get_flying_pointer = NULL;
+static void **pmod_handling_manager = NULL;
+
+static void fly_probe_records(void) {
+  static int done = 0;
+  if (done || !get_flying_pointer || !pmod_handling_manager ||
+      !*pmod_handling_manager)
+    return;
+  done = 1;
+
+  // Which record each of these ends up on, and whether any of them is in range.
+  static const int of_interest[] = { 164, 214, 213, 130, 168 };
+  for (int i = 0; i < (int)(sizeof(of_interest) / sizeof(of_interest[0])); i++) {
+    const uint8_t *info = model_info_for(of_interest[i]);
+    if (!info)
+      continue;
+    const unsigned char hid = info[MODELINFO_HANDLING_ID];
+    debugPrintf("MENU: model %d handling id %u -> flying record %p\n",
+                of_interest[i], hid,
+                get_flying_pointer(*pmod_handling_manager, hid));
+  }
+
+  for (int id = 75; id < 81; id++) {
+    const float *r =
+        (const float *)get_flying_pointer(*pmod_handling_manager,
+                                          (unsigned char)id);
+    if (!r)
+      continue;
+    debugPrintf("MENU: flying record %d @%p: %g %g %g %g %g %g %g %g %g %g %g %g %g\n",
+                id, (const void *)r, (double)r[0], (double)r[1], (double)r[2],
+                (double)r[3], (double)r[4], (double)r[5], (double)r[6],
+                (double)r[7], (double)r[8], (double)r[9], (double)r[10],
+                (double)r[11], (double)r[12]);
+  }
+}
+
+// ---- vehicle invincibility ----
+//
+// CVehicle::InflictDamage opens with
+//
+//   ldrb w8, [x0, #719] / tbnz w8, #6, <carry on> / <return>
+//
+// so **bit 6 of vehicle+719 is "can be damaged"**, and clearing it makes the
+// whole damage path a no-op -- bullets, collisions, fire, the lot. That is also
+// the answer to dying when your car explodes with Invincible on: the ped's own
+// InflictDamage has no equivalent early-out to flip, and pinning health after
+// the fact does not undo being dead. A car that cannot be damaged never
+// explodes, so the question does not arise.
+//
+// Health, the fire and the burn timer are pinned alongside it, because a vehicle
+// that was already alight when the toggle came on would otherwise keep burning
+// down on a timer that damage flags have no say over.
+#define VEH_CAN_BE_DAMAGED_BYTE 719
+#define VEH_CAN_BE_DAMAGED_BIT  (1u << 6)
+#define VEH_BURN_TIMER 1804
+
+static void *veh_inv_patched = NULL;
+
+static void veh_invincible_restore(void) {
+  if (!veh_inv_patched)
+    return;
+  *((uint8_t *)veh_inv_patched + VEH_CAN_BE_DAMAGED_BYTE) |=
+      VEH_CAN_BE_DAMAGED_BIT;
+  debugPrintf("MENU: vehicle %p can be damaged again\n", veh_inv_patched);
+  veh_inv_patched = NULL;
+}
+
+static void veh_invincible_tick(void) {
+  if (!menu_toggle_on[MENU_TOG_VEH_INVINCIBLE] || !find_player_vehicle) {
+    veh_invincible_restore();
+    return;
+  }
+
+  uint8_t *veh = (uint8_t *)find_player_vehicle();
+  if (!veh) {
+    veh_invincible_restore();
+    return;
+  }
+
+  if (veh_inv_patched && veh_inv_patched != veh)
+    veh_invincible_restore();      // changed vehicle: hand the old one back
+
+  if (!veh_inv_patched) {
+    veh_inv_patched = veh;
+    debugPrintf("MENU: vehicle %p is now invincible\n", (void *)veh);
+  }
+
+  veh[VEH_CAN_BE_DAMAGED_BYTE] &= (uint8_t)~VEH_CAN_BE_DAMAGED_BIT;
+  *(float *)(veh + VEH_HEALTH) = VEH_HEALTH_FULL;
+  *(uint32_t *)(veh + VEH_BURN_TIMER) = 0;
+  if (extinguish_car_fire && *(void *const *)(veh + VEH_FIRE))
+    extinguish_car_fire(veh);
+}
 
 static void fly_any_tick(void) {
   if (!menu_toggle_on[MENU_TOG_FLY_ANY] || !flying_control || !find_player_vehicle)
@@ -2549,6 +2665,8 @@ void menu_tick(int in_game) {
   // away from everything else that uses them.
   if (in_game)
     fly_any_tick();
+  veh_invincible_tick();
+  fly_probe_records();
 
   if (!menu_ready())
     return;
@@ -2664,6 +2782,9 @@ void menu_init(void) {
   bike_teleport = (void *)need_sym("_ZN5CBike8TeleportE7CVector");
   flying_control =
       (flying_control_fn)need_sym("_ZN8CVehicle13FlyingControlE12eFlightModel");
+  get_flying_pointer =
+      (get_flying_ptr_fn)need_sym("_ZN16cHandlingDataMgr16GetFlyingPointerEh");
+  pmod_handling_manager = (void **)need_sym("pmod_HandlingManager");
   ped_teleport = (ped_teleport_fn)need_sym("_ZN4CPed8TeleportE7CVector");
   world_remove = (world_entity_fn)need_sym("_ZN6CWorld6RemoveEP7CEntity");
   world_add = (world_entity_fn)need_sym("_ZN6CWorld3AddEP7CEntity");
