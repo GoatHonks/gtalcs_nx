@@ -451,3 +451,23 @@ function is defined above the vehicle field offsets this needs.
 
 It prints speed, lift, stick and altitude twice a second so the constants can be
 tuned against what happened rather than against how it felt.
+
+### The pad returns signed fields through unsigned loads
+
+**`CPad::GetSteeringUpDown` and `GetSteeringLeftRight` end in `ldrh` — a
+zero-extending load of what is really an `int16`.** One of their branches clamps
+to ±32767, so the declared `int` return can carry `0xFF84` where the stick value
+is −124. Taking that at face value and dividing by 128 gave a normalised stick
+reading of **−511 instead of −0.97**, which spun the matrix by ten radians a
+frame; the Dodo reared up and stood on its nose in the middle of the road, and
+the video showed exactly that.
+
+**Cast pad accessor returns to `int16_t`.** It normalises every branch and leaves
+already-small values alone. Clamp afterwards anyway — no pad reading should be
+able to spin the aircraft whatever the game hands back.
+
+Attitude authority is now multiplied by the same airspeed `lift` term, so a
+parked Dodo has no pitch authority at all and drives like the car the game thinks
+it is until it is fast enough to fly. That is what a control surface does, and it
+makes the standing-on-its-nose failure structurally impossible rather than merely
+fixed.

@@ -2333,6 +2333,35 @@ static void menu_spawn_bodyguards(void) {
 
 typedef void *(*pad_get_fn)(int which);
 typedef int (*pad_axis_fn)(void *pad);
+
+// **The steering accessors return a signed field through a zero-extending load.**
+// CPad::GetSteeringUpDown ends in `ldrh w8, [x0, #4]` -- an unsigned halfword of
+// what is really an int16 -- and one of its other branches clamps to +/-32767, so
+// the declared `int` return carries 0xFF84 rather than -124. Dividing that by 128
+// gave a stick reading of -511 instead of -0.97, the matrix was spun by ten
+// radians a frame, and the Dodo ended up standing on its nose in the road.
+//
+// Casting to int16_t normalises every branch: 0xFF84 -> -124, and a value that
+// was already small and positive is unchanged. The clamp afterwards is belt and
+// braces -- no pad reading should ever be allowed to spin the aircraft, whatever
+// the game hands back.
+static float dodo_stick(pad_axis_fn get, void *pad) {
+  if (!get)
+    return 0.0f;
+  float v = (float)(int16_t)get(pad) / DODO_STICK_MAX;
+  if (v < -1.0f) v = -1.0f;
+  if (v > 1.0f) v = 1.0f;
+  return v;
+}
+
+static float dodo_pedal(pad_axis_fn get, void *pad) {
+  if (!get)
+    return 0.0f;
+  float v = (float)(int16_t)get(pad) / DODO_PEDAL_MAX;
+  if (v < 0.0f) v = 0.0f;
+  if (v > 1.0f) v = 1.0f;
+  return v;
+}
 static pad_get_fn pad_get_pad = NULL;
 static pad_axis_fn pad_steer_ud = NULL;
 static pad_axis_fn pad_steer_lr = NULL;
@@ -2381,34 +2410,39 @@ static void dodo_fly_tick(void) {
   float *up = rows + VEH_ROW_UP;
 
   // Stick up puts the nose down, the way every flight control works.
-  const float pitch_in =
-      pad_steer_ud ? -(float)pad_steer_ud(pad) / DODO_STICK_MAX : 0.0f;
-  const float roll_in =
-      pad_steer_lr ? (float)pad_steer_lr(pad) / DODO_STICK_MAX : 0.0f;
-  const float accel =
-      pad_accelerate ? (float)pad_accelerate(pad) / DODO_PEDAL_MAX : 0.0f;
-  const float brake = pad_brake ? (float)pad_brake(pad) / DODO_PEDAL_MAX : 0.0f;
-
-  // Thrust and airbrake along the nose.
-  const float push = (accel * DODO_THRUST - brake * DODO_AIRBRAKE) * step;
-  for (int i = 0; i < 3; i++)
-    vel[i] += fwd[i] * push;
+  const float pitch_in = -dodo_stick(pad_steer_ud, pad);
+  const float roll_in = dodo_stick(pad_steer_lr, pad);
+  const float accel = dodo_pedal(pad_accelerate, pad);
+  const float brake = dodo_pedal(pad_brake, pad);
 
   // Lift, proportional to how fast you are going *forwards*. So it still sits on
   // the runway at rest, it still stalls if you climb until the speed bleeds off,
   // and it never becomes a hover. At takeoff speed it exactly cancels gravity.
+  // Computed first because attitude authority below scales with it too.
   const float fspeed = vel[0] * fwd[0] + vel[1] * fwd[1] + vel[2] * fwd[2];
   float lift = fspeed / DODO_TAKEOFF;
   if (lift < 0.0f) lift = 0.0f;
   if (lift > 1.0f) lift = 1.0f;
   vel[2] += GAME_GRAVITY * lift * step;
 
-  // Attitude. Roll also yaws you, which is how an aircraft actually turns, and
-  // saves needing a rudder on a pad with no axis left to give it.
+  // Thrust and airbrake along the nose.
+  const float push = (accel * DODO_THRUST - brake * DODO_AIRBRAKE) * step;
+  for (int i = 0; i < 3; i++)
+    vel[i] += fwd[i] * push;
+
+  // Attitude, with **authority proportional to airspeed** -- the same `lift` term.
+  // That is what a control surface actually does, and it has a useful corollary:
+  // parked, the stick does nothing at all, so the Dodo drives like the car the
+  // game thinks it is until it is going fast enough to fly. The previous build
+  // would rear up on the spot and stay there, and while the direct cause was the
+  // stick misread above, a plane that can pitch at a standstill is wrong anyway.
+  //
+  // Roll also yaws, which is how an aircraft turns, and saves needing a rudder on
+  // a pad with no axis left to give it.
   if (pitch_in != 0.0f)
-    dodo_spin(fwd, up, pitch_in * DODO_PITCH_RATE * step);
+    dodo_spin(fwd, up, pitch_in * DODO_PITCH_RATE * step * lift);
   if (roll_in != 0.0f)
-    dodo_spin(right, up, roll_in * DODO_ROLL_RATE * step);
+    dodo_spin(right, up, roll_in * DODO_ROLL_RATE * step * lift);
 
   const float bank = right[2];          // how far the wing is tipped from level
   if (lift > 0.0f) {
@@ -2447,9 +2481,13 @@ static void dodo_fly_tick(void) {
   static int dodo_log = 0;
   if (++dodo_log >= 30) {
     dodo_log = 0;
-    debugPrintf("MENU: dodo fwd %.3f lift %.2f pitch %.2f roll %.2f z %.1f\n",
+    debugPrintf("MENU: dodo fwd %.3f lift %.2f pitch %.2f roll %.2f z %.1f "
+                "raw ud=%d lr=%d acc=%d\n",
                 (double)fspeed, (double)lift, (double)pitch_in, (double)roll_in,
-                (double)((const float *)(veh + VEH_POS))[2]);
+                (double)((const float *)(veh + VEH_POS))[2],
+                pad_steer_ud ? (int)(int16_t)pad_steer_ud(pad) : 0,
+                pad_steer_lr ? (int)(int16_t)pad_steer_lr(pad) : 0,
+                pad_accelerate ? (int)(int16_t)pad_accelerate(pad) : 0);
   }
 }
 
