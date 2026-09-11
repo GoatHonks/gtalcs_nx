@@ -825,6 +825,9 @@ static int menu_pos_sane(float x, float y) {
 }
 
 static int menu_find_marker(float *out_x, float *out_y) {
+  // Set by the GRadarMap read below; the blip sweep still runs either way so the
+  // log carries both halves of the picture in one go.
+  int found_target = 0;
   // Printed with %g, not %.1f. The last build showed MapWayPoint as "-0.0" and I
   // read that as zero; it was a tiny non-zero value rounding to -0.0, so the
   // "is it non-zero" test passed, the range check waved it through -- the origin
@@ -865,43 +868,49 @@ static int menu_find_marker(float *out_x, float *out_y) {
   // single eight-byte store, which is what a CVector2D looks like.
   if (gp_radar_map && *gp_radar_map) {
     const float *target = (const float *)((uintptr_t)*gp_radar_map + RADARMAP_TARGET);
-    // Clearing the marker leaves +128 holding the old coordinates, so the
-    // position alone cannot say whether one is set -- it teleported to a stale
-    // marker for exactly that reason. Dumping the object twice, once with a
-    // marker and once without, made the flag obvious:
+    // +136 is NOT the flag. It looked like one on a two-sample diff -- 0 with no
+    // marker, 1 with one -- but the "no marker" sample was taken before a marker
+    // had ever been placed in that session, not after one was removed. Those are
+    // different states, and the difference is the whole question. Once a marker
+    // has been placed +136 stays 1 for good, so a removed marker still teleports.
+    // **The comparison has to be with/without inside one session.**
     //
-    //   no marker:  +128 00000000 +132 00000000 +136 00000000
-    //   marker set: +128 444eb00b +132 c3f73f96 +136 00000001
+    // +128 itself is the map cursor, not the confirmed marker:
+    // RadarMap::Update writes it from OS_PointerGetNumber ->
+    // TransformScreenSpaceToRadarPoint -> TransformRadarPointToRealWorldSpace,
+    // so it holds wherever you last pointed on the map whether or not you
+    // committed to it. That explains the stale destination exactly.
     //
-    // 0x444eb00b is 826.75 and 0xc3f73f96 is -494.50, which is where the pin
-    // was. So **+136 is the "a marker exists" flag**, sitting immediately after
-    // the CVector2D. Nothing in RadarMap stores to it, which is why grepping
-    // the class for writers found nothing and the diff had to settle it.
-    const uint32_t set = *(const uint32_t *)((uintptr_t)*gp_radar_map +
-                                             RADARMAP_TARGET_SET);
-    debugPrintf("MENU: GRadarMap target = %g, %g (set=%u)\n",
-                (double)target[0], (double)target[1], set);
+    // Nor is it in the globals that sound right: resolving every GOT reference to
+    // CMenuManager::m_TargetIsOn, m_fTargetPos, m_TargetBlipIndex and
+    // CRadar::MapWayPoint shows their only readers and writers are SetSaveData
+    // and LoadSaveData. They are save-game fields, nothing more, and
+    // CRadar::SetTargetBlip has exactly one caller in the whole binary --
+    // LoadSaveData. None of them track a marker you place while playing.
+    //
+    // So dump the object wide and dump the blips too, and settle it with a real
+    // diff: place a marker, teleport, remove it, teleport again.
+    const uint32_t *w = (const uint32_t *)*gp_radar_map;
+    for (int off = 0; off < 320; off += 32)
+      debugPrintf("MENU: GRadarMap+%3d: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                  off, w[off / 4 + 0], w[off / 4 + 1], w[off / 4 + 2],
+                  w[off / 4 + 3], w[off / 4 + 4], w[off / 4 + 5],
+                  w[off / 4 + 6], w[off / 4 + 7]);
 
-    if (set && menu_pos_sane(target[0], target[1])) {
+    debugPrintf("MENU: GRadarMap target = %g, %g, +136 = %u\n",
+                (double)target[0], (double)target[1],
+                *(const uint32_t *)((uintptr_t)*gp_radar_map + RADARMAP_TARGET_SET));
+
+    if (menu_pos_sane(target[0], target[1]) &&
+        (target[0] != 0.0f || target[1] != 0.0f)) {
       *out_x = target[0];
       *out_y = target[1];
-      return 1;
+      found_target = 1;
     }
-    // An unset marker is a definite answer, not a reason to keep looking: the
-    // fallbacks below are the blip sweep, and the blips are the game's own
-    // icons (home, mission) which are exactly what should not be teleported to.
-    return 0;
-  }
-
-  if (menu_target_on && menu_target_pos && *menu_target_on &&
-      menu_pos_sane(menu_target_pos[0], menu_target_pos[1])) {
-    *out_x = menu_target_pos[0];
-    *out_y = menu_target_pos[1];
-    return 1;
   }
 
   if (!radar_trace)
-    return 0;
+    return found_target;
 
   int found = 0;
   for (int i = 0; i < BLIP_COUNT; i++) {
@@ -915,14 +924,11 @@ static int menu_find_marker(float *out_x, float *out_y) {
     debugPrintf("MENU: blip %2d use=%u sprite=%u at %g, %g\n", i,
                 b[BLIP_INUSE], sprite, (double)x, (double)y);
 
-    if (b[BLIP_INUSE] && sprite == BLIP_SPRITE_WAYPOINT &&
-        menu_pos_sane(x, y)) {
-      *out_x = x;
-      *out_y = y;
-      found = 1;
-    }
+    (void)found;
   }
-  return found;
+
+  // Still the GRadarMap answer for now -- the blip lines above are the probe.
+  return found_target;
 }
 
 static char place_label[MENU_NUM_PLACES][40];
