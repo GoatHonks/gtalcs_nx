@@ -78,6 +78,25 @@ static find_player_ped_fn find_player_ped = NULL;
 // (CAutomobile::Teleport: ldr d0,[x19] / ldr s1,[x19,#8]).
 #define ENTITY_VT_TELEPORT (0x78 / 8)
 
+// But the slot is not always filled in. `CEntity::Teleport` is a bare `ret` --
+// one instruction, no body -- and it is what `_ZTV5CHeli`, `_ZTV6CPlane`,
+// `_ZTV6CTrain` and `_ZTV8CVehicle` all carry in that slot. Only CAutomobile,
+// CBike, CBoat and CPed override it. So a real helicopter (198/199, the two the
+// game types as CHeli) would have been teleported by calling a function that
+// does nothing, and reported success.
+//
+// Comparing the slot against CEntity::Teleport is the check, and it needs no
+// vtable symbols. When it is the stub, do the move by hand the way
+// CAutomobile::Teleport's own first and last steps do it: CWorld::Remove, write
+// the position, CWorld::Add. Calling CAutomobile::Teleport on a CHeli instead
+// would be wrong -- CHeli allocates 0x490 bytes and that function stores to
+// +1568 and +1600, well past the end of it.
+typedef void (*world_entity_fn)(void *entity);
+static world_entity_fn world_remove = NULL;
+static world_entity_fn world_add = NULL;
+static void *entity_teleport_stub = NULL;
+
+
 typedef void (*ped_teleport_fn)(void *ped, const float *pos);
 static ped_teleport_fn ped_teleport = NULL;
 
@@ -782,6 +801,11 @@ static void **gp_radar_map = NULL;   // GRadarMap
 // Any coordinate that comes from guessing at a field has to be checked before it
 // reaches CPed::Teleport, and honestly all of them should be.
 #define WORLD_LIMIT 3000.0f
+
+// Above this much clearance, treat the vehicle as flying and preserve altitude
+// rather than dropping it onto the destination. Ordinary driving never gets this
+// far off the ground; a jump does, briefly, and landing in the air is harmless.
+#define AIRBORNE_MIN 8.0f
 
 static int menu_pos_sane(float x, float y) {
   // NaN fails every comparison, which is what the first test is for.
@@ -1815,11 +1839,43 @@ static void menu_teleport_xy(float x, float y, int snap_to_road,
   if (subject != ped)
     pos[2] += 1.0f;
 
+  // Flying is the exception: putting a helicopter on the ground at 90 knots is
+  // a crash, not a teleport. If the vehicle is well clear of the ground where
+  // it is, arrive at the same altitude -- but never below the destination
+  // ground, which is what the max is for when you fly from a hill to a valley.
+  if (subject != ped) {
+    const float *cur = (const float *)((uintptr_t)subject + VEH_POS);
+    const float ground_here = find_ground_z(cur[0], cur[1]);
+    const float altitude = cur[2] - ground_here;
+    if (altitude > AIRBORNE_MIN) {
+      const float keep = pos[2] + altitude;
+      debugPrintf("MENU: airborne %.1f above ground, arriving at z %.1f\n",
+                  altitude, keep);
+      pos[2] = keep;
+    }
+  }
+
   debugPrintf("MENU: teleport to %s at %.1f, %.1f, %.1f (%s)%s\n",
               what, pos[0], pos[1], pos[2], how, riding);
 
   void *const *vtable = *(void *const **)subject;
-  ((ped_teleport_fn)vtable[ENTITY_VT_TELEPORT])(subject, pos);
+  void *impl = vtable[ENTITY_VT_TELEPORT];
+  if (impl && impl != entity_teleport_stub) {
+    ((ped_teleport_fn)impl)(subject, pos);
+  } else if (world_remove && world_add) {
+    // The stub case: helicopters, planes, trains.
+    debugPrintf("MENU: Teleport slot is the CEntity stub, moving by hand\n");
+    world_remove(subject);
+    float *ep = (float *)((uintptr_t)subject + VEH_POS);
+    ep[0] = pos[0];
+    ep[1] = pos[1];
+    ep[2] = pos[2];
+    world_add(subject);
+  } else {
+    snprintf(toast, sizeof(toast), "Cannot teleport this");
+    toast_pending = 1;
+    return;
+  }
 
   // The vehicle arrives stationary. Without this it keeps the velocity it had
   // when you opened the menu and drives off on its own.
@@ -2585,6 +2641,9 @@ void menu_init(void) {
   init_gear_ratios =
       (init_gear_ratios_fn)need_sym("_ZN13cTransmission14InitGearRatiosEv");
   ped_teleport = (ped_teleport_fn)need_sym("_ZN4CPed8TeleportE7CVector");
+  world_remove = (world_entity_fn)need_sym("_ZN6CWorld6RemoveEP7CEntity");
+  world_add = (world_entity_fn)need_sym("_ZN6CWorld3AddEP7CEntity");
+  entity_teleport_stub = (void *)need_sym("_ZN7CEntity8TeleportE7CVector");
 
   ctext_instance = (void **)need_sym("_ZN5CText10msInstanceE");
 

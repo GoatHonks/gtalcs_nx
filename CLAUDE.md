@@ -351,3 +351,20 @@ speed it had when the menu opened.
 It logged a parked, perfectly healthy car twice a second for over 100 seconds and
 buried everything else in the log. `VEH_TRACK_MS` stops it at 12 s — a spawn that
 is going to fall does so in about 3.5.
+
+**`CEntity::Teleport` is a no-op — one `ret`, no body.** It is what `_ZTV5CHeli`,
+`_ZTV6CPlane`, `_ZTV6CTrain` and `_ZTV8CVehicle` all hold in slot `+0x78`; only
+`CPed`, `CAutomobile`, `CBike` and `CBoat` override it. So the virtual call
+silently does nothing for a real helicopter (198/199) and would have reported
+success. Compare the slot against the resolved `CEntity::Teleport` and, when it
+matches, do the move by hand: `CWorld::Remove`, write `+64`/`+72`, `CWorld::Add` —
+CAutomobile's first and last steps. **Do not call `CAutomobile::Teleport` on a
+`CHeli` instead**: `CHeli` allocates `0x490` bytes and that function stores to
+`+1568` and `+1600`.
+
+Note 211–216 are built as `CAutomobile` (their model type says car), so they take
+the real override; it is only 198/199 that need the fallback.
+
+Teleporting a flying vehicle onto the ground is a crash, so when it is more than
+`AIRBORNE_MIN` (8 units) clear of the ground it keeps its altitude above the
+destination instead.
