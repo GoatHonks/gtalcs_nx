@@ -415,59 +415,62 @@ Ruled out for good, by resolving every GOT reference rather than grepping:
 with one placed, `ms_RadarTrace` holds only the player (sprite 40) and the home
 icon (19).
 
-## The Dodo flight model
+## The Dodo: the game already flies it
 
-Model 164 is a plane the model table calls a car, so the game builds it as a
-`CAutomobile` and it drives. Nothing in this build flies it — `CPlane` has no
-callers at all — so `dodo_fly_tick()` is a flight model written in `menu.c` and
-run per frame on the vehicle the game is already simulating.
+**LCS has a Dodo flight model, keyed on the model number, and it runs every
+frame.** `CAutomobile::ProcessControl`:
 
-It is **purely additive**: it runs only while the toggle is on *and* the player is
-sitting in model 164, and touches nothing else. Off, the Dodo is exactly the
-vehicle the game shipped. That was the requirement.
+```
+4cbb14: ldrh w9, [x19, #124]     the model index
+4cbb18: cmp  w9, #0xa4           164 -- the Dodo, by name
+4cbb1c: b.eq <flying path>       skipping the handling-flag check others need
+4cbbfc: mov  w1, wzr             eFlightModel 0, the Dodo model
+4cbc6c: bl   CVehicle::FlyingControl
+```
 
-It writes the velocity at `+144` and the rotation rows at `+16` directly rather
-than going through `ApplyMoveForce`/`ApplyTurnForce`. Forces are more physical,
-but every constant here is a guess until it is flown, and velocity is the one
-that can be reasoned about: gravity is `m_vecMoveSpeed.z -= 0.008 * ms_fTimeStep`
-(`CPhysical::ApplyGravity`, constant `0xbc03126f`), so cancelling it is a
-subtraction rather than a force divided by a mass that would also be guessed.
+The other global in that branch is `CVehicle::bAllDodosCheat` — the "all cars
+fly" cheat routes every car through the same path. Helicopters reach it instead
+via **`handling+206` bit 1**, which is the flag that makes 211–216 fly despite
+being typed as cars.
 
-- **Lift is proportional to forward speed**, clamped to 1 at `DODO_TAKEOFF`. That
-  single choice gives a runway roll, a stall if you climb until the speed bleeds
-  off, and no hovering — none of which needed special-casing.
-- **Roll yaws you.** A banked turn is how an aircraft actually turns, and the pad
-  has no axis left for a rudder.
-- **The rows are re-orthonormalised every frame.** Spinning pairs of axes in
-  floats drifts, and a non-orthonormal matrix shears the model.
-- **Velocity tracks the nose**, or pitching up leaves you travelling the old way
-  and the plane flies sideways.
+What the Dodo lacks is a flying handling record worth using. `FlyingControl`
+opens with `ldr x8,[x0,#400]` / `cbz x8,<return>`, and **`+400` is the *flying*
+handling pointer — not `+392`, the ordinary one.** `CAutomobile`'s constructor
+fills it from `GetFlyingPointer(handlingId)`, which is
 
-Input is `CPad::GetPad(0)` with `GetSteeringUpDown` / `GetSteeringLeftRight`
-(±128) and `GetAccelerate` / `GetBrake` (0–255).
+```
+idx = id - 75;  if (idx < 6) record = base + idx*88;  else record = base
+```
 
-`dodo_fly_tick` is called from `menu_tick`, not `menu_apply_toggles`: that
-function is defined above the vehicle field offsets this needs.
+— a **fallback to record 0, never a null**. So the Dodo never fails the check,
+always flies, and always flies on whatever record 0 is. That is precisely
+"technically flyable, unusable", and why a CLEO script exists for it.
 
-It prints speed, lift, stick and altitude twice a second so the constants can be
-tuned against what happened rather than against how it felt.
+So the feature is **not a flight model**. The toggle points `+400` at the
+*helicopter's* flying handling record and restores the original when off. The
+flight code, constants, feel and control mapping are all the game's own, and
+"off" restores a pointer rather than unwinding physics. The donor record is
+found through a helicopter's own model info (`+102` is the handling id, the way
+`CCam::GetBoatLook_L_R_HeightOffset` reads it to reach `GetBoatPointer`), not by
+hardcoding an index.
+
+### What the hand-rolled version cost
+
+The first attempt was a full flight model in `menu.c` — lift, pitch, roll, matrix
+re-orthonormalisation. It flew badly and the controls inverted at random, and the
+reason was that **it was fighting `FlyingControl`, which was running on the same
+vehicle the whole time.** 189 lines replaced by a pointer swap.
+
+**Before writing a mechanic, check whether the game already has it and what is
+switching it off.** The evidence was reachable from the start: `FlyingControl`
+existed, was already patched for the altitude cap, and 211–216 were known to fly
+while typed as cars — which should have prompted the question of what enables it.
 
 ### The pad returns signed fields through unsigned loads
 
-**`CPad::GetSteeringUpDown` and `GetSteeringLeftRight` end in `ldrh` — a
-zero-extending load of what is really an `int16`.** One of their branches clamps
-to ±32767, so the declared `int` return can carry `0xFF84` where the stick value
-is −124. Taking that at face value and dividing by 128 gave a normalised stick
-reading of **−511 instead of −0.97**, which spun the matrix by ten radians a
-frame; the Dodo reared up and stood on its nose in the middle of the road, and
-the video showed exactly that.
-
-**Cast pad accessor returns to `int16_t`.** It normalises every branch and leaves
-already-small values alone. Clamp afterwards anyway — no pad reading should be
-able to spin the aircraft whatever the game hands back.
-
-Attitude authority is now multiplied by the same airspeed `lift` term, so a
-parked Dodo has no pitch authority at all and drives like the car the game thinks
-it is until it is fast enough to fly. That is what a control surface does, and it
-makes the standing-on-its-nose failure structurally impossible rather than merely
-fixed.
+Still true and still worth keeping. `CPad::GetSteeringUpDown` ends in `ldrh` — a
+zero-extending load of an `int16` — so the declared `int` return carries `0xFF84`
+where the stick is −124. Dividing that by 128 gave −511 instead of −0.97, spun
+the matrix ten radians a frame, and left the Dodo standing on its nose in the
+road. **Cast pad accessor returns to `int16_t`**; `FlyingControl` itself does
+exactly that (`sxth w8, w0`), which is the confirmation.
