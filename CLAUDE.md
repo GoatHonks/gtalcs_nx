@@ -589,3 +589,44 @@ still takes damage and still looks wrecked; it just cannot burn down under you.
 **Check for a real flag before settling for pinning a value every frame.** The
 health pin had been in the menu since the beginning and looked like it worked,
 because most damage is not lethal in one hit.
+
+## Why the winged flight models tear a car apart
+
+Not the flying handling record — the probe settled that. All six are real:
+
+```
+record 75 @...: id 0.4 0.75 -0.001 0.02 0.2 0.0065 7 0.0065 7 0.4 0.012 0.997
+record 76 ... 80: same shape, different numbers
+```
+
+(Field 0 prints as `1.05e-43` because it is the id as an **int**, 75, read as a
+float — which incidentally confirms the 88-byte stride and the 75..80 range.)
+
+The cause is rotational inertia. Every torque `FlyingControl` applies goes
+through `CPhysical::ApplyTurnForce`, which divides by the **turn mass at
+`vehicle+244`**:
+
+```
+3485fc: ldr  s0, [x19, #244]
+348600: fmov s1, #1.0
+348614: fdiv s0, s1, s0        -> 1 / turnMass, applied to the cross product
+```
+
+A car's turn mass is a fraction of an aircraft's, so the torque that banks a
+plane spins a Banshee — and the flying records' stability terms are large (roll
+and pitch stability are both 7), so it oscillates rather than merely
+over-rotating. The helicopter models escape this because their path applies far
+less torque and reads one field instead of eleven.
+
+The menu therefore lends the vehicle an aircraft's turn mass for the duration of
+the call and restores it immediately after, so nothing persists into the
+vehicle's own physics. `PLANE_TURN_MASS_SCALE` is the knob, and the log prints
+both masses so it can be set from measurements.
+
+## The flight submenu
+
+"Vehicles fly" is a submenu, not a toggle: row 0 is `Enabled [ON/off]` and the
+rest are the styles, with `[Selected]` against the current one. It is **the only
+list that does not close the menu on activation** — choosing a style and turning
+it on are two presses, and closing in between is tedious. Labels are built at
+render time because they carry state.

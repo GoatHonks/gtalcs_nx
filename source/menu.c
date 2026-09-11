@@ -441,7 +441,6 @@ typedef enum {
   MENU_TOG_AMMO,
   MENU_TOG_NEVER_WANTED,
   MENU_TOG_FLY_HIGHER,
-  MENU_TOG_FLY_ANY,
   MENU_TOG_VEH_INVINCIBLE,
   MENU_NUM_TOGGLES
 } menu_toggle;
@@ -453,7 +452,6 @@ static const char *const menu_toggle_name[MENU_NUM_TOGGLES] = {
   "Unlimited ammo",
   "Never wanted",
   "Fly higher",
-  "Vehicles fly",
   "Vehicle invincible",
 };
 
@@ -1475,7 +1473,6 @@ static void menu_repair_vehicle(void *veh) {
 typedef enum {
   VEDIT_UPRIGHT = 0,
   VEDIT_REPAIR,
-  VEDIT_FLY_STYLE,
   VEDIT_COLOUR1,
   VEDIT_COLOUR2,
   VEDIT_COLOUR_RANDOM,
@@ -1485,7 +1482,6 @@ typedef enum {
 static const char *const veh_edit_name[VEDIT_NUM] = {
   "Flip upright",
   "Repair",
-  "Flight style",
   "Next colour 1",
   "Next colour 2",
   "Random colours",
@@ -1500,6 +1496,7 @@ typedef enum {
   MENU_ACT_TELEPORT,
   MENU_ACT_VEHICLE,
   MENU_ACT_VEHEDIT,
+  MENU_ACT_FLY,
   MENU_ACT_BODYGUARDS,
   MENU_ACT_CLEAR_WANTED,
   MENU_NUM_ACTIONS
@@ -1510,6 +1507,7 @@ static const char *const menu_action_name[MENU_NUM_ACTIONS] = {
   "Teleport",
   "Spawn vehicle",
   "Edit vehicle",
+  "Vehicles fly",
   "Spawn bodyguards",
   "Clear wanted level",
 };
@@ -1523,6 +1521,11 @@ static int menu_cursor = 0;
 static int menu_dirty = 0;
 static u64  menu_pad_prev = 0;
 
+// The flight submenu's rows live with the flight code further down; these let
+// the tables below reach them without moving that code up here.
+static const char *fly_row_label(int row);
+static int fly_row_count(void);
+
 // The second level. One piece of state covers all three lists rather than a flag
 // per list, so adding a fourth is a table entry instead of another branch.
 typedef enum {
@@ -1530,7 +1533,8 @@ typedef enum {
   SUB_CHEATS,
   SUB_TELEPORT,
   SUB_VEHICLES,
-  SUB_VEHEDIT
+  SUB_VEHEDIT,
+  SUB_FLY
 } menu_sub;
 
 static menu_sub sub_kind = SUB_NONE;
@@ -1556,6 +1560,7 @@ static int sub_num_cats(void) {
     case SUB_TELEPORT: return PLACE_NUM_CATS + 1;
     case SUB_VEHICLES: return VEH_NUM_CATS;
     case SUB_VEHEDIT:  return 1;   // flat list, entered straight away
+    case SUB_FLY:      return 1;
     default:           return 0;
   }
 }
@@ -1567,6 +1572,7 @@ static const char *sub_cat_label(int i) {
                                                        : place_cat_name[i - 1];
     case SUB_VEHICLES: return veh_cat_name[i];
     case SUB_VEHEDIT:  return "Vehicle";
+    case SUB_FLY:      return "Flight";
     default:           return "";
   }
 }
@@ -1577,6 +1583,7 @@ static int sub_total(void) {
     case SUB_TELEPORT: return MENU_NUM_PLACES;
     case SUB_VEHICLES: return vehicles_ready;
     case SUB_VEHEDIT:  return VEDIT_NUM;
+    case SUB_FLY:      return fly_row_count();
     default:           return 0;
   }
 }
@@ -1588,6 +1595,7 @@ static int sub_item_cat(int i) {
     case SUB_TELEPORT: return place_cat[i] + 1;   // 0 is the map marker
     case SUB_VEHICLES: return veh_list[i].cat;
     case SUB_VEHEDIT:  return 0;
+    case SUB_FLY:      return 0;
     default:           return -1;
   }
 }
@@ -1598,6 +1606,7 @@ static const char *sub_item_label(int i) {
     case SUB_TELEPORT: return place_label[i];
     case SUB_VEHICLES: return veh_list[i].label;
     case SUB_VEHEDIT:  return veh_edit_name[i];
+    case SUB_FLY:      return fly_row_label(i);
     default:           return "";
   }
 }
@@ -1608,6 +1617,7 @@ static const char *sub_title(void) {
     case SUB_TELEPORT: return "TELEPORT";
     case SUB_VEHICLES: return "SPAWN VEHICLE";
     case SUB_VEHEDIT:  return "EDIT VEHICLE";
+    case SUB_FLY:      return "VEHICLES FLY";
     default:           return "";
   }
 }
@@ -2415,6 +2425,49 @@ static const struct { int model; const char *name; } fly_style[] = {
 #define NUM_FLY_STYLES ((int)(sizeof(fly_style) / sizeof(fly_style[0])))
 
 static int fly_style_idx = 0;
+static int fly_enabled = 0;
+
+// CPhysical::ApplyTurnForce divides every torque by the turn mass.
+#define VEH_MASS_FIELD 240
+#define VEH_TURN_MASS  244
+#define VEH_TURN_SPEED 160   // CVector: +160, +164, +168
+#define PLANE_TURN_MASS_SCALE 8.0f
+
+// Row 0 is the on/off switch, then one row per style. The labels are built
+// rather than fixed because they carry state -- which style is chosen, and
+// whether the whole thing is on.
+static int fly_row_count(void) { return 1 + NUM_FLY_STYLES; }
+
+static const char *fly_row_label(int row) {
+  static char buf[NUM_FLY_STYLES + 1][40];
+
+  if (row == 0) {
+    snprintf(buf[0], sizeof(buf[0]), "Enabled [%s]", fly_enabled ? "ON" : "off");
+    return buf[0];
+  }
+
+  const int i = row - 1;
+  if (i < 0 || i >= NUM_FLY_STYLES)
+    return "";
+  snprintf(buf[row], sizeof(buf[row]), "%s%s", fly_style[i].name,
+           i == fly_style_idx ? " [Selected]" : "");
+  return buf[row];
+}
+
+static void fly_row_activate(int row) {
+  if (row == 0) {
+    fly_enabled = !fly_enabled;
+    debugPrintf("MENU: vehicles fly -> %s\n", fly_enabled ? "ON" : "off");
+    return;
+  }
+
+  const int i = row - 1;
+  if (i < 0 || i >= NUM_FLY_STYLES)
+    return;
+  fly_style_idx = i;
+  debugPrintf("MENU: flight style -> %d (%s)\n", fly_style[i].model,
+              fly_style[i].name);
+}
 
 // One-shot dump of every flying handling record, so the winged models can be
 // fixed from data. GetFlyingPointer is `idx = id - 75; idx < 6 ? base + idx*88 :
@@ -2537,7 +2590,7 @@ static void veh_invincible_tick(void) {
 }
 
 static void fly_any_tick(void) {
-  if (!menu_toggle_on[MENU_TOG_FLY_ANY] || !flying_control || !find_player_vehicle)
+  if (!fly_enabled || !flying_control || !find_player_vehicle)
     return;
 
   uint8_t *veh = (uint8_t *)find_player_vehicle();
@@ -2553,7 +2606,29 @@ static void fly_any_tick(void) {
   if (handling && (handling[HANDLING_FLAGS] & 2))
     return;
 
-  flying_control(veh, fly_style[fly_style_idx].model);
+  const int model = fly_style[fly_style_idx].model;
+
+  // Winged models spin a car to pieces: it tumbles with the stick untouched.
+  // Every torque FlyingControl applies goes through CPhysical::ApplyTurnForce,
+  // which divides by the turn mass at +244 (`ldr s0,[x19,#244]` / `fdiv s0,
+  // 1.0, s0`), and a car's turn mass is a fraction of an aircraft's -- so the
+  // torque that banks a plane spins a Banshee. The flying record's stability
+  // terms are large as well (roll and pitch stability are both 7), which is why
+  // it oscillates rather than simply over-rotating.
+  //
+  // So lend it an aircraft's rotational inertia for the duration of the call
+  // and hand it straight back. Nothing persists -- the vehicle's own physics,
+  // and the next frame, see the value they always had.
+  const int winged = (model != 2 && model != 6);
+  float *turn_mass = (float *)(veh + VEH_TURN_MASS);
+  const float real_turn_mass = *turn_mass;
+  if (winged)
+    *turn_mass = real_turn_mass * PLANE_TURN_MASS_SCALE;
+
+  flying_control(veh, model);
+
+  if (winged)
+    *turn_mass = real_turn_mass;
 
   static u64 next = 0;
   const u64 ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
@@ -2561,10 +2636,15 @@ static void fly_any_tick(void) {
     next = ms + 1000;
     const float *p = (const float *)(veh + VEH_POS);
     const float *v = (const float *)(veh + VEH_MOVESPEED);
-    debugPrintf("MENU: flying model %d (%s) on model %d, z %.1f vel %.3f %.3f %.3f\n",
-                fly_style[fly_style_idx].model, fly_style[fly_style_idx].name,
+    const float *t = (const float *)(veh + VEH_TURN_SPEED);
+    debugPrintf("MENU: flying %d (%s) model %d z %.1f vel %.3f %.3f %.3f "
+                "turn %.3f %.3f %.3f mass %.0f/%.0f\n",
+                model, fly_style[fly_style_idx].name,
                 (int)*(const int16_t *)(veh + ENTITY_MODEL_ID),
-                (double)p[2], (double)v[0], (double)v[1], (double)v[2]);
+                (double)p[2], (double)v[0], (double)v[1], (double)v[2],
+                (double)t[0], (double)t[1], (double)t[2],
+                (double)*(const float *)(veh + VEH_MASS_FIELD),
+                (double)real_turn_mass);
   }
 }
 
@@ -2634,16 +2714,6 @@ static void menu_vehicle_edit(int action) {
       snprintf(toast, sizeof(toast), "Repaired");
       break;
 
-    case VEDIT_FLY_STYLE:
-      // A global setting rather than an edit to this vehicle, so it holds when
-      // you get into the next one. It lives here because this is the vehicle
-      // menu; like the rest of it, you have to be sitting in something.
-      fly_style_idx = (fly_style_idx + 1) % NUM_FLY_STYLES;
-      snprintf(toast, sizeof(toast), "Flight style: %s",
-               fly_style[fly_style_idx].name);
-      debugPrintf("MENU: flight style -> %d (%s)\n",
-                  fly_style[fly_style_idx].model, fly_style[fly_style_idx].name);
-      break;
 
     default:
       return;
@@ -2689,6 +2759,14 @@ static void menu_activate(void) {
       case SUB_TELEPORT: menu_teleport_to(item);   break;
       case SUB_VEHICLES: menu_spawn_vehicle(item); break;
       case SUB_VEHEDIT:  menu_vehicle_edit(item);  break;
+
+      // The only list you stay in: picking a style and switching it on are two
+      // presses, and closing the menu between them would be tedious.
+      case SUB_FLY:
+        fly_row_activate(item);
+        menu_dirty = 1;
+        return;
+
       default: break;
     }
     menu_close();
@@ -2720,6 +2798,9 @@ static void menu_activate(void) {
       break;
     case MENU_ACT_VEHEDIT:
       menu_sub_enter(SUB_VEHEDIT);
+      break;
+    case MENU_ACT_FLY:
+      menu_sub_enter(SUB_FLY);
       break;
     case MENU_ACT_BODYGUARDS:
       menu_spawn_bodyguards();
