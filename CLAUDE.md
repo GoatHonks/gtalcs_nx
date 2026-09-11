@@ -112,7 +112,7 @@ All derived by disassembling the named function in this build.
 | ped position | `ped+64` (x,y) / `ped+72` (z) | `CPed::Teleport` `str d0,[x20,#64]` |
 | radar blips | `CRadar::ms_RadarTrace`, 75 × 60 | `CRadar::SetTargetBlip` |
 | blip type / pos | `+40` (2=char, 4=coord) / `+12,+16,+20` | ditto + runtime dump |
-| map marker | `GRadarMap+128` (x,y), **`+136` = is-set** | `RadarMap::Update`; with/without diff |
+| map marker | `GRadarMap+128` (x,y), **`+120` byte = is-set** | `RadarMap::Update` toggle; with/without diff |
 | vehicle handling | `vehicle+392` | `CBoat::DisplayHandlingData` `ldr x0,[x0,#392]` |
 | top speed | `tHandlingData+136` | `ConvertDataToGameUnits` `fmul` by 1/180 |
 | gearbox | `tHandlingData+52`, reads its own `+84` | `cTransmission::InitGearRatios` |
@@ -383,3 +383,34 @@ to 1000 afterwards; the call only lifts it to 300.
 entries, in no vtable, so it has to be chosen by class. The Teleport slot does
 that for free — whichever override is sitting in it names the class, with no
 `_ZTV` symbols to resolve. "Flip upright" repairs as part of the same action.
+
+## The map marker, and the diff that has to straddle the transition
+
+`GRadarMap+128` is the position, **`+120` (a byte) is whether a marker exists.**
+`RadarMap::Update` toggles it in two places:
+
+```
+ldrb w8, [x19, #120] / eor w9, w8, #0x1 / strb w9, [x19, #120]
+cbnz w8, <skip>      ... then compute and store the position at +128
+```
+
+Confirming on the map flips it, so placing sets it and pressing again clears it.
+The position is written only on the 0 → 1 edge, which is why a cleared marker
+leaves the old coordinates intact at `+128` — and `+128` is the map *cursor*
+anyway, written from `OS_PointerGetNumber` → `TransformScreenSpaceToRadarPoint` →
+`TransformRadarPointToRealWorldSpace`.
+
+**I called `+136` the flag first, and it was wrong in an instructive way.** It fit
+both samples I had — 0 without a marker, 1 with one — but the "without" sample was
+taken *before a marker had ever been placed that session*, not after one was
+removed. `+136` never returns to 0 once set, so every cleared marker still
+teleported. **A before/after diff has to straddle the actual transition**; two
+states that merely differ are not a diff of the thing you are asking about.
+
+Ruled out for good, by resolving every GOT reference rather than grepping:
+`CMenuManager::m_TargetIsOn`, `m_fTargetPos`, `m_TargetBlipIndex` and
+`CRadar::MapWayPoint` are read and written **only** by `SetSaveData` and
+`LoadSaveData`, and `CRadar::SetTargetBlip` has exactly one caller in the binary
+(`LoadSaveData`). They are save-game fields. The marker is also **not a blip**:
+with one placed, `ms_RadarTrace` holds only the player (sprite 40) and the home
+icon (19).
