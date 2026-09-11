@@ -526,11 +526,8 @@ ldrb w8, [x0, #719] / tbnz w8, #6, <carry on> / <return>
 so **bit 6 of `vehicle+719` is "can be damaged"**, and clearing it turns the whole
 damage path into a no-op — bullets, collisions, fire, all of it.
 
-That is also the answer to *dying when your car explodes with Invincible on*.
-`CPed::InflictDamage` has **no equivalent early-out** to flip, and the menu's
-Invincible works by pinning health each frame, which cannot undo being dead by
-the time the next frame runs. A car that cannot be damaged never explodes, so
-the situation does not arise. Health, the `CFire *` at `+696` and the burn timer
+(That claim needed correcting: `CPed::InflictDamage` *does* have an early-out —
+see below — but it is not what kills you in an exploding car.) Health, the `CFire *` at `+696` and the burn timer
 at `+1804` are pinned alongside the flag, because a vehicle already alight when
 the toggle came on would otherwise keep burning down on a timer that damage
 flags have no say over.
@@ -552,3 +549,43 @@ does. **A plane is not a different model number on the same record** — it need
 genuine winged record. There are exactly six (handling ids 75–80, 88 bytes each);
 `fly_probe_records()` dumps all of them, and which record each interesting model
 resolves to, so the choice can come from data rather than a fourth guess.
+
+## Real invincibility is a flag, not a health pin
+
+Pinning health every frame restores you *after* the hit, so anything lethal in
+one blow still kills. The game has an actual flag and `CPed::InflictDamage`
+gates the entire function on it for the player:
+
+```
+452bb0: bl   FindPlayerPed
+452bb4: cmp  x0, x19          is the victim the player?
+452bb8: b.eq 452c08           yes:
+452c0c: ldrb w8, [x0, #3185]
+452c10: cbz  w8, <mov w0, wzr; ret>   zero -> no damage at all
+```
+
+**`ped+3185` is the player's can-be-damaged byte; zero means immune.** It is the
+game's own mechanism — `CPlayerInfo::MakePlayerSafe` clears it,
+`CPlayerPed::SetInitialState` restores it — which is also why it has to be
+written every frame rather than once on the toggle edge.
+
+### Except in an exploding car, where nothing helps
+
+`CAutomobile::BlowUpCar` → `CVehicle::KillPedsInVehicle` kills occupants
+outright:
+
+```
+ldr w8, [x0, #988] / cmp w8, #0x32 / b.ne <SetDie>   ... bl CPed::SetDead
+```
+
+No damage call, no health check, **no flag** — `IsPlayer()` appears one line
+later but only decides whether the object is destroyed. So the only way to
+survive is for the explosion not to happen. Invincible therefore also keeps the
+vehicle you are in above the health at which it catches fire, using the game's
+own figure of **300** (`ExtinguishCarFire` does `fmaxnm s0, s0, #300.0`). The car
+still takes damage and still looks wrecked; it just cannot burn down under you.
+"Vehicle invincible" remains the separate toggle for genuinely indestructible.
+
+**Check for a real flag before settling for pinning a value every frame.** The
+health pin had been in the menu since the beginning and looked like it worked,
+because most damage is not lethal in one hit.

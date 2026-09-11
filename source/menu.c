@@ -474,6 +474,58 @@ static void menu_apply_ammo_edges(void *ped) {
     ammo_restore(ped);
 }
 
+// ---- real invincibility ----
+//
+// Pinning health every frame is not immunity: it restores you *after* the hit,
+// so anything that kills outright still kills, and you die between two of our
+// frames. The game has an actual flag, and CPed::InflictDamage gates the whole
+// function on it for the player:
+//
+//   452bb0: bl   FindPlayerPed
+//   452bb4: cmp  x0, x19          is the victim the player?
+//   452bb8: b.eq 452c08           yes:
+//   452c0c: ldrb w8, [x0, #3185]
+//   452c10: cbz  w8, <mov w0, wzr; ret>    zero -> no damage, at all
+//
+// So **ped+3185 is the player's can-be-damaged byte**, and zero means immune.
+// It is the game's own mechanism: CPlayerInfo::MakePlayerSafe clears it and
+// CPlayerPed::SetInitialState puts it back, which is also why it is re-applied
+// every frame here rather than once on the edge.
+#define PED_CAN_BE_DAMAGED 3185
+
+// **This does not cover being blown up in your own car, and no flag does.**
+// CAutomobile::BlowUpCar calls CVehicle::KillPedsInVehicle, which kills the
+// occupants outright:
+//
+//   ldr w8, [x0, #988] / cmp w8, #0x32 / b.ne <SetDie>   ... bl CPed::SetDead
+//
+// There is no damage, no health check and nothing to switch off -- IsPlayer()
+// appears one line later, but only to decide whether the object gets destroyed.
+// The only way to survive the explosion is for it not to happen, so Invincible
+// also keeps the vehicle you are sitting in above the threshold at which it
+// catches fire. 300 is the game's own number for that: it is what
+// ExtinguishCarFire raises health to (`fmaxnm s0, s0, #300.0`). The car still
+// takes damage and still looks wrecked -- it just will not burn down under you.
+// "Vehicle invincible" is the separate toggle for actually indestructible.
+// (invincible_no_burn_tick, further down, does that half -- it needs the vehicle
+// offsets, which are defined later in this file.)
+
+static int invincible_was_on = 0;
+
+static void menu_apply_invincible_edges(void *ped) {
+  const int on = menu_toggle_on[MENU_TOG_INVINCIBLE];
+
+  if (on) {
+    // Every frame, not once: SetInitialState resets it on respawn, and cutscenes
+    // move it about through MakePlayerSafe.
+    *((uint8_t *)ped + PED_CAN_BE_DAMAGED) = 0;
+  } else if (invincible_was_on) {
+    *((uint8_t *)ped + PED_CAN_BE_DAMAGED) = 1;
+    debugPrintf("MENU: player can be damaged again\n");
+  }
+  invincible_was_on = on;
+}
+
 // Runs every frame while the game is live, menu open or not.
 static void menu_apply_toggles(void) {
   const int want_high = menu_toggle_on[MENU_TOG_FLY_HIGHER];
@@ -499,8 +551,11 @@ static void menu_apply_toggles(void) {
   float *health = (float *)((uintptr_t)ped + PED_HEALTH);
   float *armour = (float *)((uintptr_t)ped + PED_ARMOUR);
 
-  // Invincible pins both every frame; regen tops them up once a second, so you
-  // still take damage and recover rather than never flinching.
+  menu_apply_invincible_edges(ped);
+
+  // Invincible pins both every frame on top of the real flag below; regen tops
+  // them up once a second, so you still take damage and recover rather than
+  // never flinching.
   if (menu_toggle_on[MENU_TOG_INVINCIBLE]) {
     *health = PED_MAX;
     *armour = PED_MAX;
@@ -2433,6 +2488,27 @@ static void veh_invincible_restore(void) {
   veh_inv_patched = NULL;
 }
 
+// The other half of Invincible: see the note beside PED_CAN_BE_DAMAGED. Nothing
+// can save you from CVehicle::KillPedsInVehicle, so keep the car you are in
+// above the health at which it catches fire and the call never happens. 300 is
+// the game's own figure -- what ExtinguishCarFire raises health to.
+#define VEH_NO_BURN_HEALTH 300.0f
+
+static void invincible_no_burn_tick(void) {
+  if (!menu_toggle_on[MENU_TOG_INVINCIBLE] || !find_player_vehicle)
+    return;
+
+  uint8_t *veh = (uint8_t *)find_player_vehicle();
+  if (!veh)
+    return;
+
+  float *vh = (float *)(veh + VEH_HEALTH);
+  if (*vh < VEH_NO_BURN_HEALTH) {
+    *vh = VEH_NO_BURN_HEALTH;
+    *(uint32_t *)(veh + VEH_BURN_TIMER) = 0;
+  }
+}
+
 static void veh_invincible_tick(void) {
   if (!menu_toggle_on[MENU_TOG_VEH_INVINCIBLE] || !find_player_vehicle) {
     veh_invincible_restore();
@@ -2666,6 +2742,7 @@ void menu_tick(int in_game) {
   if (in_game)
     fly_any_tick();
   veh_invincible_tick();
+  invincible_no_burn_tick();
   fly_probe_records();
 
   if (!menu_ready())
