@@ -220,7 +220,6 @@ static menu_cheat menu_cheats[] = {
   { "Mad drivers",      "_Z12MadCarsCheatv",            NULL, 0, CHEAT_CAT_VEHICLE },
   { "Peds riot",        "_Z11MayhemCheatv",             NULL, 0, CHEAT_CAT_PEDS },
   { "Peds attack you",  "_Z27EverybodyAttacksPlayerCheatv",  NULL, 0, CHEAT_CAT_PEDS },
-  { "Women armed",      "_Z21DoChicksWithGunsCheatv",   NULL, 0, CHEAT_CAT_PEDS },
 
   // Everything below is a cheat the game exports that the menu had not listed.
   // The retail button-code list is the check: each is one of those sequences,
@@ -234,27 +233,37 @@ static menu_cheat menu_cheats[] = {
   //   MultiplayerUnlockCheat1..4                nothing to unlock in the port
   //   DoShowChaseStatCheat ("media attention")  activates, shows nothing useful
   //
-  // **FlyingFishCheat is "boats fly", not "cars drive on water".** It was
-  // listed as the latter on the strength of the name matching a line in the
-  // retail code list, which was a guess; the flag it toggles,
-  // CVehicle::bCheat8, is read by CBoat::ProcessControl and by nothing else.
-  // The retail cars-on-water code reaches some other function entirely --
-  // FlyingFishCheat has **no callers anywhere in the binary**, so CPad cannot be
-  // reaching it. Several exported cheats are dead that way (WallClimbingCheat,
-  // OnlyRenderWheelsCheat, DoChicksWithGunsCheat, TrashmasterCheat): the only
-  // reference to each is its own definition.
+  // "Cars drive on water" is **BackToTheFuture**, which no amount of reading
+  // names would have suggested. It took walking CPad::AddToCheatString and
+  // pairing every CheatStringN with the handler its match branches to:
   //
-  // **CPad::AddToCheatString is the authority on what a button code does** -- it
-  // holds every cheat the codes can reach. Matching a cheat to a name in a list
-  // is not the same as matching it to the function behind that name.
+  //   CheatString33 -> _Z15BackToTheFuturev  -> toggles CVehicle::bHoverCheat
+  //
+  // and bHoverCheat is read by CAutomobile::ProcessBuoyancy, which is the
+  // feature. Two earlier guesses at this entry were both wrong: FlyingFishCheat
+  // (CVehicle::bCheat8, read only by CBoat::ProcessControl -- that is boats
+  // flying) and before that nothing at all.
+  //
+  // **CPad::AddToCheatString is the authority on what a button code does.** It
+  // holds every cheat the codes can reach, and pairing it against the exported
+  // symbols shows several are dead -- FlyingFishCheat, WallClimbingCheat,
+  // OnlyRenderWheelsCheat, DoChicksWithGunsCheat and TrashmasterCheat are each
+  // referenced only by their own definition, so no button code reaches them.
+  // Matching a cheat to a name in a list is not the same as matching it to the
+  // function behind that name; find the reader of the flag it sets.
+  //
+  // Also learned from that walk, should it ever matter: gTopsyTurvyCheat is
+  // "upside down" (two codes reach it; CPad::Update and RslCameraBeginUpdate
+  // read it), CheatString45 runs CCredits::Start, the pad's Trashmaster and
+  // Rhino codes go through VehicleCheat(id), and CheatStrings 23, 26 and 35 are
+  // recognised but branch to a block that only clears the buffer.
   //
   // "Peds have weapons" is WeaponsForAllCheat, not DoChicksWithGuns -- that one
   // arms women only and is labelled as such above.
   { "Commit suicide",   "_Z12SuicideCheatv",            NULL, 0, CHEAT_CAT_PLAYER },
   { "Perfect traction", "_Z15StrongGripCheatv",         NULL, 0, CHEAT_CAT_VEHICLE },
-  { "Boats fly",        "_Z15FlyingFishCheatv",         NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Cars drive on water","_Z15BackToTheFuturev",       NULL, 0, CHEAT_CAT_VEHICLE },
   { "All green lights", "_Z18TrafficLightsCheatv",      NULL, 0, CHEAT_CAT_VEHICLE },
-  { "Invisible cars",   "_Z21OnlyRenderWheelsCheatv",   NULL, 0, CHEAT_CAT_VEHICLE },
   { "Peds have weapons","_Z18WeaponsForAllCheatv",      NULL, 0, CHEAT_CAT_PEDS },
   { "Peds follow you",  "_Z16FannyMagnetCheatv",        NULL, 0, CHEAT_CAT_PEDS },
   { "Peds enter your car","_Z17PickUpChicksCheatv",     NULL, 0, CHEAT_CAT_PEDS },

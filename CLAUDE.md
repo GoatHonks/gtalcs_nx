@@ -640,23 +640,36 @@ reads as nothing happening. The menu now walks the vehicle pool afterwards and
 recolours what is already there, so the result is visible immediately. The flag
 itself is untouched; that part is still the game's cheat.
 
-**`CPad::AddToCheatString` is the authority on what a button code does.** It
-holds every cheat the codes can reach, and comparing that list against the
-exported `*Cheat` symbols shows several are **dead code — the only reference to
-each is its own definition**: `FlyingFishCheat`, `WallClimbingCheat`,
-`OnlyRenderWheelsCheat`, `DoChicksWithGunsCheat`, `TrashmasterCheat`. (The pad's
-Trashmaster and Rhino codes go through `VehicleCheat(id)` instead.)
+**`CPad::AddToCheatString` is the authority on what a button code does**, and the
+way to read it is to pair every `CheatStringN` with the handler its match
+branches to. Note there are **two branch shapes** — `tbz w0,#0,<handler>` and
+`tbnz w0,#0,<return>` falling through to the handler — and scanning for only the
+first silently misses entries.
 
-That caught a mislabel. `FlyingFishCheat` was listed as "cars drive on water"
-because the name matched a line in the retail code list — a guess. The flag it
-toggles, `CVehicle::bCheat8`, is read by `CBoat::ProcessControl` and nothing
-else, so it is **boats fly**, and the retail cars-on-water code must reach some
-other function since nothing calls this one at all. **Matching a cheat to a name
-in a list is not the same as matching it to the function behind that name — find
-the reader.**
+That walk found "cars drive on water": it is **`BackToTheFuture()`**, which no
+amount of reading names would have suggested.
 
-It is also a **toggle** (`ldrb` / `eor #1` / `strb`), so pressing it twice puts
-it back.
+```
+CheatString33 -> _Z15BackToTheFuturev -> toggles CVehicle::bHoverCheat
+```
+
+and `bHoverCheat` is read by `CAutomobile::ProcessBuoyancy`, which is the
+feature. I guessed at this entry twice and was wrong twice — first omitting it,
+then wiring it to `FlyingFishCheat` because the name matched a line in the code
+list. `FlyingFishCheat` toggles `CVehicle::bCheat8`, read only by
+`CBoat::ProcessControl`: that is boats flying, and nothing calls it anyway.
+
+**Several exported cheats are dead — the only reference to each is its own
+definition, so no button code reaches them**: `FlyingFishCheat`,
+`WallClimbingCheat`, `OnlyRenderWheelsCheat`, `DoChicksWithGunsCheat`,
+`TrashmasterCheat`. (The pad's Trashmaster and Rhino codes use
+`VehicleCheat(id)`.) Also from that walk: `gTopsyTurvyCheat` is "upside down",
+read by `CPad::Update` and `RslCameraBeginUpdate`; `CheatString45` runs
+`CCredits::Start`; and CheatStrings 23, 26 and 35 are recognised but branch to a
+block that only clears the buffer.
+
+**Matching a cheat to a name in a list is not matching it to the function behind
+that name. Find the reader of the flag it sets.**
 
 `CPad::ResetCheats` has **no callers** in this build, so nothing clears a cheat
 flag once set.
