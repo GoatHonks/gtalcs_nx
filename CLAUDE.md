@@ -640,9 +640,23 @@ reads as nothing happening. The menu now walks the vehicle pool afterwards and
 recolours what is already there, so the result is visible immediately. The flag
 itself is untouched; that part is still the game's cheat.
 
-`FlyingFishCheat` ("cars drive on water") is a **toggle** — `ldrb` / `eor #1` /
-`strb` on `CVehicle::bCheat8` — so pressing it twice puts it back. Worth knowing
-before concluding it does nothing.
+**`CPad::AddToCheatString` is the authority on what a button code does.** It
+holds every cheat the codes can reach, and comparing that list against the
+exported `*Cheat` symbols shows several are **dead code — the only reference to
+each is its own definition**: `FlyingFishCheat`, `WallClimbingCheat`,
+`OnlyRenderWheelsCheat`, `DoChicksWithGunsCheat`, `TrashmasterCheat`. (The pad's
+Trashmaster and Rhino codes go through `VehicleCheat(id)` instead.)
+
+That caught a mislabel. `FlyingFishCheat` was listed as "cars drive on water"
+because the name matched a line in the retail code list — a guess. The flag it
+toggles, `CVehicle::bCheat8`, is read by `CBoat::ProcessControl` and nothing
+else, so it is **boats fly**, and the retail cars-on-water code must reach some
+other function since nothing calls this one at all. **Matching a cheat to a name
+in a list is not the same as matching it to the function behind that name — find
+the reader.**
+
+It is also a **toggle** (`ldrb` / `eor #1` / `strb`), so pressing it twice puts
+it back.
 
 `CPad::ResetCheats` has **no callers** in this build, so nothing clears a cheat
 flag once set.

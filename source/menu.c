@@ -232,13 +232,27 @@ static menu_cheat menu_cheats[] = {
   //   ChangePlayerCheat ("play as pedestrian")  does nothing in this build
   //   SlowClockCheat                            not a cheat in LCS at all
   //   MultiplayerUnlockCheat1..4                nothing to unlock in the port
+  //   DoShowChaseStatCheat ("media attention")  activates, shows nothing useful
+  //
+  // **FlyingFishCheat is "boats fly", not "cars drive on water".** It was
+  // listed as the latter on the strength of the name matching a line in the
+  // retail code list, which was a guess; the flag it toggles,
+  // CVehicle::bCheat8, is read by CBoat::ProcessControl and by nothing else.
+  // The retail cars-on-water code reaches some other function entirely --
+  // FlyingFishCheat has **no callers anywhere in the binary**, so CPad cannot be
+  // reaching it. Several exported cheats are dead that way (WallClimbingCheat,
+  // OnlyRenderWheelsCheat, DoChicksWithGunsCheat, TrashmasterCheat): the only
+  // reference to each is its own definition.
+  //
+  // **CPad::AddToCheatString is the authority on what a button code does** -- it
+  // holds every cheat the codes can reach. Matching a cheat to a name in a list
+  // is not the same as matching it to the function behind that name.
   //
   // "Peds have weapons" is WeaponsForAllCheat, not DoChicksWithGuns -- that one
   // arms women only and is labelled as such above.
   { "Commit suicide",   "_Z12SuicideCheatv",            NULL, 0, CHEAT_CAT_PLAYER },
-  { "Media attention",  "_Z20DoShowChaseStatCheatv",    NULL, 0, CHEAT_CAT_WANTED },
   { "Perfect traction", "_Z15StrongGripCheatv",         NULL, 0, CHEAT_CAT_VEHICLE },
-  { "Cars drive on water","_Z15FlyingFishCheatv",       NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Boats fly",        "_Z15FlyingFishCheatv",         NULL, 0, CHEAT_CAT_VEHICLE },
   { "All green lights", "_Z18TrafficLightsCheatv",      NULL, 0, CHEAT_CAT_VEHICLE },
   { "Invisible cars",   "_Z21OnlyRenderWheelsCheatv",   NULL, 0, CHEAT_CAT_VEHICLE },
   { "Peds have weapons","_Z18WeaponsForAllCheatv",      NULL, 0, CHEAT_CAT_PEDS },
