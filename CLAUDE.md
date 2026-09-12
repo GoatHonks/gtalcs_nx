@@ -592,36 +592,45 @@ because most damage is not lethal in one hit.
 
 ## Why the winged flight models tear a car apart
 
-Not the flying handling record — the probe settled that. All six are real:
+Not the flying handling record — the probe settled that. All six are real and
+sensibly shaped (field 0 prints as `1.05e-43` because it is the id as an **int**,
+75, read as a float, which incidentally confirms the 88-byte stride).
+
+Nor is it rotational inertia. Every torque goes through
+`CPhysical::ApplyTurnForce`, which divides by the **turn mass at `vehicle+244`**
+(`ldr s0,[x19,#244]` / `fdiv s0, s1, s0`), so scaling that up looked like the
+answer. It was not, and the log said so in one line:
 
 ```
-record 75 @...: id 0.4 0.75 -0.001 0.02 0.2 0.0065 7 0.0065 7 0.4 0.012 0.997
-record 76 ... 80: same shape, different numbers
+flying 5 (Plane) ... turn -3.347 3.515 -3.203 mass 1400/2800
 ```
 
-(Field 0 prints as `1.05e-43` because it is the id as an **int**, 75, read as a
-float — which incidentally confirms the 88-byte stride and the 75..80 range.)
+Turn mass doubled, turn speed **still pinned at the engine's limit on all three
+axes**, against 0.001–0.007 for the helicopter model. Saturating regardless of
+the divisor is a **feedback loop**, not a torque too large for the inertia: the
+flying records' roll and pitch stability terms are both `7`, they read the turn
+speed back, and nothing damps it between frames — a car's angular damping lives
+in its *ordinary* handling record, which the winged path never touches.
 
-The cause is rotational inertia. Every torque `FlyingControl` applies goes
-through `CPhysical::ApplyTurnForce`, which divides by the **turn mass at
-`vehicle+244`**:
+So the menu clamps the turn speed after the call (`PLANE_TURN_LIMIT`), which
+breaks the loop where it is measurable. **Print the quantity you are theorising
+about**: both masses in that log line are what turned a plausible story into a
+dead one in a single frame of output.
 
-```
-3485fc: ldr  s0, [x19, #244]
-348600: fmov s1, #1.0
-348614: fdiv s0, s1, s0        -> 1 / turnMass, applied to the cross product
-```
+## Menu shape
 
-A car's turn mass is a fraction of an aircraft's, so the torque that banks a
-plane spins a Banshee — and the flying records' stability terms are large (roll
-and pitch stability are both 7), so it oscillates rather than merely
-over-rotating. The helicopter models escape this because their path applies far
-less torque and reads one field instead of eleven.
+The top level is six doorways and nothing else — Cheats, Teleport, Spawn
+vehicle, Player modifications, Vehicle modifications, Misc. Every toggle lives
+in the submenu it belongs to, which is also what keeps the help box inside its
+255 characters as features accumulate. Toggle rows build their own labels
+(`Name [ON]`) at render time, and **activating a toggle or a style does not close
+the menu** — closing after each flip makes turning three things on a chore.
 
-The menu therefore lends the vehicle an aircraft's turn mass for the duration of
-the call and restores it immediately after, so nothing persists into the
-vehicle's own physics. `PLANE_TURN_MASS_SCALE` is the knob, and the log prints
-both masses so it can be set from measurements.
+**A list with a single category must not unwind into it.** `menu_sub_enter`
+walks straight past the category level when there is only one, so backing out to
+it landed on a one-line "Vehicle" screen the user never chose and could not have
+chosen. Those lists return to whatever opened them — `sub_parent`, one level,
+which is all anything here nests.
 
 ## The flight submenu
 

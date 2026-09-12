@@ -436,7 +436,6 @@ static cheat_wanted_fn cheat_wanted_level = NULL;
 
 typedef enum {
   MENU_TOG_NEVER_TIRED = 0,
-  MENU_TOG_REGEN,
   MENU_TOG_INVINCIBLE,
   MENU_TOG_AMMO,
   MENU_TOG_NEVER_WANTED,
@@ -445,15 +444,6 @@ typedef enum {
   MENU_NUM_TOGGLES
 } menu_toggle;
 
-static const char *const menu_toggle_name[MENU_NUM_TOGGLES] = {
-  "Never tired",
-  "Regen health & armour",
-  "Invincible",
-  "Unlimited ammo",
-  "Never wanted",
-  "Fly higher",
-  "Vehicle invincible",
-};
 
 static int menu_toggle_on[MENU_NUM_TOGGLES];
 
@@ -569,12 +559,6 @@ static void menu_apply_toggles(void) {
     return;
   slow_tick = 0;
 
-  if (menu_toggle_on[MENU_TOG_REGEN]) {
-    if (*health < PED_MAX)
-      *health = PED_MAX;
-    if (*armour < PED_MAX)
-      *armour = PED_MAX;
-  }
 
   if (menu_toggle_on[MENU_TOG_AMMO] && ped_set_ammo) {
     for (int t = 1; t <= WEAPON_TYPE_MAX; t++)
@@ -1479,13 +1463,6 @@ typedef enum {
   VEDIT_NUM
 } veh_edit_action;
 
-static const char *const veh_edit_name[VEDIT_NUM] = {
-  "Flip upright",
-  "Repair",
-  "Next colour 1",
-  "Next colour 2",
-  "Random colours",
-};
 
 
 // ---- menu state ----
@@ -1495,26 +1472,25 @@ typedef enum {
   MENU_ACT_CHEATS = 0,
   MENU_ACT_TELEPORT,
   MENU_ACT_VEHICLE,
-  MENU_ACT_VEHEDIT,
-  MENU_ACT_FLY,
-  MENU_ACT_BODYGUARDS,
-  MENU_ACT_CLEAR_WANTED,
+  MENU_ACT_PLAYER,
+  MENU_ACT_VEHMOD,
+  MENU_ACT_MISC,
   MENU_NUM_ACTIONS
 } menu_action;
 
+// The top level is nothing but doorways now. Everything that used to sit here
+// as a bare toggle lives in the submenu it belongs to, which is what keeps the
+// help box inside its 255 characters as the menu grows.
 static const char *const menu_action_name[MENU_NUM_ACTIONS] = {
   "Cheats",
   "Teleport",
   "Spawn vehicle",
-  "Edit vehicle",
-  "Vehicles fly",
-  "Spawn bodyguards",
-  "Clear wanted level",
+  "Player modifications",
+  "Vehicle modifications",
+  "Misc",
 };
 
-// Top level = the actions, a header, then the toggles.
-#define MENU_HDR_ROW   MENU_NUM_ACTIONS
-#define MENU_TOP_ROWS  (MENU_NUM_ACTIONS + 1 + MENU_NUM_TOGGLES)
+#define MENU_TOP_ROWS  MENU_NUM_ACTIONS
 
 static int menu_open = 0;
 static int menu_cursor = 0;
@@ -1533,11 +1509,72 @@ typedef enum {
   SUB_CHEATS,
   SUB_TELEPORT,
   SUB_VEHICLES,
-  SUB_VEHEDIT,
+  SUB_PLAYER,
+  SUB_VEHMOD,
+  SUB_MISC,
   SUB_FLY
 } menu_sub;
 
+// A row in one of the plain lists: run something, flip something, or open
+// another list. One table per submenu beats a switch per question.
+typedef enum { ROW_ACT = 0, ROW_TOG, ROW_SUB } row_kind;
+
+// The two things in the player list that are not toggles.
+typedef enum { PACT_BODYGUARDS = 0, PACT_CLEAR_WANTED } player_action;
+typedef struct { uint8_t kind; uint8_t id; const char *name; } menu_row;
+
+static const menu_row player_rows[] = {
+  { ROW_ACT, PACT_BODYGUARDS,     "Spawn bodyguards" },
+  { ROW_ACT, PACT_CLEAR_WANTED,   "Clear wanted level" },
+  { ROW_TOG, MENU_TOG_INVINCIBLE, "Invincible" },
+  { ROW_TOG, MENU_TOG_AMMO,       "Unlimited ammo" },
+  { ROW_TOG, MENU_TOG_NEVER_TIRED,"Never tired" },
+  { ROW_TOG, MENU_TOG_NEVER_WANTED,"Never wanted" },
+};
+
+static const menu_row vehmod_rows[] = {
+  { ROW_ACT, VEDIT_COLOUR_RANDOM, "Random colour" },
+  { ROW_ACT, VEDIT_COLOUR1,       "Next primary colour" },
+  { ROW_ACT, VEDIT_COLOUR2,       "Next secondary colour" },
+  { ROW_ACT, VEDIT_REPAIR,        "Repair" },
+  { ROW_ACT, VEDIT_UPRIGHT,       "Flip upright" },
+  { ROW_TOG, MENU_TOG_VEH_INVINCIBLE, "Vehicle invincible" },
+  { ROW_SUB, SUB_FLY,             "Vehicles fly" },
+};
+
+static const menu_row misc_rows[] = {
+  { ROW_TOG, MENU_TOG_FLY_HIGHER, "No height limit" },
+};
+
+#define NUM_ROWS(t) ((int)(sizeof(t) / sizeof((t)[0])))
+
+static const menu_row *sub_rows(menu_sub k, int *count) {
+  switch (k) {
+    case SUB_PLAYER: *count = NUM_ROWS(player_rows); return player_rows;
+    case SUB_VEHMOD: *count = NUM_ROWS(vehmod_rows); return vehmod_rows;
+    case SUB_MISC:   *count = NUM_ROWS(misc_rows);   return misc_rows;
+    default:         *count = 0;                     return NULL;
+  }
+}
+
+// A toggle's row has to say what it is doing, so these are built per frame.
+static const char *row_label(const menu_row *r, char *buf, size_t n) {
+  if (r->kind == ROW_TOG)
+    snprintf(buf, n, "%s [%s]", r->name,
+             menu_toggle_on[r->id] ? "ON" : "off");
+  else if (r->kind == ROW_SUB)
+    snprintf(buf, n, "%s >", r->name);
+  else
+    snprintf(buf, n, "%s", r->name);
+  return buf;
+}
+
 static menu_sub sub_kind = SUB_NONE;
+
+// Which list opened the current one, so B from "Vehicles fly" returns to
+// "Vehicle modifications" rather than all the way out. One level is enough:
+// nothing nests deeper.
+static menu_sub sub_parent = SUB_NONE;
 static int sub_cursor = 0;
 
 // Each list now opens on its categories and drills into one. `sub_cat` is -1
@@ -1559,8 +1596,10 @@ static int sub_num_cats(void) {
     case SUB_CHEATS:   return CHEAT_NUM_CATS;
     case SUB_TELEPORT: return PLACE_NUM_CATS + 1;
     case SUB_VEHICLES: return VEH_NUM_CATS;
-    case SUB_VEHEDIT:  return 1;   // flat list, entered straight away
-    case SUB_FLY:      return 1;
+    case SUB_PLAYER:
+    case SUB_VEHMOD:
+    case SUB_MISC:
+    case SUB_FLY:      return 1;   // flat lists, entered straight away
     default:           return 0;
   }
 }
@@ -1571,7 +1610,9 @@ static const char *sub_cat_label(int i) {
     case SUB_TELEPORT: return i == TELEPORT_CAT_MARKER ? "Map marker"
                                                        : place_cat_name[i - 1];
     case SUB_VEHICLES: return veh_cat_name[i];
-    case SUB_VEHEDIT:  return "Vehicle";
+    case SUB_PLAYER:   return "Player";
+    case SUB_VEHMOD:   return "Vehicle";
+    case SUB_MISC:     return "Misc";
     case SUB_FLY:      return "Flight";
     default:           return "";
   }
@@ -1582,7 +1623,13 @@ static int sub_total(void) {
     case SUB_CHEATS:   return cheats_ready;
     case SUB_TELEPORT: return MENU_NUM_PLACES;
     case SUB_VEHICLES: return vehicles_ready;
-    case SUB_VEHEDIT:  return VEDIT_NUM;
+    case SUB_PLAYER:
+    case SUB_VEHMOD:
+    case SUB_MISC: {
+      int n = 0;
+      (void)sub_rows(sub_kind, &n);
+      return n;
+    }
     case SUB_FLY:      return fly_row_count();
     default:           return 0;
   }
@@ -1594,7 +1641,9 @@ static int sub_item_cat(int i) {
     case SUB_CHEATS:   return menu_cheats[i].cat;
     case SUB_TELEPORT: return place_cat[i] + 1;   // 0 is the map marker
     case SUB_VEHICLES: return veh_list[i].cat;
-    case SUB_VEHEDIT:  return 0;
+    case SUB_PLAYER:
+    case SUB_VEHMOD:
+    case SUB_MISC:
     case SUB_FLY:      return 0;
     default:           return -1;
   }
@@ -1605,7 +1654,16 @@ static const char *sub_item_label(int i) {
     case SUB_CHEATS:   return menu_cheats[i].name;
     case SUB_TELEPORT: return place_label[i];
     case SUB_VEHICLES: return veh_list[i].label;
-    case SUB_VEHEDIT:  return veh_edit_name[i];
+    case SUB_PLAYER:
+    case SUB_VEHMOD:
+    case SUB_MISC: {
+      static char buf[40];
+      int n = 0;
+      const menu_row *rows = sub_rows(sub_kind, &n);
+      if (!rows || i < 0 || i >= n)
+        return "";
+      return row_label(&rows[i], buf, sizeof(buf));
+    }
     case SUB_FLY:      return fly_row_label(i);
     default:           return "";
   }
@@ -1616,7 +1674,9 @@ static const char *sub_title(void) {
     case SUB_CHEATS:   return "CHEATS";
     case SUB_TELEPORT: return "TELEPORT";
     case SUB_VEHICLES: return "SPAWN VEHICLE";
-    case SUB_VEHEDIT:  return "EDIT VEHICLE";
+    case SUB_PLAYER:   return "PLAYER";
+    case SUB_VEHMOD:   return "VEHICLE";
+    case SUB_MISC:     return "MISC";
     case SUB_FLY:      return "VEHICLES FLY";
     default:           return "";
   }
@@ -1725,17 +1785,8 @@ static void menu_render(void) {
 
     for (int i = first; i < MENU_TOP_ROWS && i < first + MENU_ROWS; i++) {
       const char mark = i == menu_cursor ? '>' : ' ';
-      if (i < MENU_NUM_ACTIONS) {
-        n += snprintf(line + n, sizeof(line) - n, "~n~%c %s",
-                      mark, menu_action_name[i]);
-      } else if (i == MENU_HDR_ROW) {
-        n += snprintf(line + n, sizeof(line) - n, "~n~  -- ALWAYS ON --");
-      } else {
-        const int t = i - MENU_HDR_ROW - 1;
-        n += snprintf(line + n, sizeof(line) - n, "~n~%c %s  [%s]",
-                      mark, menu_toggle_name[t],
-                      menu_toggle_on[t] ? "ON" : "off");
-      }
+      n += snprintf(line + n, sizeof(line) - n, "~n~%c %s >",
+                    mark, menu_action_name[i]);
       // Stop well short of what the help box holds; a row that would be
       // cut in half is a row that makes the text never match again.
       if (n >= HUD_HELP_CHARS - 40)
@@ -2431,7 +2482,9 @@ static int fly_enabled = 0;
 #define VEH_MASS_FIELD 240
 #define VEH_TURN_MASS  244
 #define VEH_TURN_SPEED 160   // CVector: +160, +164, +168
-#define PLANE_TURN_MASS_SCALE 8.0f
+// The helicopter model works within 0.007, so this leaves room to manoeuvre
+// while cutting the runaway off two orders of magnitude below where it sat.
+#define PLANE_TURN_LIMIT 0.06f
 
 // Row 0 is the on/off switch, then one row per style. The labels are built
 // rather than fixed because they carry state -- which style is chosen, and
@@ -2608,27 +2661,35 @@ static void fly_any_tick(void) {
 
   const int model = fly_style[fly_style_idx].model;
 
-  // Winged models spin a car to pieces: it tumbles with the stick untouched.
-  // Every torque FlyingControl applies goes through CPhysical::ApplyTurnForce,
-  // which divides by the turn mass at +244 (`ldr s0,[x19,#244]` / `fdiv s0,
-  // 1.0, s0`), and a car's turn mass is a fraction of an aircraft's -- so the
-  // torque that banks a plane spins a Banshee. The flying record's stability
-  // terms are large as well (roll and pitch stability are both 7), which is why
-  // it oscillates rather than simply over-rotating.
+  // Lending the vehicle an aircraft's turn mass was the wrong fix, and the log
+  // said so plainly: with the mass scaled 1400 -> 2800 the turn speed still came
+  // back pinned at the engine's limit on every axis --
   //
-  // So lend it an aircraft's rotational inertia for the duration of the call
-  // and hand it straight back. Nothing persists -- the vehicle's own physics,
-  // and the next frame, see the value they always had.
+  //   flying 5 (Plane) ... turn -3.347 3.515 -3.203 mass 1400/2800
+  //   flying 4 (Plane (sharp)) ... turn 3.668 4.000 2.771 mass 1400/2800
+  //
+  // -- against 0.001..0.007 for the helicopter model. Saturating on all three
+  // axes whatever the divisor is a feedback loop, not a torque merely too large
+  // for the inertia: the flying record's roll and pitch stability terms (both 7)
+  // read the turn speed back, and nothing damps it between frames, because a
+  // car's angular damping lives in its ordinary handling record and the winged
+  // path never touches that.
+  //
+  // So break the loop where it is measurable: clamp the turn speed after the
+  // call, well above the helicopter model's working range and far below the
+  // runaway.
   const int winged = (model != 2 && model != 6);
-  float *turn_mass = (float *)(veh + VEH_TURN_MASS);
-  const float real_turn_mass = *turn_mass;
-  if (winged)
-    *turn_mass = real_turn_mass * PLANE_TURN_MASS_SCALE;
+  const float real_turn_mass = *(const float *)(veh + VEH_TURN_MASS);
 
   flying_control(veh, model);
 
-  if (winged)
-    *turn_mass = real_turn_mass;
+  if (winged) {
+    float *turn = (float *)(veh + VEH_TURN_SPEED);
+    for (int i = 0; i < 3; i++) {
+      if (turn[i] > PLANE_TURN_LIMIT)  turn[i] = PLANE_TURN_LIMIT;
+      if (turn[i] < -PLANE_TURN_LIMIT) turn[i] = -PLANE_TURN_LIMIT;
+    }
+  }
 
   static u64 next = 0;
   const u64 ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
@@ -2758,29 +2819,52 @@ static void menu_activate(void) {
       case SUB_CHEATS:   menu_run_cheat(item);     break;
       case SUB_TELEPORT: menu_teleport_to(item);   break;
       case SUB_VEHICLES: menu_spawn_vehicle(item); break;
-      case SUB_VEHEDIT:  menu_vehicle_edit(item);  break;
 
-      // The only list you stay in: picking a style and switching it on are two
-      // presses, and closing the menu between them would be tedious.
+      // Lists you stay in. Picking a flight style and switching it on are two
+      // presses, and closing the menu after every toggle makes turning three
+      // things on a chore.
       case SUB_FLY:
         fly_row_activate(item);
         menu_dirty = 1;
         return;
 
+      case SUB_PLAYER:
+      case SUB_VEHMOD:
+      case SUB_MISC: {
+        int n = 0;
+        const menu_row *rows = sub_rows(sub_kind, &n);
+        if (!rows || item < 0 || item >= n)
+          return;
+        const menu_row *r = &rows[item];
+
+        if (r->kind == ROW_TOG) {
+          menu_toggle_on[r->id] = !menu_toggle_on[r->id];
+          debugPrintf("MENU: %s -> %s\n", r->name,
+                      menu_toggle_on[r->id] ? "ON" : "off");
+          menu_dirty = 1;
+          return;
+        }
+
+        if (r->kind == ROW_SUB) {
+          sub_parent = sub_kind;
+          menu_sub_enter((menu_sub)r->id);
+          return;
+        }
+
+        if (sub_kind == SUB_VEHMOD) {
+          menu_vehicle_edit(r->id);
+        } else if (sub_kind == SUB_PLAYER) {
+          if (r->id == PACT_BODYGUARDS)
+            menu_spawn_bodyguards();
+          else
+            menu_clear_wanted();
+        }
+        break;
+      }
+
       default: break;
     }
     menu_close();
-    return;
-  }
-
-  if (menu_cursor > MENU_HDR_ROW) {
-    const int t = menu_cursor - MENU_HDR_ROW - 1;
-    if (t >= 0 && t < MENU_NUM_TOGGLES) {
-      menu_toggle_on[t] = !menu_toggle_on[t];
-      debugPrintf("MENU: %s -> %s\n", menu_toggle_name[t],
-                  menu_toggle_on[t] ? "ON" : "off");
-      menu_dirty = 1;
-    }
     return;
   }
 
@@ -2796,19 +2880,14 @@ static void menu_activate(void) {
       if (vehicles_ready)
         menu_sub_enter(SUB_VEHICLES);
       break;
-    case MENU_ACT_VEHEDIT:
-      menu_sub_enter(SUB_VEHEDIT);
+    case MENU_ACT_PLAYER:
+      menu_sub_enter(SUB_PLAYER);
       break;
-    case MENU_ACT_FLY:
-      menu_sub_enter(SUB_FLY);
+    case MENU_ACT_VEHMOD:
+      menu_sub_enter(SUB_VEHMOD);
       break;
-    case MENU_ACT_BODYGUARDS:
-      menu_spawn_bodyguards();
-      menu_close();
-      break;
-    case MENU_ACT_CLEAR_WANTED:
-      menu_clear_wanted();
-      menu_close();
+    case MENU_ACT_MISC:
+      menu_sub_enter(SUB_MISC);
       break;
     default:
       break;
@@ -2864,8 +2943,24 @@ void menu_tick(int in_game) {
 
   // B unwinds one level at a time: items to categories, categories to the top,
   // top to closed.
+  //
+  // Except that a list with a single category never showed that category level
+  // -- menu_sub_enter walks straight past it -- so unwinding into it landed you
+  // on a one-line "Vehicle" screen you never chose and could not have. Those
+  // lists go straight back to wherever they were opened from: the list that
+  // opened them if there was one, otherwise the top.
   if (pressed & (HidNpadButton_B | HidNpadButton_Minus)) {
-    if (sub_cat >= 0) {
+    if (sub_cat >= 0 && sub_num_cats() == 1) {
+      const menu_sub parent = sub_parent;
+      sub_parent = SUB_NONE;
+      if (parent != SUB_NONE) {
+        menu_sub_enter(parent);
+      } else {
+        sub_kind = SUB_NONE;
+        sub_cat = -1;
+      }
+      menu_dirty = 1;
+    } else if (sub_cat >= 0) {
       sub_cat = -1;
       menu_dirty = 1;
     } else if (sub_kind != SUB_NONE) {
@@ -2883,19 +2978,14 @@ void menu_tick(int in_game) {
   if (count <= 0)
     return;
 
-  // The section header is a label, so the cursor steps over it.
   if (pressed & HidNpadButton_Up) {
-    do {
-      if (--*cursor < 0)
-        *cursor = count - 1;
-    } while (sub_kind == SUB_NONE && *cursor == MENU_HDR_ROW);
+    if (--*cursor < 0)
+      *cursor = count - 1;
     menu_dirty = 1;
   }
   if (pressed & HidNpadButton_Down) {
-    do {
-      if (++*cursor >= count)
-        *cursor = 0;
-    } while (sub_kind == SUB_NONE && *cursor == MENU_HDR_ROW);
+    if (++*cursor >= count)
+      *cursor = 0;
     menu_dirty = 1;
   }
   if (pressed & HidNpadButton_A)
