@@ -1,0 +1,2954 @@
+/* menu.c -- Liberty Menu, an in-game menu for the LCS Switch port
+ *
+ * This software may be modified and distributed under the terms
+ * of the MIT license.  See the LICENSE file for details.
+ *
+ * Everything here is native: each entry calls the game's own functions, which
+ * libGame.so exports by name (it ships 18k+ mangled C++ symbols), so there is no
+ * script interpreter, no bytecode and no third-party content involved.
+ *
+ * An earlier version of this file ran CLEO scripts by reimplementing the script
+ * VM's opcode dispatcher. That worked, but every feature worth having turned out
+ * to be a direct call to an exported function anyway -- the cheats are literally
+ * TankCheat(), MoneyCheat() and friends -- so the interpreter was carrying a lot
+ * of risk (IP desyncs, script-list corruption, opcode semantics guessed from a
+ * 32-bit ARM library) for no benefit. Calling the functions is simpler, cannot
+ * desync, and keeps the menu entirely our own work.
+ *
+ * ---- how it draws ----
+ *
+ * Through CHud::SetHelpMessage, the game's own help box. That was originally a
+ * workaround -- every per-frame function in the HUD render path is either large
+ * or a dead stub with no callers, and hook_arm64() builds no trampoline, so
+ * there was nothing to hook -- but it turned out to look like part of the game,
+ * which is worth more than a custom overlay would be.
+ *
+ * The help box is a single shared slot the game also writes its own tips into,
+ * so the menu re-pushes its text whenever something else has overwritten it.
+ * Re-pushing unconditionally every frame does not work: SetHelpMessage restarts
+ * the box's animation and replays its sound, so at 60Hz the cue machine-guns and
+ * the text never finishes appearing.
+ */
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+#include <switch.h>
+
+#include "config.h"
+#include "util.h"
+#include "so_util.h"
+#include "menu.h"
+
+extern so_module game_mod;   // defined in main.c
+
+// Published by main.c's update_gamepad. While the menu is open the game receives
+// no buttons and centred sticks, so navigating cannot shoot, steer or punch.
+extern volatile u64 g_menu_pad_down;
+extern volatile int g_menu_open;
+
+// ---- game entry points ----
+typedef void (*set_help_msg_fn)(uint16_t *text, char a, char b);
+static set_help_msg_fn hud_set_help_message = NULL;
+static uint8_t *hud_help_forever = NULL;    // CHud::m_HelpMessageDisplayForever
+static uint16_t *hud_help_message = NULL;   // CHud::m_HelpMessage (UTF-16)
+
+typedef float (*find_ground_z_fn)(float x, float y);
+static find_ground_z_fn find_ground_z = NULL;
+typedef void *(*find_player_ped_fn)(void);
+static find_player_ped_fn find_player_ped = NULL;
+
+// CPed::Teleport takes its CVector BY POINTER, not in s0/s1/s2.
+//
+// The mangled name says CVector by value, and a three-float aggregate would
+// normally travel in the float registers under AAPCS64 -- but the body is
+//
+//   ldr d0, [x1]  /  ldr s2, [x1, #8]  /  str d0, [x20, #64]
+//
+// so the argument arrives as an address in x1. Passing three floats instead left
+// the callee dereferencing whatever happened to be sitting in x1, which is why
+// teleporting never worked no matter which blip we picked. The blip was never
+// the bug.
+// CEntity::Teleport, called through the vtable. Every entity class overrides it
+// in the *same* slot -- _ZTV4CPed, _ZTV11CAutomobile, _ZTV5CBike and _ZTV5CBoat
+// all carry their Teleport at vtable+0x78 -- so one signature moves a ped on
+// foot or the car he is driving. The CVector is by pointer here too
+// (CAutomobile::Teleport: ldr d0,[x19] / ldr s1,[x19,#8]).
+// The `_ZTV...` symbol points at the vtable **object**, not at its first function
+// pointer: `+0` is offset-to-top, `+8` is the RTTI pointer, and the entries start
+// at `+0x10` (`_ZTI11CAutomobile` is at `_ZTV11CAutomobile+8`, and slot 0,
+// `CPhysical::Add`, is at `+0x10`). What an object stores is `symbol + 0x10`.
+//
+// So a relocation at `symbol+0x78` is index **13** counting from the pointer in
+// the object, not 15. Indexing by 15 called `Render()` -- two slots further on --
+// which is why every teleport logged its destination, returned cleanly, and moved
+// nobody. Subtract the 0x10 header before dividing.
+#define ENTITY_VT_TELEPORT ((0x78 - 0x10) / 8)
+
+// But the slot is not always filled in. `CEntity::Teleport` is a bare `ret` --
+// one instruction, no body -- and it is what `_ZTV5CHeli`, `_ZTV6CPlane`,
+// `_ZTV6CTrain` and `_ZTV8CVehicle` all carry in that slot. Only CAutomobile,
+// CBike, CBoat and CPed override it. So a real helicopter (198/199, the two the
+// game types as CHeli) would have been teleported by calling a function that
+// does nothing, and reported success.
+//
+// Comparing the slot against CEntity::Teleport is the check, and it needs no
+// vtable symbols. When it is the stub, do the move by hand the way
+// CAutomobile::Teleport's own first and last steps do it: CWorld::Remove, write
+// the position, CWorld::Add. Calling CAutomobile::Teleport on a CHeli instead
+// would be wrong -- CHeli allocates 0x490 bytes and that function stores to
+// +1568 and +1600, well past the end of it.
+typedef void (*world_entity_fn)(void *entity);
+static world_entity_fn world_remove = NULL;
+static world_entity_fn world_add = NULL;
+static void *entity_teleport_stub = NULL;
+
+
+typedef void (*ped_teleport_fn)(void *ped, const float *pos);
+static ped_teleport_fn ped_teleport = NULL;
+
+// That same store says where a ped keeps its position: +64 for x and y, +72 for
+// z -- the translation row of the matrix that begins at +16.
+#define PED_POS 64
+
+// ---- the game's own text ----
+//
+// Zone names are GXT keys, so rather than shipping a guessed English list the
+// menu asks the game for them and falls back only where a key is missing. As a
+// side effect the names arrive in whatever language the game is set to.
+// Reached through CText::msInstance rather than through TheText(). TheText() is
+// a weak symbol and a lazy constructor -- if the slot is empty it allocates a
+// brand new, empty CText and installs it, which would answer every key with a
+// miss and quietly replace the game's real text object. Reading the pointer is
+// both safer and the same thing the game's own inlined accessors do:
+// TheText()'s adrp/ldr lands on a GOT entry relocated to CText::msInstance.
+// CText::Get is the call the game itself makes -- CCurrentVehicle::Display and
+// CZone::GetTranslatedName both use it. CText::Exists, which this used to gate
+// on, answered false for every key including CHEAT1, one the game demonstrably
+// resolves; whatever it is checking, it is not what Get needs.
+typedef uint16_t *(*text_get_fn)(void *self, const char *key);
+static void **ctext_instance = NULL;
+static text_get_fn text_get = NULL;
+
+// The game's strings are UTF-16. Nothing the menu shows needs more than ASCII,
+// and the help box is fed a wide buffer anyway, so anything outside it becomes
+// '?' rather than dropping the whole name.
+static int wide_to_ascii(const uint16_t *w, char *out, int len) {
+  if (!w || !w[0])
+    return 0;
+  int n = 0;
+  for (; w[n] && n < len - 1; n++)
+    out[n] = (w[n] < 0x80) ? (char)w[n] : '?';
+  out[n] = 0;
+  return n > 0;
+}
+
+// Fills `out` from the GXT key, or leaves it untouched and returns 0.
+static int gxt_lookup(const char *key, char *out, int len) {
+  if (!key || !key[0] || !ctext_instance || !text_get)
+    return 0;
+  void *t = *ctext_instance;
+  if (!t)
+    return 0;
+  return wide_to_ascii(text_get(t, key), out, len);
+}
+
+// ---- cheats ----
+// Called straight through by symbol. Cheats whose flags nothing in this build
+// reads (WallClimbingCheat just eors a byte) are left out rather than listed as
+// something that looks like it works.
+typedef struct {
+  const char *name;
+  const char *sym;
+  void (*fn)(void);
+  int arg;    // 1 = call as fn(1); only HealthCheat takes one, see below
+  int cat;    // which list it appears under
+} menu_cheat;
+
+// Categories exist because 28 cheats in one column is a scrolling contest. The
+// split is by what the cheat acts on, which is the only grouping the names
+// themselves suggest.
+enum {
+  CHEAT_CAT_PLAYER = 0,
+  CHEAT_CAT_WANTED,
+  CHEAT_CAT_WEATHER,
+  CHEAT_CAT_VEHICLE,
+  CHEAT_CAT_PEDS,
+  CHEAT_NUM_CATS
+};
+
+static const char *const cheat_cat_name[CHEAT_NUM_CATS] = {
+  "Player", "Wanted level", "Weather & time", "Vehicles", "Peds",
+};
+
+static menu_cheat menu_cheats[] = {
+  { "Weapons 1",        "_Z12WeaponCheat1v",            NULL, 0, CHEAT_CAT_PLAYER },
+  { "Weapons 2",        "_Z12WeaponCheat2v",            NULL, 0, CHEAT_CAT_PLAYER },
+  { "Weapons 3",        "_Z12WeaponCheat3v",            NULL, 0, CHEAT_CAT_PLAYER },
+  // HealthCheat is the one cheat that takes a parameter, and it gates the game's
+  // own on-screen confirmation (tst w0,#0xff / b.eq past the CText work), so
+  // pass 1 to get the native message rather than a silent top-up.
+  { "Health",           "_Z11HealthCheath",             NULL, 1, CHEAT_CAT_PLAYER },
+  { "Armour",           "_Z11ArmourCheatv",             NULL, 0, CHEAT_CAT_PLAYER },
+  { "Money",            "_Z10MoneyCheatv",              NULL, 0, CHEAT_CAT_PLAYER },
+  { "Wanted up",        "_Z18WantedLevelUpCheatv",      NULL, 0, CHEAT_CAT_WANTED },
+  { "Wanted down",      "_Z20WantedLevelDownCheatv",    NULL, 0, CHEAT_CAT_WANTED },
+  { "Sunny",            "_Z17SunnyWeatherCheatv",       NULL, 0, CHEAT_CAT_WEATHER },
+  { "Extra sunny",      "_Z22ExtraSunnyWeatherCheatv",  NULL, 0, CHEAT_CAT_WEATHER },
+  { "Cloudy",           "_Z18CloudyWeatherCheatv",      NULL, 0, CHEAT_CAT_WEATHER },
+  { "Rainy",            "_Z17RainyWeatherCheatv",       NULL, 0, CHEAT_CAT_WEATHER },
+  { "Foggy",            "_Z17FoggyWeatherCheatv",       NULL, 0, CHEAT_CAT_WEATHER },
+  { "Faster gameplay",  "_Z13FastTimeCheatv",           NULL, 0, CHEAT_CAT_WEATHER },
+  { "Slower gameplay",  "_Z13SlowTimeCheatv",           NULL, 0, CHEAT_CAT_WEATHER },
+  { "Faster clock",     "_Z16FastWeatherCheatv",        NULL, 0, CHEAT_CAT_WEATHER },
+  // TankCheat is not "spawn a tank". It walks a counter over the whole vehicle
+  // model range (130..216) and hands whatever it lands on to VehicleCheat, so it
+  // spawns a different vehicle every time -- which is exactly the random cars
+  // that showed up. Spawn vehicle below is the same VehicleCheat call with the
+  // model chosen deliberately; this entry stays, honestly named, because the
+  // cycling is the game's own cheat.
+  { "Random vehicle",   "_Z9TankCheatv",                NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Trashmaster",      "_Z16TrashmasterCheatv",        NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Chromed cars",     "_Z14GlassCarsCheatv",          NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Black traffic",    "_Z14BlackCarsCheatv",          NULL, 0, CHEAT_CAT_VEHICLE },
+  { "White traffic",    "_Z13PinkCarsCheatv",           NULL, 0, CHEAT_CAT_VEHICLE },
+  // Not a cheat of the game's: there is no way back from the two above. They
+  // set gbBlackCars / gbPinkCars and nothing clears them -- CPad::ResetCheats
+  // would, but it has no callers in this build -- so once traffic is black it is
+  // black for the rest of the session, newly spawned cars included. A NULL
+  // symbol marks an entry the menu implements itself.
+  { "Normal traffic",   NULL,                           NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Tiny bike wheels",      "_Z15BikeWheelsCheatv",         NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Big heads",        "_Z13BigHeadsCheatv",           NULL, 0, CHEAT_CAT_PEDS },
+  { "Blow up cars",     "_Z15BlowUpCarsCheatv",         NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Mad drivers",      "_Z12MadCarsCheatv",            NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Peds riot",        "_Z11MayhemCheatv",             NULL, 0, CHEAT_CAT_PEDS },
+  { "Peds attack you",  "_Z27EverybodyAttacksPlayerCheatv",  NULL, 0, CHEAT_CAT_PEDS },
+
+  // Everything below is a cheat the game exports that the menu had not listed.
+  // The retail button-code list is the check: each is one of those sequences,
+  // matched to the exported function that implements it, and the names now come
+  // from that list rather than from the symbol.
+  //
+  // Not listed, and why -- all confirmed by entering the button code by hand:
+  //
+  //   ChangePlayerCheat ("play as pedestrian")  does nothing in this build
+  //   SlowClockCheat                            not a cheat in LCS at all
+  //   MultiplayerUnlockCheat1..4                nothing to unlock in the port
+  //   DoShowChaseStatCheat ("media attention")  activates, shows nothing useful
+  //
+  // "Cars drive on water" is **BackToTheFuture**, which no amount of reading
+  // names would have suggested. It took walking CPad::AddToCheatString and
+  // pairing every CheatStringN with the handler its match branches to:
+  //
+  //   CheatString33 -> _Z15BackToTheFuturev  -> toggles CVehicle::bHoverCheat
+  //
+  // and bHoverCheat is read by CAutomobile::ProcessBuoyancy, which is the
+  // feature. Two earlier guesses at this entry were both wrong: FlyingFishCheat
+  // (CVehicle::bCheat8, read only by CBoat::ProcessControl -- that is boats
+  // flying) and before that nothing at all.
+  //
+  // **CPad::AddToCheatString is the authority on what a button code does.** It
+  // holds every cheat the codes can reach, and pairing it against the exported
+  // symbols shows several are dead -- FlyingFishCheat, WallClimbingCheat,
+  // OnlyRenderWheelsCheat, DoChicksWithGunsCheat and TrashmasterCheat are each
+  // referenced only by their own definition, so no button code reaches them.
+  // Matching a cheat to a name in a list is not the same as matching it to the
+  // function behind that name; find the reader of the flag it sets.
+  //
+  // Also learned from that walk, should it ever matter: gTopsyTurvyCheat is
+  // "upside down" (two codes reach it; CPad::Update and RslCameraBeginUpdate
+  // read it), CheatString45 runs CCredits::Start, the pad's Trashmaster and
+  // Rhino codes go through VehicleCheat(id), and CheatStrings 23, 26 and 35 are
+  // recognised but branch to a block that only clears the buffer.
+  //
+  // "Peds have weapons" is WeaponsForAllCheat, not DoChicksWithGuns -- that one
+  // arms women only and is labelled as such above.
+  { "Commit suicide",   "_Z12SuicideCheatv",            NULL, 0, CHEAT_CAT_PLAYER },
+  { "Perfect traction", "_Z15StrongGripCheatv",         NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Cars drive on water","_Z15BackToTheFuturev",       NULL, 0, CHEAT_CAT_VEHICLE },
+  { "All green lights", "_Z18TrafficLightsCheatv",      NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Peds have weapons","_Z18WeaponsForAllCheatv",      NULL, 0, CHEAT_CAT_PEDS },
+  { "Peds follow you",  "_Z16FannyMagnetCheatv",        NULL, 0, CHEAT_CAT_PEDS },
+  { "Peds enter your car","_Z17PickUpChicksCheatv",     NULL, 0, CHEAT_CAT_PEDS },
+};
+#define MENU_NUM_CHEATS ((int)(sizeof(menu_cheats) / sizeof(menu_cheats[0])))
+
+static int cheats_ready = 0;
+
+// The two traffic-colour flags, and the routine the game itself uses to pick a
+// vehicle's colours, so putting traffic back means asking for the same answer a
+// fresh spawn would have got rather than inventing one.
+static uint8_t *gb_black_cars = NULL;
+static uint8_t *gb_pink_cars = NULL;
+typedef void (*choose_colour_fn)(void *modelinfo, uint8_t *c1, uint8_t *c2);
+static choose_colour_fn choose_vehicle_colour = NULL;
+
+// ---- the flying ceiling, second attempt ----
+//
+// The user's read of this was right and mine was wrong: it is not a property of
+// flying, it is a height limit the game keeps in a variable. The CLEO
+// "Unlimited Flying" script is eighteen bytes and all it does is write the float
+// 8000.0 to one address and end.
+//
+// That address in this build is CVehicle::rcHeliHeightLimit -- a named, exported
+// four-byte float, which FlyingControl loads and compares the vehicle's z
+// against before any of the hardcoded 80.0 business:
+//
+//   ldr  x9, [x9, #1200]      ; -> CVehicle::rcHeliHeightLimit
+//   ldr  s2, [x9]
+//   ldr  s1, [x19, #72]       ; z
+//   fcmp s1, s2
+//
+// So the toggle is now a four-byte write to a variable that exists for exactly
+// this purpose. No code patching, and nothing borrowed from a neighbour: the
+// last attempt parked two floats in VehicleNames and took every vehicle's
+// collision with it.
+// Writing 8000.0 there on its own changed nothing, and the log shows why: the
+// stock limit is 60.0, and the two branches of FlyingControl work out to the
+// same formula.
+//
+//   if (z > rcHeliHeightLimit)  lift *= 10 / ((z - limit) - 10)
+//   else if (z > 80.0)          lift *= 10 / (z - 70)
+//
+// With limit 60 the first branch gives 10/(z-70). With limit 8000 the first
+// branch never fires and the second gives 10/(z-70). Identical. The 80/-70 pair
+// is the real ceiling, and it is two MOVZ immediates in the code.
+//
+// So both halves are needed: patch those immediates once at init to 300/-290 --
+// plain instruction rewriting, no borrowed storage this time -- and have the
+// toggle push rcHeliHeightLimit out of the way so the patched branch is the one
+// that runs. Toggled off, the limit goes back to 60, the first branch governs
+// again, and the patched constants are unreachable, so stock behaviour is exact.
+#define FLY_OFF_CAP   0x69c
+#define FLY_OFF_FLOOR 0x6ac
+
+#define MOVZ_W8_HI(imm16) (0x52a00000u | ((uint32_t)(imm16) << 5) | 8u)
+#define FLY_CAP_STOCK   MOVZ_W8_HI(0x42a0)   //   80.0
+#define FLY_FLOOR_STOCK MOVZ_W8_HI(0xc28c)   //  -70.0
+// MOVZ with a high-half shift can only encode floats whose low 16 bits are zero,
+// which is why these are powers of two rather than round decimals. 300 was
+// timid: this is the real ceiling, twenty-seven times higher, and the map is
+// only about 3000 units across.
+#define FLY_CAP_HIGH    MOVZ_W8_HI(0x4600)   //  8192.0
+#define FLY_FLOOR_HIGH  MOVZ_W8_HI(0xc600)   // -8192.0
+
+// Runs from menu_init, while the image is still only mapped at load_base.
+static void fly_raise_hard_cap(void) {
+  const uintptr_t fc =
+      so_try_find_addr_rx(&game_mod, "_ZN8CVehicle13FlyingControlE12eFlightModel");
+  if (!fc || !game_mod.load_base || !game_mod.load_virtbase)
+    return;
+
+  const uintptr_t virt = (uintptr_t)game_mod.load_virtbase;
+  const uintptr_t base = (uintptr_t)game_mod.load_base;
+  uint32_t *const cap = (uint32_t *)(base + (fc + FLY_OFF_CAP - virt));
+  uint32_t *const floor_ = (uint32_t *)(base + (fc + FLY_OFF_FLOOR - virt));
+
+  if (*cap != FLY_CAP_STOCK || *floor_ != FLY_FLOOR_STOCK) {
+    debugPrintf("MENU: flying cap NOT patched, found %08x %08x\n", *cap, *floor_);
+    return;
+  }
+  *cap = FLY_CAP_HIGH;
+  *floor_ = FLY_FLOOR_HIGH;
+  debugPrintf("MENU: flying cap 80 -> 8192 (reached only with No height limit on)\n");
+}
+
+// Has to stay clear above the patched cap, or the branch it exists to push
+// out of the way comes back into play at altitude.
+#define FLY_LIMIT_HIGH 60000.0f
+
+static float *fly_height_limit = NULL;
+static float fly_height_stock = 0.0f;
+static int fly_height_saved = 0;
+static int fly_height_applied = 0;
+
+static void fly_limit_set(int high) {
+  if (!fly_height_limit)
+    return;
+
+  if (!fly_height_saved) {
+    fly_height_stock = *fly_height_limit;
+    fly_height_saved = 1;
+    debugPrintf("MENU: rcHeliHeightLimit was %.1f\n", (double)fly_height_stock);
+  }
+
+  *fly_height_limit = high ? FLY_LIMIT_HIGH : fly_height_stock;
+  fly_height_applied = high;
+  debugPrintf("MENU: rcHeliHeightLimit -> %.1f\n", (double)*fly_height_limit);
+}
+
+// ---- the first attempt at the flying ceiling, and why it is gone ----
+//
+// "Fly higher" patched CVehicle::FlyingControl to read its altitude cap from two
+// floats instead of holding them as MOVZ immediates, and parked those floats in
+// VehicleNames -- 0x46e bytes of .data I had convinced myself nothing used.
+//
+// Nothing used it *in the same translation unit*. That is all I actually
+// checked: a grep for `adrp x8, 81a000` paired with `add #0x1c8`. Cross-module
+// access goes through the GOT, and `objdump -R` lists a GLOB_DAT relocation for
+// VehicleNames with five readers (0x343b6c, 0x3a07e8, 0x474268, 0x4ba4d4,
+// 0x4ba604). It sits between HandlingFilename and BOAT_BUOYANCY_DAMPING, in the
+// middle of the vehicle handling data.
+//
+// So the menu wrote floats over live vehicle data at init and then every frame,
+// and every vehicle in the world -- ours and the game's own traffic -- lost its
+// collision and fell through the map. Spawned cars falling was that, and so was
+// the empty street. The user spotted the correlation ("this only started when
+// you added the fly higher limit") long before I did; I was busy proving the
+// spawn code innocent, which it was.
+//
+// The 80.0 cap is real and at FlyingControl+0x69c if this is ever revisited.
+// What it needs is somewhere safe to keep two floats, and **"I grepped and found
+// no readers" is not a proof of that** -- check `objdump -R` for a GOT entry
+// before believing any data symbol is dead.
+
+// ---- always-on toggles ----
+//
+// CPlayerPed::RestoreSprintEnergy (0x45cc28) reads the current sprint energy
+// from +3116 and its maximum from +3120, topping the first up towards the
+// second. Rather than trickle it in, the toggle pins one to the other.
+#define PED_SPRINT_ENERGY 3116
+#define PED_SPRINT_MAX    3120
+
+// Health and armour are floats on the player ped. HealthCheat stores to +1440
+// (str s8, [x0, #1440] at 0x341488) and ArmourCheat to +1444 (0x34233c), both
+// on the pointer FindPlayerPed returns -- so they can be read and written
+// directly, which is what regen and invincibility need.
+#define PED_HEALTH  1440
+#define PED_ARMOUR  1444
+#define PED_MAX     100.0f
+
+// CPed::SetAmmo(type, count) resolves the weapon slot through
+// CWeaponInfo::GetWeaponInfo and returns early when the type has none, so
+// refilling by type is safe: slots the player does not own are skipped by the
+// game's own check rather than by us poking the ped struct.
+#define WEAPON_TYPE_MAX 36
+#define AMMO_TOPUP      9999
+
+typedef void (*set_ammo_fn)(void *ped, int weapon_type, unsigned count);
+static set_ammo_fn ped_set_ammo = NULL;
+
+// Turning unlimited ammo off used to leave everything at 9999, because nothing
+// remembered what you had. CPed::SetAmmo shows where it goes:
+//
+//   x0 = CWeaponInfo::GetWeaponInfo(type)
+//   ldrsw x8, [x0, #96]        ; the ped's weapon slot for that type, -1 if none
+//   madd  x10, x8, #28, x19    ; ped + slot * 28
+//   str   w20, [x10, #1716]    ; ammo
+//
+// so the counts can be read back the same way and put back on the way out.
+// Snapshotting per slot rather than per type matters: several types share a
+// slot, and saving per type would restore whichever one happened to be last.
+typedef void *(*get_weapon_info_fn)(int weapon_type);
+static get_weapon_info_fn get_weapon_info = NULL;
+
+#define WEAPONINFO_SLOT   96
+#define PED_WEAPON_BASE   1716
+#define PED_WEAPON_STRIDE 28
+#define MAX_WEAPON_SLOTS  32
+
+static int ammo_backup[MAX_WEAPON_SLOTS];
+static uint8_t ammo_backup_valid[MAX_WEAPON_SLOTS];
+static int ammo_was_on = 0;
+
+static int weapon_slot_of(int type) {
+  if (!get_weapon_info)
+    return -1;
+  const void *info = get_weapon_info(type);
+  if (!info)
+    return -1;
+  const int slot = *(const int32_t *)((uintptr_t)info + WEAPONINFO_SLOT);
+  return (slot >= 0 && slot < MAX_WEAPON_SLOTS) ? slot : -1;
+}
+
+static int *ammo_cell(void *ped, int slot) {
+  return (int *)((uintptr_t)ped + PED_WEAPON_BASE +
+                 (size_t)slot * PED_WEAPON_STRIDE);
+}
+
+static void ammo_snapshot(void *ped) {
+  memset(ammo_backup_valid, 0, sizeof(ammo_backup_valid));
+  int n = 0;
+  for (int t = 1; t <= WEAPON_TYPE_MAX; t++) {
+    const int slot = weapon_slot_of(t);
+    if (slot < 0 || ammo_backup_valid[slot])
+      continue;
+    ammo_backup[slot] = *ammo_cell(ped, slot);
+    ammo_backup_valid[slot] = 1;
+    n++;
+  }
+  debugPrintf("MENU: saved ammo for %d weapon slots\n", n);
+}
+
+static void ammo_restore(void *ped) {
+  int n = 0;
+  for (int slot = 0; slot < MAX_WEAPON_SLOTS; slot++) {
+    if (!ammo_backup_valid[slot])
+      continue;
+    *ammo_cell(ped, slot) = ammo_backup[slot];
+    n++;
+  }
+  debugPrintf("MENU: restored ammo for %d weapon slots\n", n);
+}
+
+// CWanted lives at ped+0x928: WantedLevelDownCheat does FindPlayerPed(),
+// add x0,#0x928, then CheatWantedLevel(0) -- which is exactly "clear it".
+#define PED_WANTED_OFFSET 0x928
+typedef void (*cheat_wanted_fn)(void *wanted, int level);
+static cheat_wanted_fn cheat_wanted_level = NULL;
+
+typedef enum {
+  MENU_TOG_NEVER_TIRED = 0,
+  MENU_TOG_INVINCIBLE,
+  MENU_TOG_AMMO,
+  MENU_TOG_NEVER_WANTED,
+  MENU_TOG_FLY_HIGHER,
+  MENU_TOG_VEH_INVINCIBLE,
+  MENU_TOG_FLY_ANY,
+  MENU_NUM_TOGGLES
+} menu_toggle;
+
+
+static int menu_toggle_on[MENU_NUM_TOGGLES];
+
+// Save on the way in, put back on the way out. Kept out of the slow tick above
+// so the snapshot happens the instant the toggle flips, before anything has
+// been overwritten with 9999.
+static void menu_apply_ammo_edges(void *ped) {
+  const int on = menu_toggle_on[MENU_TOG_AMMO];
+  if (on == ammo_was_on)
+    return;
+  ammo_was_on = on;
+
+  if (on)
+    ammo_snapshot(ped);
+  else
+    ammo_restore(ped);
+}
+
+// ---- real invincibility ----
+//
+// Pinning health every frame is not immunity: it restores you *after* the hit,
+// so anything that kills outright still kills, and you die between two of our
+// frames. The game has an actual flag, and CPed::InflictDamage gates the whole
+// function on it for the player:
+//
+//   452bb0: bl   FindPlayerPed
+//   452bb4: cmp  x0, x19          is the victim the player?
+//   452bb8: b.eq 452c08           yes:
+//   452c0c: ldrb w8, [x0, #3185]
+//   452c10: cbz  w8, <mov w0, wzr; ret>    zero -> no damage, at all
+//
+// So **ped+3185 is the player's can-be-damaged byte**, and zero means immune.
+// It is the game's own mechanism: CPlayerInfo::MakePlayerSafe clears it and
+// CPlayerPed::SetInitialState puts it back, which is also why it is re-applied
+// every frame here rather than once on the edge.
+#define PED_CAN_BE_DAMAGED 3185
+
+// **This does not cover being blown up in your own car, and no flag does.**
+// CAutomobile::BlowUpCar calls CVehicle::KillPedsInVehicle, which kills the
+// occupants outright:
+//
+//   ldr w8, [x0, #988] / cmp w8, #0x32 / b.ne <SetDie>   ... bl CPed::SetDead
+//
+// There is no damage, no health check and nothing to switch off -- IsPlayer()
+// appears one line later, but only to decide whether the object gets destroyed.
+// The only way to survive the explosion is for it not to happen, so Invincible
+// also keeps the vehicle you are sitting in above the threshold at which it
+// catches fire. 300 is the game's own number for that: it is what
+// ExtinguishCarFire raises health to (`fmaxnm s0, s0, #300.0`). The car still
+// takes damage and still looks wrecked -- it just will not burn down under you.
+// "Vehicle invincible" is the separate toggle for actually indestructible.
+// (invincible_no_burn_tick, further down, does that half -- it needs the vehicle
+// offsets, which are defined later in this file.)
+
+static int invincible_was_on = 0;
+
+static void menu_apply_invincible_edges(void *ped) {
+  const int on = menu_toggle_on[MENU_TOG_INVINCIBLE];
+
+  if (on) {
+    // Every frame, not once: SetInitialState resets it on respawn, and cutscenes
+    // move it about through MakePlayerSafe.
+    *((uint8_t *)ped + PED_CAN_BE_DAMAGED) = 0;
+  } else if (invincible_was_on) {
+    *((uint8_t *)ped + PED_CAN_BE_DAMAGED) = 1;
+    debugPrintf("MENU: player can be damaged again\n");
+  }
+  invincible_was_on = on;
+}
+
+// Runs every frame while the game is live, menu open or not.
+static void menu_apply_toggles(void) {
+  const int want_high = menu_toggle_on[MENU_TOG_FLY_HIGHER];
+  if (want_high != fly_height_applied)
+    fly_limit_set(want_high);
+
+  if (!find_player_ped)
+    return;
+
+  void *ped = find_player_ped();
+  if (!ped)
+    return;
+
+  if (menu_toggle_on[MENU_TOG_NEVER_TIRED]) {
+    float *energy = (float *)((uintptr_t)ped + PED_SPRINT_ENERGY);
+    const float *max = (const float *)((uintptr_t)ped + PED_SPRINT_MAX);
+    if (*energy < *max)
+      *energy = *max;
+  }
+
+  menu_apply_ammo_edges(ped);
+
+  float *health = (float *)((uintptr_t)ped + PED_HEALTH);
+  float *armour = (float *)((uintptr_t)ped + PED_ARMOUR);
+
+  menu_apply_invincible_edges(ped);
+
+  // Invincible pins both every frame on top of the real flag below; regen tops
+  // them up once a second, so you still take damage and recover rather than
+  // never flinching.
+  if (menu_toggle_on[MENU_TOG_INVINCIBLE]) {
+    *health = PED_MAX;
+    *armour = PED_MAX;
+  }
+
+  // Every frame, so stars never get a chance to appear rather than flickering
+  // on and being cleared a second later.
+  if (menu_toggle_on[MENU_TOG_NEVER_WANTED] && cheat_wanted_level)
+    cheat_wanted_level((void *)((uintptr_t)ped + PED_WANTED_OFFSET), 0);
+
+  static int slow_tick = 0;
+  if (++slow_tick < 60)
+    return;
+  slow_tick = 0;
+
+
+  if (menu_toggle_on[MENU_TOG_AMMO] && ped_set_ammo) {
+    for (int t = 1; t <= WEAPON_TYPE_MAX; t++)
+      ped_set_ammo(ped, t, AMMO_TOPUP);
+  }
+}
+
+
+// ---- teleport ----
+//
+// Fixed destinations rather than the map marker. Hunting the marker down in
+// ms_RadarTrace was never the problem -- CPed::Teleport's calling convention
+// was -- but a named list is more useful than a marker anyway: it works with the
+// map closed and needs no setup.
+//
+// The destinations are the game's own map zones. gtalcs.teleport.csi carried
+// each zone as a pair of opposing corners and teleported to the centre of the
+// box, snapped to the ground; these are those boxes reduced to their centres.
+// Names are GXT keys wherever the zone has one, so they come out of the game
+// already localised, and `fallback` only shows if a key is missing.
+typedef struct {
+  const char *key;        // GXT key, or NULL for places the game does not name
+  const char *fallback;
+  float x, y;
+} menu_place;
+
+// Roughly south to north, so walking the list walks the city.
+static const menu_place menu_places[] = {
+  { "PORT_W",   "Portland Harbor",         908.68f, -1068.47f },
+  { "PORT_S",   "Callahan Point",         1283.88f, -1160.74f },
+  { "PORT_E",   "Atlantic Quays",         1589.68f,  -841.65f },
+  { "PORT_I",   "Trenton",                1214.63f,  -905.95f },
+  { "S_VIEW",   "Portland View",          1214.85f,  -627.31f },
+  { "CHINA",    "Chinatown",               905.42f,  -685.99f },
+  { "REDLIGH",  "Red Light District",      905.38f,  -373.12f },
+  { "TOWERS",   "Hepburn Heights",         905.42f,  -180.58f },
+  { "LITTLEI",  "Saint Marks",            1227.40f,  -295.32f },
+  { "HARWOOD",  "Harwood",                1067.48f,   122.25f },
+  { "EASTBAY",  "Portland Beach",         1593.48f,  -206.92f },
+  { "IND_ZON",  "Portland",               1259.91f,  -447.80f },
+  { NULL,       "Portland police",        1159.08f,  -663.02f },
+  { NULL,       "Portland hospital",      1159.09f,  -565.57f },
+  { NULL,       "Markos bistro",          1376.47f,  -562.94f },
+  { "ROADBR2",  "Callahan Bridge",         529.82f,  -933.30f },
+  { "CONSTRU",  "Fort Staunton",           427.10f,  -236.62f },
+  { "STADIUM",  "Aspatria",                -54.76f,  -126.05f },
+  { "YAKUSA",   "Torrington",              388.77f, -1366.18f },
+  { "SHOPING",  "Bedford Point",           -12.44f, -1338.25f },
+  { "COM_EAS",  "Newport",                 407.61f,  -735.69f },
+  { "PARK",     "Belleville Park",          38.85f,  -708.07f },
+  { "UNIVERS",  "Liberty Campus",          178.27f,  -236.62f },
+  { "HOSPI_2",  "Rockford",                366.24f,   103.89f },
+  { "BIG_DAM",  "Cochrane Dam",          -1131.01f,   398.99f },
+  { "AIRPORT",  "Francis Intl Airport",  -1050.80f,  -806.58f },
+  { "PROJECT",  "Wichita Gardens",        -591.44f,   -87.67f },
+  { "SWANKS",   "Cedar Grove",            -567.07f,   371.72f },
+  { "SUB_IND",  "Pike Creek",            -1109.94f,   -87.61f },
+};
+#define MENU_NUM_PLACES ((int)(sizeof(menu_places) / sizeof(menu_places[0])))
+
+// The game's own zone table, which is the authority on both where a zone is and
+// what it is called. The coordinates above came from reading a CLEO script's
+// data, and teleporting to "Atlantic Quays" put the player in Portland Harbor,
+// so that reading was wrong somewhere -- most likely the mapping from menu entry
+// to coordinate block. Rather than re-guess it, ask the game.
+//
+// gpTheZones is a CTheZones*. CZone is 72 bytes: an 8-byte label at +0, the box
+// minimum at +8/+12/+16 and its maximum at +20/+24/+28, per
+// CTheZones::PointLiesWithinZone.
+#define ZONE_STRIDE 72
+#define ZONE_MIN     8
+#define ZONE_MAX    20
+
+// Landing on the road rather than on the geometry directly under the zone's
+// centre. FindGroundZForCoord returns whatever surface is highest at that x/y,
+// so a zone whose middle happens to be a building -- Saint Mark's, for one --
+// put the player on its roof.
+//
+// The path network has no such problem: every node is a road. VehicleCheat uses
+// the same call to place a car, and reads the node back the same way -- node
+// records are 20 bytes with x, y and z as int16 at +4, +6 and +8, each an eighth
+// of a world unit (its scvtf is followed by fmul by 0.125).
+#define PATHNODE_STRIDE 20
+#define PATHNODE_X       4
+#define PATHNODE_SCALE   0.125f
+#define PATHNODE_SEARCH  200.0f
+
+typedef int (*find_node_fn)(void *paths, const float *coors, unsigned char type,
+                            float dist, int a, int b, int c, int d);
+static void **gp_the_paths = NULL;
+static find_node_fn find_node_closest = NULL;
+
+// Puts the nearest road position to x/y in `out`, or returns 0.
+static int road_near(float x, float y, float z, float *out) {
+  if (!gp_the_paths || !find_node_closest)
+    return 0;
+  void *paths = *gp_the_paths;
+  if (!paths)
+    return 0;
+
+  const float coors[3] = { x, y, z };
+  const int idx = find_node_closest(paths, coors, 0, PATHNODE_SEARCH, 0, 0, 0, 0);
+  if (idx < 0)
+    return 0;
+
+  const uint8_t *nodes = *(const uint8_t **)paths;
+  if (!nodes)
+    return 0;
+
+  const int16_t *p =
+      (const int16_t *)(nodes + (size_t)idx * PATHNODE_STRIDE + PATHNODE_X);
+  out[0] = p[0] * PATHNODE_SCALE;
+  out[1] = p[1] * PATHNODE_SCALE;
+  out[2] = p[2] * PATHNODE_SCALE;
+  return 1;
+}
+
+typedef short (*find_zone_label_fn)(void *zones, char *label, int type);
+typedef void *(*get_zone_fn)(void *zones, unsigned short index);
+typedef uint16_t *(*zone_name_fn)(void *zone);
+
+static void **gp_the_zones = NULL;
+static find_zone_label_fn find_zone_by_label = NULL;
+static get_zone_fn get_nav_zone = NULL;
+static get_zone_fn get_info_zone = NULL;
+static get_zone_fn get_map_zone = NULL;
+static zone_name_fn zone_translated_name = NULL;
+
+// Which of the four zone types holds the named zones is not obvious from the
+// disassembly -- the label search branches on type and each type has its own
+// array and accessor -- so all three are tried and the one that answers is
+// logged.
+static const struct { int type; const char *what; } zone_types[] = {
+  { 0, "navigation" }, { 3, "map" }, { 2, "info" },
+};
+#define NUM_ZONE_TYPES ((int)(sizeof(zone_types) / sizeof(zone_types[0])))
+
+static get_zone_fn zone_getter(int type) {
+  switch (type) {
+    case 3:  return get_map_zone;
+    case 2:  return get_info_zone;
+    default: return get_nav_zone;
+  }
+}
+
+// Fills in the centre of the named zone and, where the game has one, its
+// display name. Returns 0 if the game does not know the label.
+static int zone_lookup(const char *key, float *cx, float *cy,
+                       char *name, int name_len) {
+  if (!key || !gp_the_zones || !find_zone_by_label)
+    return 0;
+  void *zones = *gp_the_zones;
+  if (!zones)
+    return 0;
+
+  // The label is copied because the search writes through its argument.
+  char label[16];
+  snprintf(label, sizeof(label), "%s", key);
+
+  for (int t = 0; t < NUM_ZONE_TYPES; t++) {
+    const get_zone_fn get = zone_getter(zone_types[t].type);
+    if (!get)
+      continue;
+
+    const short idx = find_zone_by_label(zones, label, zone_types[t].type);
+    if (idx < 0)
+      continue;
+
+    const uint8_t *z = (const uint8_t *)get(zones, (unsigned short)idx);
+    if (!z)
+      continue;
+
+    const float *mn = (const float *)(z + ZONE_MIN);
+    const float *mx = (const float *)(z + ZONE_MAX);
+    *cx = (mn[0] + mx[0]) * 0.5f;
+    *cy = (mn[1] + mx[1]) * 0.5f;
+
+    // CZone::GetTranslatedName goes through the same CText the HUD uses to
+    // print the zone you are standing in, so it sidesteps our own GXT lookup.
+    if (name && zone_translated_name) {
+      const uint16_t *w = zone_translated_name((void *)z);
+      if (w && w[0]) {
+        int n = 0;
+        for (; w[n] && n < name_len - 1; n++)
+          name[n] = (w[n] < 0x80) ? (char)w[n] : '?';
+        name[n] = 0;
+      }
+    }
+
+    debugPrintf("MENU: zone \"%s\" found as %s zone %d, centre %.1f, %.1f\n",
+                key, zone_types[t].what, (int)idx, *cx, *cy);
+    return 1;
+  }
+
+  debugPrintf("MENU: zone \"%s\" not found in any zone type\n", key);
+  return 0;
+}
+
+// Resolved the first time the list is opened rather than in menu_init: neither
+// the zones nor CText are up that early.
+// Which island a place is on. Asked of the game rather than sorted by hand:
+// CTheZones::GetLevelFromPosition returns the eLevelName, which is exactly the
+// first/second/third city split.
+enum { PLACE_CAT_PORTLAND = 0, PLACE_CAT_STAUNTON, PLACE_CAT_SHORESIDE,
+       PLACE_NUM_CATS };
+
+static const char *const place_cat_name[PLACE_NUM_CATS] = {
+  "1 - Portland", "2 - Staunton Island", "3 - Shoreside Vale",
+};
+
+// Takes gpTheZones as `this`; the vector is the second argument. Passing the
+// vector as `this` returned garbage levels and then faulted outright.
+typedef int (*level_from_pos_fn)(void *zones, const float *pos);
+static level_from_pos_fn level_from_position = NULL;
+
+// ---- the map marker ----
+//
+// This was dropped once as unfixable. It was not: the marker scan was always
+// right, and what broke it was CPed::Teleport's CVector arriving by pointer
+// rather than in the float registers. With that understood it is worth having
+// back, so the marker sits at the top of the teleport list.
+//
+// CRadar::ms_RadarTrace is 75 entries of 60 bytes. CRadar::SetTargetBlip walks
+// the array testing +43 for a free slot and writes the position at +12; +40 is
+// the blip type, where 4 is a coordinate blip -- the kind a marker you place on
+// the map is, as opposed to the char blip (2) a mission contact gets.
+#define BLIP_STRIDE 60
+#define BLIP_COUNT  75
+#define BLIP_INUSE  43
+#define BLIP_POS    12
+
+// The marker *you* place, as opposed to the ones the game puts on the map for
+// home, missions and shops. CRadar::SetTargetBlip stamps sprite 49 at +56:
+//
+//   mov  w12, #0x31            ; 49
+//   strh w12, [x8, #56]
+//
+// and no other blip gets that sprite. The previous version matched on +40 being
+// 4, which is why it happily teleported to the home marker: +40 is not a blip
+// type at all, it is a generation counter that SetTargetBlip reads, increments
+// and writes back. Small values there meant nothing.
+#define BLIP_SPRITE          56
+#define BLIP_SPRITE_WAYPOINT 49
+
+static uint8_t *radar_trace = NULL;
+
+// The marker you place is not a radar blip at all.
+//
+// The blip dump settled that: with a marker on the map, ms_RadarTrace held
+// exactly two entries -- sprite 40 next to the player and sprite 19 on the home
+// icon, which is the one it kept teleporting to. Nothing for the waypoint.
+// CRadar::MapWayPoint is 8 bytes and looks right, but only CRadar::Shutdown and
+// LoadAllRadarBlips touch it, so it is not where a live marker lives either.
+//
+// CMenuManager keeps it: m_TargetIsOn is a byte saying whether one is placed and
+// m_fTargetPos is the two floats. Both are logged, so if the coordinates turn
+// out to be map-space rather than world-space that will be obvious rather than
+// mysterious.
+static uint8_t *menu_target_on = NULL;
+static float *menu_target_pos = NULL;
+static float *radar_map_waypoint = NULL;   // CRadar::MapWayPoint, two floats
+static int *menu_target_blip_index = NULL;
+// The map target, two floats inside the RadarMap object.
+#define RADARMAP_TARGET 128
+// And the byte that says a marker exists at all.
+#define RADARMAP_TARGET_SET 120
+
+static void **gp_radar_map = NULL;   // GRadarMap
+
+// Where the marker you place actually lives is still unknown, so this reports
+// every candidate at once rather than guessing at a fourth.
+//
+// Ruled out so far, each by looking rather than reasoning:
+//   - ms_RadarTrace holds only two blips with a marker placed, sprite 40 by the
+//     player and sprite 19 on the home icon. The array is the right one: it is
+//     0x1194 bytes, exactly 75 x 60, and +43 is the in-use byte per
+//     CRadar::SetTargetBlip's own free-slot scan.
+//   - CMenuManager::m_TargetIsOn stays 0 and m_fTargetPos stays 0,0.
+//   - CRadar::MapWayPoint and m_TargetBlipIndex have no writers at all outside
+//     save/load -- checked for both GOT access and same-module addressing.
+//
+// Something draws that pin on the map and on the radar, so the data exists. The
+// blip sweep below now reports any slot with a non-zero position regardless of
+// its in-use byte, in case the marker is stored with a different convention.
+// Liberty City fits comfortably inside +/-3000 on both axes, so anything
+// outside that is not a place -- it is a field that happens to be non-zero.
+//
+// CRadar::MapWayPoint read back as -12921941685960704.0, my "non-zero means
+// valid" test accepted it, and the teleport that followed took the game down.
+// Any coordinate that comes from guessing at a field has to be checked before it
+// reaches CPed::Teleport, and honestly all of them should be.
+#define WORLD_LIMIT 3000.0f
+
+// Above this much clearance, treat the vehicle as flying and preserve altitude
+// rather than dropping it onto the destination. Ordinary driving never gets this
+// far off the ground; a jump does, briefly, and landing in the air is harmless.
+#define AIRBORNE_MIN 8.0f
+
+static int menu_pos_sane(float x, float y) {
+  // NaN fails every comparison, which is what the first test is for.
+  if (!(x == x) || !(y == y))
+    return 0;
+  return x > -WORLD_LIMIT && x < WORLD_LIMIT &&
+         y > -WORLD_LIMIT && y < WORLD_LIMIT;
+}
+
+static int menu_find_marker(float *out_x, float *out_y) {
+  if (gp_radar_map && *gp_radar_map) {
+    const float *target = (const float *)((uintptr_t)*gp_radar_map + RADARMAP_TARGET);
+    // The flag is the **byte at +120**, and the only thing that could have found
+    // it was a with/without diff taken inside one session. Place a marker,
+    // teleport, remove it, press again: exactly one word of 320 changes.
+    //
+    //   with marker:  +96: ... 4372918c 42d6ee67 40400000 00000001 3f800000
+    //   after remove: +96: ... 4372918c 42d6ee67 40400000 00000000 3f800000
+    //
+    // RadarMap::Update agrees, in two places:
+    //
+    //   ldrb w8, [x19, #120] / eor w9, w8, #0x1 / strb w9, [x19, #120]
+    //   cbnz w8, <skip>      ... then compute and store the position at +128
+    //
+    // It is a **toggle**: confirming on the map flips it, so placing a marker
+    // sets it and pressing again on the same spot clears it. The position at
+    // +128 is only written on the 0 -> 1 edge, which is why a cleared marker
+    // leaves the old coordinates sitting there intact.
+    //
+    // I called +136 the flag before this. It fit the two samples I had, but the
+    // "no marker" one was taken before a marker had ever been placed that
+    // session rather than after one was removed -- and +136 never returns to 0
+    // once set, so every cleared marker still teleported. **A before/after pair
+    // has to straddle the transition, not start outside it.**
+    if (*(const uint8_t *)((uintptr_t)*gp_radar_map + RADARMAP_TARGET_SET) &&
+        menu_pos_sane(target[0], target[1])) {
+      debugPrintf("MENU: marker set at %g, %g\n", (double)target[0],
+                  (double)target[1]);
+      *out_x = target[0];
+      *out_y = target[1];
+      return 1;
+    }
+
+    // No marker is a definite answer, not a reason to fall through to the game's
+    // own blips -- home and mission icons are exactly what must not be used.
+    debugPrintf("MENU: no marker set (+128 still holds %g, %g)\n",
+                (double)target[0], (double)target[1]);
+    return 0;
+  }
+
+  // The blip array is not a source and never was. With a marker placed it holds
+  // only the player (sprite 40) and the home icon (19) -- the marker is not a
+  // blip in this build. Nor are the globals that sound right: every GOT
+  // reference to CMenuManager::m_TargetIsOn, m_fTargetPos and m_TargetBlipIndex,
+  // and to CRadar::MapWayPoint, resolves to SetSaveData or LoadSaveData and
+  // nothing else, and CRadar::SetTargetBlip has one caller in the binary, which
+  // is LoadSaveData. They are save-game fields.
+  return 0;
+}
+
+static char place_label[MENU_NUM_PLACES][40];
+static float place_x[MENU_NUM_PLACES];
+static float place_y[MENU_NUM_PLACES];
+static int place_cat[MENU_NUM_PLACES];
+static int places_labelled = 0;
+
+static void menu_label_places(void) {
+  if (places_labelled)
+    return;
+  places_labelled = 1;
+
+  int from_zone = 0, from_gxt = 0;
+  for (int i = 0; i < MENU_NUM_PLACES; i++) {
+    // Start from the scraped table, then let the game overrule it.
+    place_x[i] = menu_places[i].x;
+    place_y[i] = menu_places[i].y;
+    snprintf(place_label[i], sizeof(place_label[i]), "%s", menu_places[i].fallback);
+
+    char name[40];
+    name[0] = 0;
+    if (zone_lookup(menu_places[i].key, &place_x[i], &place_y[i],
+                    name, sizeof(name))) {
+      from_zone++;
+      if (name[0])
+        snprintf(place_label[i], sizeof(place_label[i]), "%s", name);
+    } else if (gxt_lookup(menu_places[i].key, name, sizeof(name))) {
+      from_gxt++;
+      snprintf(place_label[i], sizeof(place_label[i]), "%s", name);
+    }
+
+    // eLevelName is 1-based with 0 meaning "no level", so anything the game
+    // will not place falls back to Portland rather than off the end of the
+    // category array.
+    place_cat[i] = PLACE_CAT_PORTLAND;
+    if (level_from_position && gp_the_zones) {
+      const float pos[3] = { place_x[i], place_y[i], 0.0f };
+      void *zones = gp_the_zones ? *gp_the_zones : NULL;
+      const int level = zones ? level_from_position(zones, pos) : 0;
+      if (level >= 1 && level <= PLACE_NUM_CATS)
+        place_cat[i] = level - 1;
+      else
+        debugPrintf("MENU: \"%s\" has level %d, filed under Portland\n",
+                    place_label[i], level);
+    }
+  }
+
+  debugPrintf("MENU: %d/%d places located from the game's zones (%d named by GXT)\n",
+              from_zone, MENU_NUM_PLACES, from_gxt);
+  debugPrintf("MENU: CText::msInstance = %p, gpTheZones = %p\n",
+              ctext_instance ? *ctext_instance : NULL,
+              gp_the_zones ? *gp_the_zones : NULL);
+}
+
+// ---- vehicle spawner ----
+//
+// VehicleCheat(modelId) looked like the whole spawner, and it is the call
+// TankCheat makes -- but it is only safe for two of the four vehicle classes.
+// It picks the class by model id alone:
+//
+//   sub w8, w19, #0xca / cmp w8, #8 / b.hi   ->  CBike for 202..210,
+//                                               CAutomobile for everything else
+//
+// so a boat gets built as a CAutomobile and the game dies the moment anything
+// touches it. That is exactly what happened with the Reefer and the Speeder.
+// (TankCheat gets away with it because it skips planes and never lands on a
+// boat often enough to matter.)
+//
+// It also places the vehicle on the nearest path node within 100 units of the
+// player, which is why cars kept appearing out of view or across the street.
+//
+// So the spawn is done here instead, following VehicleCheat's own sequence --
+// request, load, allocate, construct, write the matrix, CWorld::Add -- with the
+// class chosen from CModelInfo rather than from an id range, and the position
+// taken from the player rather than from a path node.
+#define VEH_MATRIX  16    // three 16-byte rotation rows, +16..+63
+#define VEH_POS     64    // x,y at +64/+68 and z at +72
+#define VEH_FLAGS   88    // entity flags; the status is five bits at bit 4
+#define VEH_STATUS_MASK 0x1f0ULL
+
+// Which island the entity is on. SpawnInModel writes the vehicle's at +390;
+// CEntity::SetupBigBuilding writes a building's at +126, which is a different
+// field and the wrong one to copy for a vehicle.
+#define ENTITY_LEVEL 390
+
+// The player's forward vector is the second matrix row: CPlaceable::SetHeading
+// builds row0 = (cos, sin, 0) and row1 = (-sin, cos, 0), and GTA faces +y.
+#define PED_FORWARD (VEH_MATRIX + 16)
+#define SPAWN_AHEAD 5.0f
+
+// Planes and trains are deliberately absent: LCS has no flyable plane -- nothing
+// in this build even calls CPlane's constructor -- and trains need rails.
+typedef enum { VEH_AUTO = 0, VEH_BIKE, VEH_BOAT, VEH_HELI } veh_kind;
+
+// SpawnInModel(int model, CVector &pos) is the game's own vehicle spawner, and
+// hand-rolling one instead was the whole problem. Ours built the vehicle and
+// added it to the world, and it fell straight through the map -- x and y frozen,
+// z going 11.7, 10.5, 4.6, -6.4, -22.5, -43.5 until CWorld::RemoveFallenCars
+// swept it up below -100. Boats did not even manage that; their z came out NaN.
+//
+// The game's version does a dozen things ours did not, and rather than guess
+// which one grants collision, this now calls it. Among the differences:
+//
+//   RequestModel(id, 4)          not 1
+//   constructors take createdBy 2, not 1
+//   CBike / CHeli / CBoat / CAutomobile chosen by the Is*Model predicates,
+//     with CHeli::ActivateHeli(false) and a bike-specific flag at +1540
+//   z = FindGroundZForCoord + CEntity::GetDistanceFromCentreOfMassToBaseOfModel
+//     -- the model's own height, rather than our flat +1.0
+//   CCarCtrl::JoinCarWithRoadSystem
+//   several flag writes at +717, and the level byte at +390, not +126
+//
+// The CVector is by reference and is written back with the settled position, so
+// the log shows where the vehicle actually ended up.
+typedef void (*spawn_in_model_fn)(int model, float *pos);
+static spawn_in_model_fn spawn_in_model = NULL;
+
+// The one that works. TankCheat and TrashmasterCheat both go through it.
+typedef void (*vehicle_cheat_fn)(int model);
+static vehicle_cheat_fn vehicle_cheat = NULL;
+
+static const char *const veh_kind_name[] = { "Car", "Bike", "Boat", "Helicopter" };
+
+// Streaming and classification are still ours -- the list is built from the
+// model table and peds are loaded the same way -- but nothing here constructs a
+// vehicle any more. SpawnInModel does that, and does it correctly.
+typedef void *(*get_model_info_fn)(const char *name, int *id_out);
+typedef void (*request_model_fn)(int model, int flags);
+typedef void (*load_all_models_fn)(int prio);
+typedef char (*is_model_fn)(int model);
+
+static get_model_info_fn get_model_info = NULL;
+static request_model_fn request_model = NULL;
+static load_all_models_fn load_all_models = NULL;
+static is_model_fn is_car_model = NULL;
+static is_model_fn is_bike_model = NULL;
+static is_model_fn is_boat_model = NULL;
+static is_model_fn is_heli_model = NULL;
+static is_model_fn is_in_cd_image = NULL;
+
+// How many model slots exist, so the table can be walked end to end.
+static const int *num_model_infos = NULL;
+
+// Classifies a model id, or returns -1 for anything this menu cannot construct
+// (planes, trains, and every non-vehicle model).
+static int veh_classify(int id) {
+  if (is_bike_model && is_bike_model(id)) return VEH_BIKE;
+  if (is_boat_model && is_boat_model(id)) return VEH_BOAT;
+  if (is_heli_model && is_heli_model(id)) return VEH_HELI;
+  if (is_car_model && is_car_model(id))   return VEH_AUTO;
+  return -1;
+}
+
+// Model ids are per-build, so the menu resolves them by name:
+// CModelInfo::GetModelInfo hashes the name and searches, writing the id out.
+// LCS keeps only those hashes -- there is no name table to enumerate, which is
+// why this list is the one place a name has to be spelled out. Anything that
+// does not resolve is dropped and logged rather than left in the menu doing
+// nothing when picked.
+// The game names its own vehicles. CCurrentVehicle::Display -- the code behind
+// the vehicle name that flashes bottom-right when you get in -- does:
+//
+//   w8  = vehicle->[124]                 (model index)
+//   x20 = CModelInfo::ms_modelInfoPtrs[w8]
+//   x1  = x20 + 0x52                     (the GXT key, inline in the model info)
+//   CHud::SetVehicleName(CText::Get(x1))
+//
+// So every vehicle carries its own key at model info +0x52, and CText turns it
+// into the real name -- localised, and correct by construction. That replaces
+// the hand-written name list this used to carry entirely: no spellings to guess,
+// nothing to get wrong, and the twenty numbered entries get proper names.
+#define MODELINFO_GXT_KEY 0x52
+
+static void ***ms_model_info_ptrs = NULL;
+
+// The six the game has no name for, identified from screenshots of each one
+// spawned. All are helicopters, and all of them fly -- even though their model
+// info types them as cars, so the menu builds them as CAutomobile. Flight in
+// this engine evidently comes from the handling data, not the model type.
+//
+// (Models 198 and 199, the two the game does type as helicopters, are the ones
+// you cannot fly: they are scripted traffic and take off by themselves.)
+//
+// 211, 212 and 216 have no textures in this build. That is the game's data
+// missing, not something the menu should be apologising for in its own list, so
+// the names are just the names. Labelling any of them by model number was worse
+// than useless: it said car, and what appeared was a Hunter.
+// Model 198 crashes the game on spawn. Both it and 199 are typed as
+// helicopters and both go through the identical CHeli path, so the class is not
+// the problem -- 198 itself is incomplete, like the untextured models nearby.
+// The likely mechanism is in the constructor:
+//
+//   ldr x0, [x19, #112]                     (the clump SetModelIndex installed)
+//   bl  CElementGroupModelInfo::FillNodeArray
+//
+// FillNodeArray walks the model's node hierarchy for the rotor bones, so a model
+// with no geometry hands it a null and it dies there. That is a theory, not a
+// finding -- what is certain is that this one entry crashes, so it is not
+// offered. The collision-model check in menu_spawn_vehicle is the general
+// version of the same guard, and the log will say if it ever catches anything.
+// Models kept out of the list, and why. All three are things you would pick once
+// and regret: a crash, a duplicate, and a helicopter that leaves without you.
+static const struct { int id; const char *why; } veh_excluded[] = {
+  { 198, "crashes on spawn" },
+  { 199, "takes off by itself, cannot be flown" },
+};
+#define NUM_VEH_EXCLUDED ((int)(sizeof(veh_excluded) / sizeof(veh_excluded[0])))
+
+static int veh_model_excluded(int id) {
+  for (int i = 0; i < NUM_VEH_EXCLUDED; i++)
+    if (veh_excluded[i].id == id)
+      return 1;
+  return 0;
+}
+
+static const char *veh_exclude_reason(int id) {
+  for (int i = 0; i < NUM_VEH_EXCLUDED; i++)
+    if (veh_excluded[i].id == id)
+      return veh_excluded[i].why;
+  return "";
+}
+
+// Helicopters the model table calls cars. They fly, so they belong under Air
+// even though they are built as CAutomobile.
+static int veh_model_is_air(int id) {
+  if (id == 164)          // the Dodo: a plane the model table calls a car
+    return 1;
+  return id >= 211 && id <= 216;
+}
+
+// Collision model pointer, from CBaseModelInfo::GetColModelPtr: ldr x0,[x0,#48].
+#define MODELINFO_COL_MODEL 48
+
+static const struct { int id; const char *name; } veh_extra_names[] = {
+  // 211 and 212 are not the same model twice: DEFAULT.IDE calls them rcgoblin
+  // and rcraider. Both ship without textures in this build.
+  { 164, "Dodo" },                  // a plane, filed under Air; it cannot fly yet
+  { 211, "RC Goblin" },
+  { 212, "RC Raider" },
+  { 213, "Hunter" },             // olive attack helicopter, rockets and minigun
+  { 214, "Maverick" },           // civilian, cream with a blue stripe
+  { 215, "Police Maverick" },    // LCPD markings, tail number P619PD
+  { 216, "News Maverick" },      // its vcnmav textures are missing in this build
+};
+#define NUM_VEH_EXTRA_NAMES \
+  ((int)(sizeof(veh_extra_names) / sizeof(veh_extra_names[0])))
+
+static const char *veh_extra_name(int id) {
+  for (int i = 0; i < NUM_VEH_EXTRA_NAMES; i++)
+    if (veh_extra_names[i].id == id)
+      return veh_extra_names[i].name;
+  return NULL;
+}
+
+// The model info record for a model id, or NULL.
+static const uint8_t *model_info_for(int id) {
+  if (!ms_model_info_ptrs || !num_model_infos)
+    return NULL;
+  if (id < 0 || id >= *num_model_infos)
+    return NULL;
+  void **table = *ms_model_info_ptrs;
+  return table ? (const uint8_t *)table[id] : NULL;
+}
+
+// Whether a model's geometry is actually resident, asked the way the game asks
+// it: the seventh entry of CBaseModelInfo's vtable (ldr x8,[x0]; ldr x8,[x8,#48])
+// returns the clump, and a null one means the model is not there. Constructing
+// a ped or a vehicle against that is a null dereference inside the constructor,
+// which is exactly what a crash with no log line before it looks like.
+#define MODELINFO_VT_GET_CLUMP 6
+
+static int model_has_clump(int id) {
+  const uint8_t *info = model_info_for(id);
+  if (!info)
+    return 0;
+  void *const *vtable = *(void *const *const *)info;
+  if (!vtable)
+    return 0;
+  typedef void *(*get_clump_fn)(const void *self);
+  const get_clump_fn get_clump = (get_clump_fn)vtable[MODELINFO_VT_GET_CLUMP];
+  return get_clump && get_clump(info) != NULL;
+}
+
+// Writes the game's display name for a model, or returns 0.
+static int vehicle_game_name(int id, char *out, int len) {
+  if (!ms_model_info_ptrs || !num_model_infos)
+    return 0;
+  if (id < 0 || id >= *num_model_infos)
+    return 0;
+
+  void **table = *ms_model_info_ptrs;
+  if (!table)
+    return 0;
+  const uint8_t *info = (const uint8_t *)table[id];
+  if (!info)
+    return 0;
+
+  const char *key = (const char *)(info + MODELINFO_GXT_KEY);
+  return gxt_lookup(key, out, len);
+}
+
+// The list actually shown. It is built from the game's model table rather than
+// from the names above, so every vehicle in the build is spawnable whether or
+// not we know what it is called: the names only decide how an entry is
+// labelled. Anything unnamed still appears, as "Car 173" or "Boat 191", and is
+// spawned exactly the same way.
+// `cat` is what the list groups by and `kind` is what gets constructed. They
+// disagree on purpose: models 211-216 are helicopters the game types as cars, so
+// they build as CAutomobile but belong under Air.
+enum { VEH_CAT_LAND = 0, VEH_CAT_SEA, VEH_CAT_AIR, VEH_NUM_CATS };
+
+static const char *const veh_cat_name[VEH_NUM_CATS] = {
+  "Land", "Sea", "Air",
+};
+
+typedef struct {
+  char label[28];
+  int id;
+  veh_kind kind;
+  int cat;
+} menu_veh_entry;
+
+#define MENU_VEHICLE_MAX 160
+static menu_veh_entry veh_list[MENU_VEHICLE_MAX];
+static int vehicles_ready = 0;
+
+static void veh_add(int id, veh_kind kind, int cat, const char *label) {
+  if (vehicles_ready >= MENU_VEHICLE_MAX)
+    return;
+  menu_veh_entry *e = &veh_list[vehicles_ready++];
+  e->id = id;
+  e->kind = kind;
+  e->cat = cat;
+  snprintf(e->label, sizeof(e->label), "%s", label);
+}
+
+
+// Model ids only exist once the model info table has been built, which is long
+// after patch_game, so this runs the first time the menu is opened in-game.
+static void menu_resolve_vehicles(void) {
+  static int done = 0;
+  if (done || !num_model_infos)
+    return;
+  done = 1;
+
+  // Every vehicle model the game has, in model order, each named by the game.
+  const int total = *num_model_infos;
+  int named = 0;
+  for (int id = 0; id < total; id++) {
+    const int kind = veh_classify(id);
+    if (kind < 0)
+      continue;
+    if (is_in_cd_image && !is_in_cd_image(id))
+      continue;
+    if (veh_model_excluded(id)) {
+      debugPrintf("MENU: model %d not listed (%s)\n", id, veh_exclude_reason(id));
+      continue;
+    }
+
+    char label[28];
+    // Our own label wins where we have one: the game's name for the RC
+    // helicopter is no name at all, and nothing it says distinguishes the six
+    // helicopters it calls cars.
+    const char *extra = veh_extra_name(id);
+    if (extra)
+      snprintf(label, sizeof(label), "%s", extra);
+    else if (vehicle_game_name(id, label, sizeof(label)))
+      named++;
+    else
+      snprintf(label, sizeof(label), "%s %d", veh_kind_name[kind], id);
+
+    // Air covers both the models the game types as helicopters and the ones it
+    // types as cars but which fly anyway.
+    int cat;
+    if (kind == VEH_HELI || veh_model_is_air(id))
+      cat = VEH_CAT_AIR;
+    else if (kind == VEH_BOAT)
+      cat = VEH_CAT_SEA;
+    else
+      cat = VEH_CAT_LAND;
+
+    veh_add(id, (veh_kind)kind, cat, label);
+  }
+
+  const int unnamed = vehicles_ready - named;
+
+  int by_kind[4] = { 0, 0, 0, 0 };
+  for (int i = 0; i < vehicles_ready; i++)
+    by_kind[veh_list[i].kind]++;
+
+  debugPrintf("MENU: %d vehicles (%d named, %d unnamed) -- "
+              "%d cars, %d bikes, %d boats, %d helicopters\n",
+              vehicles_ready, named, unnamed,
+              by_kind[VEH_AUTO], by_kind[VEH_BIKE],
+              by_kind[VEH_BOAT], by_kind[VEH_HELI]);
+
+  // Every unnamed entry, so the numbers can be matched up in game and turned
+  // into real names in the table above.
+  for (int i = named; i < vehicles_ready; i++)
+
+  // Vehicles said to exist in LCS but not normally reachable. The spawn list is
+  // built by walking the model table and keeping whatever the Is*Model
+  // predicates call a vehicle, so anything present *and* typed as a vehicle is
+  // already in it -- but a model that exists with some other type would be
+  // skipped silently. Asking by name settles both questions at once: the id if
+  // the game knows the name at all, and the classification if it does.
+  if (get_model_info) {
+    // Asked of the running game rather than read out of anyone's data file.
+    // The first two confirm that 211 and 212 are two different RC vehicles; the
+    // rest are the ones said to exist but be unreachable.
+    static const char *const probe[] = {
+      "rcgoblin", "rcraider",
+      "corpse", "mafiablood", "mini", "speakermav", "topfun", "deaddodo",
+      "escape",
+    };
+    for (int i = 0; i < (int)(sizeof(probe) / sizeof(probe[0])); i++) {
+      int id = -1;
+      if (!get_model_info(probe[i], &id) || id < 0) {
+        debugPrintf("MENU: extra model \"%s\" is not in this build\n", probe[i]);
+        continue;
+      }
+      const int kind = veh_classify(id);
+      debugPrintf("MENU: extra model \"%s\" = %d, %s, cd image %d\n", probe[i],
+                  id, kind < 0 ? "NOT a spawnable vehicle" : veh_kind_name[kind],
+                  is_in_cd_image ? is_in_cd_image(id) : -1);
+    }
+  }
+
+  // One probe with a key the game itself uses (VehicleCheat passes "CHEAT1" to
+  // CText::Get), so a zone-name miss can be told apart from the text system not
+  // answering at all.
+  char probe[40];
+  debugPrintf("MENU: GXT probe CHEAT1 -> %s\n",
+              gxt_lookup("CHEAT1", probe, sizeof(probe)) ? probe : "(miss)");
+}
+
+// ---- bodyguards ----
+//
+// CPopulation::AddPed takes its CVector by reference (RK7CVector in the mangled
+// name), so unlike CPed::Teleport this one genuinely does want a pointer.
+// ChooseGangOccupation picks a member model for a gang, so no ped model ids are
+// hardcoded here either.
+typedef void *(*add_ped_fn)(int ped_type, unsigned model, const float *pos,
+                           int a, int b);
+static add_ped_fn population_add_ped = NULL;
+typedef int (*choose_gang_fn)(int gang);
+static choose_gang_fn choose_gang_occupation = NULL;
+// CPed::SetPlayerToFollow(int) is the follow-the-player primitive: it stores the
+// player index at +473 and moves the ped into the follow state at +988.
+typedef void (*set_player_to_follow_fn)(void *ped, int player);
+// CPed::SetLeader(CPed*) -- one store, null-checked. Unlike
+// SetPlayerToFollow, which dereferences a field a new ped does not have.
+typedef void (*set_leader_fn)(void *ped, void *leader);
+static set_leader_fn ped_set_leader = NULL;
+typedef void (*give_weapon_fn)(void *ped, int weapon, unsigned ammo, int select);
+static give_weapon_fn ped_give_weapon = NULL;
+typedef void (*set_current_weapon_fn)(void *ped, int weapon);
+static set_current_weapon_fn ped_set_current_weapon = NULL;
+
+#define PEDTYPE_GANG1     7
+#define BODYGUARD_GANG    0
+#define BODYGUARD_COUNT   4
+// eWeaponType is not exported as anything readable, so the weapon they carry is
+// logged on spawn rather than asserted -- if this turns out to be the wrong one
+// the log says which number to change.
+#define BODYGUARD_WEAPON  17
+
+// ---- the vehicle you are in ----
+//
+// Colours are a byte each at +576 and +577: CAutomobile::Render, CBike::Render
+// and CBoat::Render all do
+//
+//   ldrb w2, [x19, #577] / ldrb w1, [x19, #576]
+//   bl   CVehicleModelInfo::SetVehicleColour
+//
+// so they are per-vehicle and take effect on the next frame drawn.
+//
+// Velocity and mass come from CPhysical::ApplyMoveForce, which reads the mass at
+// +240 and the velocity at +144 before adding force/mass to it. Everything here
+// is per-vehicle on purpose: the handling record at +392 is **shared by every
+// vehicle of that model**, so editing "speed" there would change every Banshee
+// in the city, not the one you are sitting in.
+#define ENTITY_MODEL_ID 124   // int16, proven by the pool census logging
+#define VEH_COLOUR1   576
+#define VEH_COLOUR2   577
+#define VEH_MOVESPEED 144
+#define VEH_NUM_COLOURS 128
+
+// ---- repairing ----
+//
+// `CVehicle::ExtinguishCarFire` is the whole "fix my car" feature in one exported
+// call, and reading it gives up the field offsets at the same time:
+//
+//   ldr s0, [x0, #736]   / fmaxnm s0, s0, 300.0 / str s0, [x0, #736]   health
+//   ldr x0, [x0, #696]   / CFire::Extinguish                           the fire
+//   add x20, x19, #0x3b0 / CDamageManager::Get/SetEngineStatus         the engine
+//   str wzr, [x19, #1804]                                              burn timer
+//
+// It only lifts health to 300, which is a third of full, so write the health
+// afterwards. The burn timer at +1804 is the thing that actually matters here:
+// flipping a car that has been rolling leaves it on fire with that counter
+// already running, and it explodes a moment later.
+//
+// `Fix` is **not virtual** -- `CAutomobile::Fix` and `CBike::Fix` appear only as
+// PLT entries, in no vtable -- so it has to be chosen by class. The Teleport slot
+// already identifies the class for free: whichever override is sitting in it says
+// what the vehicle is, with no vtable symbols to resolve.
+#define VEH_HEALTH      736
+#define VEH_HEALTH_FULL 1000.0f
+#define VEH_FIRE        696    // CFire *, from ExtinguishCarFire's own ldr
+#define MODELINFO_HANDLING_ID 102  // CCam::GetBoatLook_L_R_HeightOffset reads it
+
+typedef void *(*find_player_vehicle_fn)(void);
+static find_player_vehicle_fn find_player_vehicle = NULL;
+typedef void (*veh_void_fn)(void *veh);
+static veh_void_fn extinguish_car_fire = NULL;
+static veh_void_fn automobile_fix = NULL;
+static veh_void_fn bike_fix = NULL;
+static void *automobile_teleport = NULL;
+static void *bike_teleport = NULL;
+
+// Health, fire and body damage, on whatever class the vehicle turns out to be.
+static void menu_repair_vehicle(void *veh) {
+  if (extinguish_car_fire)
+    extinguish_car_fire(veh);
+
+  *(float *)((uintptr_t)veh + VEH_HEALTH) = VEH_HEALTH_FULL;
+
+  void *const *vtable = *(void *const **)veh;
+  void *impl = vtable[ENTITY_VT_TELEPORT];
+  if (impl == automobile_teleport && automobile_fix)
+    automobile_fix(veh);
+  else if (impl == bike_teleport && bike_fix)
+    bike_fix(veh);
+}
+
+typedef enum {
+  VEDIT_UPRIGHT = 0,
+  VEDIT_REPAIR,
+  VEDIT_COLOUR1,
+  VEDIT_COLOUR2,
+  VEDIT_COLOUR_RANDOM,
+  VEDIT_NUM
+} veh_edit_action;
+
+
+
+// ---- menu state ----
+#define MENU_ROWS 8
+
+typedef enum {
+  MENU_ACT_CHEATS = 0,
+  MENU_ACT_TELEPORT,
+  MENU_ACT_VEHICLE,
+  MENU_ACT_PLAYER,
+  MENU_ACT_VEHMOD,
+  MENU_ACT_MISC,
+  MENU_NUM_ACTIONS
+} menu_action;
+
+// The top level is nothing but doorways now. Everything that used to sit here
+// as a bare toggle lives in the submenu it belongs to, which is what keeps the
+// help box inside its 255 characters as the menu grows.
+static const char *const menu_action_name[MENU_NUM_ACTIONS] = {
+  "Cheats",
+  "Teleport",
+  "Spawn vehicle",
+  "Player modifications",
+  "Vehicle modifications",
+  "Misc",
+};
+
+#define MENU_TOP_ROWS  MENU_NUM_ACTIONS
+
+static int menu_open = 0;
+static int menu_cursor = 0;
+static int menu_dirty = 0;
+static u64  menu_pad_prev = 0;
+
+// The second level. One piece of state covers all three lists rather than a flag
+// per list, so adding a fourth is a table entry instead of another branch.
+typedef enum {
+  SUB_NONE = 0,
+  SUB_CHEATS,
+  SUB_TELEPORT,
+  SUB_VEHICLES,
+  SUB_PLAYER,
+  SUB_VEHMOD,
+  SUB_MISC
+} menu_sub;
+
+// A row in one of the plain lists: run something, flip something, or open
+// another list. One table per submenu beats a switch per question.
+typedef enum { ROW_ACT = 0, ROW_TOG, ROW_SUB } row_kind;
+
+// The two things in the player list that are not toggles.
+typedef enum { PACT_BODYGUARDS = 0, PACT_CLEAR_WANTED } player_action;
+typedef struct { uint8_t kind; uint8_t id; const char *name; } menu_row;
+
+static const menu_row player_rows[] = {
+  { ROW_ACT, PACT_BODYGUARDS,     "Spawn bodyguards" },
+  { ROW_ACT, PACT_CLEAR_WANTED,   "Clear wanted level" },
+  { ROW_TOG, MENU_TOG_INVINCIBLE, "Invincible" },
+  { ROW_TOG, MENU_TOG_AMMO,       "Unlimited ammo" },
+  { ROW_TOG, MENU_TOG_NEVER_TIRED,"Never tired" },
+  { ROW_TOG, MENU_TOG_NEVER_WANTED,"Never wanted" },
+};
+
+static const menu_row vehmod_rows[] = {
+  { ROW_ACT, VEDIT_COLOUR_RANDOM, "Random colour" },
+  { ROW_ACT, VEDIT_COLOUR1,       "Next primary colour" },
+  { ROW_ACT, VEDIT_COLOUR2,       "Next secondary colour" },
+  { ROW_ACT, VEDIT_REPAIR,        "Repair" },
+  { ROW_ACT, VEDIT_UPRIGHT,       "Flip upright" },
+  { ROW_TOG, MENU_TOG_VEH_INVINCIBLE, "Vehicle invincible" },
+  { ROW_TOG, MENU_TOG_FLY_ANY,    "Vehicles fly" },
+};
+
+static const menu_row misc_rows[] = {
+  { ROW_TOG, MENU_TOG_FLY_HIGHER, "No height limit" },
+};
+
+#define NUM_ROWS(t) ((int)(sizeof(t) / sizeof((t)[0])))
+
+static const menu_row *sub_rows(menu_sub k, int *count) {
+  switch (k) {
+    case SUB_PLAYER: *count = NUM_ROWS(player_rows); return player_rows;
+    case SUB_VEHMOD: *count = NUM_ROWS(vehmod_rows); return vehmod_rows;
+    case SUB_MISC:   *count = NUM_ROWS(misc_rows);   return misc_rows;
+    default:         *count = 0;                     return NULL;
+  }
+}
+
+// A toggle's row has to say what it is doing, so these are built per frame.
+static const char *row_label(const menu_row *r, char *buf, size_t n) {
+  if (r->kind == ROW_TOG)
+    snprintf(buf, n, "%s [%s]", r->name,
+             menu_toggle_on[r->id] ? "ON" : "OFF");
+  else if (r->kind == ROW_SUB)
+    snprintf(buf, n, "%s >", r->name);
+  else
+    snprintf(buf, n, "%s", r->name);
+  return buf;
+}
+
+static menu_sub sub_kind = SUB_NONE;
+
+// Which list opened the current one, so B from "Vehicles fly" returns to
+// "Vehicle modifications" rather than all the way out. One level is enough:
+// nothing nests deeper.
+static menu_sub sub_parent = SUB_NONE;
+static int sub_cursor = 0;
+
+// Each list now opens on its categories and drills into one. `sub_cat` is -1
+// while the categories are showing. The items of the chosen category are
+// gathered into sub_index rather than filtered during drawing, so paging and
+// selection stay plain array work.
+#define MENU_SUB_MAX 192
+static int sub_cat = -1;
+static int cat_cursor = 0;
+static int sub_index[MENU_SUB_MAX];
+static int sub_index_count = 0;
+
+// Teleport puts the map marker first, ahead of the three islands, because it is
+// an action rather than a category -- picking it goes straight there.
+#define TELEPORT_CAT_MARKER 0
+
+static int sub_num_cats(void) {
+  switch (sub_kind) {
+    case SUB_CHEATS:   return CHEAT_NUM_CATS;
+    case SUB_TELEPORT: return PLACE_NUM_CATS + 1;
+    case SUB_VEHICLES: return VEH_NUM_CATS;
+    case SUB_PLAYER:
+    case SUB_VEHMOD:
+    case SUB_MISC:     return 1;   // flat lists, entered straight away
+    default:           return 0;
+  }
+}
+
+static const char *sub_cat_label(int i) {
+  switch (sub_kind) {
+    case SUB_CHEATS:   return cheat_cat_name[i];
+    case SUB_TELEPORT: return i == TELEPORT_CAT_MARKER ? "Map marker"
+                                                       : place_cat_name[i - 1];
+    case SUB_VEHICLES: return veh_cat_name[i];
+    case SUB_PLAYER:   return "Player";
+    case SUB_VEHMOD:   return "Vehicle";
+    case SUB_MISC:     return "Misc";
+    default:           return "";
+  }
+}
+
+static int sub_total(void) {
+  switch (sub_kind) {
+    case SUB_CHEATS:   return cheats_ready;
+    case SUB_TELEPORT: return MENU_NUM_PLACES;
+    case SUB_VEHICLES: return vehicles_ready;
+    case SUB_PLAYER:
+    case SUB_VEHMOD:
+    case SUB_MISC: {
+      int n = 0;
+      (void)sub_rows(sub_kind, &n);
+      return n;
+    }
+    default:           return 0;
+  }
+}
+
+// The category item `i` of the full list belongs to.
+static int sub_item_cat(int i) {
+  switch (sub_kind) {
+    case SUB_CHEATS:   return menu_cheats[i].cat;
+    case SUB_TELEPORT: return place_cat[i] + 1;   // 0 is the map marker
+    case SUB_VEHICLES: return veh_list[i].cat;
+    case SUB_PLAYER:
+    case SUB_VEHMOD:
+    case SUB_MISC:     return 0;
+    default:           return -1;
+  }
+}
+
+static const char *sub_item_label(int i) {
+  switch (sub_kind) {
+    case SUB_CHEATS:   return menu_cheats[i].name;
+    case SUB_TELEPORT: return place_label[i];
+    case SUB_VEHICLES: return veh_list[i].label;
+    case SUB_PLAYER:
+    case SUB_VEHMOD:
+    case SUB_MISC: {
+      static char buf[40];
+      int n = 0;
+      const menu_row *rows = sub_rows(sub_kind, &n);
+      if (!rows || i < 0 || i >= n)
+        return "";
+      return row_label(&rows[i], buf, sizeof(buf));
+    }
+    default:           return "";
+  }
+}
+
+static const char *sub_title(void) {
+  switch (sub_kind) {
+    case SUB_CHEATS:   return "CHEATS";
+    case SUB_TELEPORT: return "TELEPORT";
+    case SUB_VEHICLES: return "SPAWN VEHICLE";
+    case SUB_PLAYER:   return "PLAYER";
+    case SUB_VEHMOD:   return "VEHICLE";
+    case SUB_MISC:     return "MISC";
+    default:           return "";
+  }
+}
+
+static void sub_build_index(int cat) {
+  sub_index_count = 0;
+  const int total = sub_total();
+  for (int i = 0; i < total && sub_index_count < MENU_SUB_MAX; i++)
+    if (sub_item_cat(i) == cat)
+      sub_index[sub_index_count++] = i;
+}
+
+// How many rows the level currently showing has, and which cursor moves.
+static int sub_count(void) {
+  return sub_cat < 0 ? sub_num_cats() : sub_index_count;
+}
+
+static const char *sub_label(int i) {
+  if (sub_cat < 0)
+    return sub_cat_label(i);
+  return sub_item_label(sub_index[i]);
+}
+
+// A short confirmation after an action, the way the game acknowledges its own
+// cheat codes. Queued, because closing the menu wipes the help box on its way out.
+static char toast[64];
+static int toast_pending = 0;
+
+// The last text we pushed, so we can tell when the game has overwritten it.
+static uint16_t menu_wide[512];
+
+static int menu_ready(void) {
+  return hud_set_help_message && hud_help_forever && hud_help_message;
+}
+
+// CHud::m_HelpMessage is 0x200 bytes -- 256 UTF-16 characters, so 255 plus a
+// terminator. Overrun it and the game stores a truncated copy, our comparison
+// against what we pushed never matches again, and the menu re-pushes every
+// frame: the help box restarts its animation 60 times a second, so nothing is
+// ever legible and the cue machine-guns. That is what a sixth toggle did, by
+// taking the top level from 246 characters to 268.
+#define HUD_HELP_CHARS 256
+
+static int menu_text_clobbered(void) {
+  for (int i = 0; i < HUD_HELP_CHARS - 1; i++) {
+    if (hud_help_message[i] != menu_wide[i])
+      return 1;
+    if (!menu_wide[i])
+      return 0;
+  }
+  return 0;
+}
+
+// Clamped to what the game's buffer holds, so what we compare against is always
+// what it actually stored.
+static void menu_push(const char *text) {
+  int i = 0;
+  for (; text[i] && i < HUD_HELP_CHARS - 1; i++)
+    menu_wide[i] = (uint16_t)(unsigned char)text[i];
+  menu_wide[i] = 0;
+  hud_set_help_message(menu_wide, 0, 0);
+}
+
+static void menu_render(void) {
+  char line[512];
+  int n = 0;
+
+  if (sub_kind != SUB_NONE) {
+    const int count = sub_count();
+    const int cursor = sub_cat < 0 ? cat_cursor : sub_cursor;
+
+    // The header carries the category once you are inside one, so the list
+    // never leaves you wondering which of three islands you are looking at.
+    if (sub_cat < 0)
+      n += snprintf(line + n, sizeof(line) - n, "%s", sub_title());
+    else
+      n += snprintf(line + n, sizeof(line) - n, "%s - %s",
+                    sub_title(), sub_cat_label(sub_cat));
+
+    int first = cursor - MENU_ROWS / 2;
+    if (first > count - MENU_ROWS)
+      first = count - MENU_ROWS;
+    if (first < 0)
+      first = 0;
+
+    for (int i = first; i < count && i < first + MENU_ROWS; i++) {
+      n += snprintf(line + n, sizeof(line) - n, "~n~%c %s",
+                    i == cursor ? '>' : ' ', sub_label(i));
+      // Stop well short of what the help box holds; a row that would be
+      // cut in half is a row that makes the text never match again.
+      if (n >= HUD_HELP_CHARS - 40)
+        break;
+    }
+  } else {
+    n += snprintf(line + n, sizeof(line) - n, "LIBERTY MENU");
+
+    // Windowed like the sub-lists. It used to draw all of itself, which was
+    // fine until the rows outgrew the help box; scrolling means another toggle
+    // costs nothing.
+    int first = menu_cursor - MENU_ROWS / 2;
+    if (first > MENU_TOP_ROWS - MENU_ROWS)
+      first = MENU_TOP_ROWS - MENU_ROWS;
+    if (first < 0)
+      first = 0;
+
+    for (int i = first; i < MENU_TOP_ROWS && i < first + MENU_ROWS; i++) {
+      const char mark = i == menu_cursor ? '>' : ' ';
+      n += snprintf(line + n, sizeof(line) - n, "~n~%c %s >",
+                    mark, menu_action_name[i]);
+      // Stop well short of what the help box holds; a row that would be
+      // cut in half is a row that makes the text never match again.
+      if (n >= HUD_HELP_CHARS - 40)
+        break;
+    }
+  }
+
+  menu_push(line);
+  *hud_help_forever = 1;
+}
+
+static void menu_close(void) {
+  menu_open = 0;
+  sub_kind = SUB_NONE;
+  sub_cat = -1;
+  g_menu_open = 0;
+  *hud_help_forever = 0;
+  menu_wide[0] = 0;
+  static uint16_t empty[1] = { 0 };
+  hud_set_help_message(empty, 0, 0);
+
+  if (toast_pending) {
+    toast_pending = 0;
+    menu_push(toast);
+  }
+}
+
+static void menu_sub_enter(menu_sub kind) {
+  if (kind == SUB_TELEPORT)
+    menu_label_places();
+  sub_kind = kind;
+  sub_cat = -1;          // categories first
+  cat_cursor = 0;
+  sub_cursor = 0;
+
+  // Unless there is only one, in which case picking it is not a decision.
+  if (sub_num_cats() == 1) {
+    sub_cat = 0;
+    sub_build_index(0);
+  }
+  menu_dirty = 1;
+}
+
+// ---- actions ----
+// The traffic colour cheats set gbBlackCars / gbPinkCars, and the only things
+// that read those are CVehicleModelInfo::ChooseVehicleColour and
+// AvoidSameVehicleColour -- both of which run when a vehicle is **created**. So
+// the cheat recolours traffic as it spawns and leaves what is already on the
+// street alone, which is why it reads as doing nothing: you have to drive around
+// until the old cars have been streamed out.
+//
+// The flag is the game's cheat and stays exactly as it is. This just walks the
+// pool afterwards so the change is visible now rather than eventually.
+static int veh_pool_recolour(int colour);   // with the pool code below
+
+static void menu_recolour_traffic(int colour) {
+  const int n = veh_pool_recolour(colour);
+  debugPrintf("MENU: recoloured %d vehicles (colour %d)\n", n, colour);
+}
+
+static void menu_run_cheat(int idx) {
+  if (idx < 0 || idx >= cheats_ready)
+    return;
+
+  debugPrintf("MENU: cheat %s\n", menu_cheats[idx].name);
+
+  // The menu's own entry, not one of the game's. Clearing both flags is exactly
+  // what CPad::ResetCheats does to them; the pool walk then puts the cars that
+  // are already out there back, since clearing the flag alone only changes what
+  // spawns next.
+  if (!menu_cheats[idx].sym) {
+    if (gb_black_cars) *gb_black_cars = 0;
+    if (gb_pink_cars) *gb_pink_cars = 0;
+    menu_recolour_traffic(-1);
+    snprintf(toast, sizeof(toast), "Traffic back to normal");
+    toast_pending = 1;
+    return;
+  }
+  if (menu_cheats[idx].arg) {
+    void (*fn1)(unsigned char) = (void (*)(unsigned char))menu_cheats[idx].fn;
+    fn1(1);
+  } else {
+    menu_cheats[idx].fn();
+  }
+
+  // Black is colour 0 and white is 1 in the game's palette, the same two the
+  // cheats hand to ChooseVehicleColour.
+  if (!strcmp(menu_cheats[idx].name, "Black traffic"))
+    menu_recolour_traffic(0);
+  else if (!strcmp(menu_cheats[idx].name, "White traffic"))
+    menu_recolour_traffic(1);
+
+  snprintf(toast, sizeof(toast), "%s cheat activated", menu_cheats[idx].name);
+  toast_pending = 1;
+}
+
+// Shared by the place list and the map marker. `snap_to_road` is what keeps the
+// islands usable -- their zone centres are often buildings -- but a marker is a
+// deliberate choice, so it is honoured exactly and only dropped to the ground.
+static void menu_teleport_xy(float x, float y, int snap_to_road,
+                             const char *what) {
+  if (!find_ground_z || !find_player_ped || !ped_teleport) {
+    snprintf(toast, sizeof(toast), "Teleport unavailable");
+    toast_pending = 1;
+    return;
+  }
+
+  if (!menu_pos_sane(x, y)) {
+    debugPrintf("MENU: refusing to teleport to %s at %.1f, %.1f -- not a place\n",
+                what, x, y);
+    snprintf(toast, sizeof(toast), "That is not a valid location");
+    toast_pending = 1;
+    return;
+  }
+
+  void *ped = find_player_ped();
+  if (!ped)
+    return;
+
+  // Teleporting the ped while he is sitting in a car left the car behind and
+  // did nothing visible, because a driving ped takes its position from the
+  // vehicle every frame. So move the vehicle instead and the player rides
+  // along -- which is also what you want: you keep the car.
+  //
+  // Teleport is virtual, and it is the **same slot for every entity**: each of
+  // CPed, CAutomobile, CBike and CBoat has its override at vtable+0x78
+  // (_ZTV4CPed+0x78, _ZTV11CAutomobile+0x78, ...), so one indirect call moves
+  // whichever of them the player currently is. Picking the function by class
+  // the way the spawner has to would work too, but it would need a fourth
+  // branch for CHeli and a fifth for anything added later.
+  void *subject = ped;
+  const char *riding = "";
+  if (find_player_vehicle) {
+    void *veh = find_player_vehicle();
+    if (veh) {
+      subject = veh;
+      riding = " with the vehicle";
+    }
+  }
+
+  float pos[3];
+  const char *how = "ground";
+  if (snap_to_road && road_near(x, y, 0.0f, pos)) {
+    pos[2] += 1.5f;
+    how = "road";
+  } else {
+    pos[0] = x;
+    pos[1] = y;
+    pos[2] = find_ground_z(x, y) + 1.5f;
+  }
+
+  // A car dropped at ped height scrapes into the road; give it a little more
+  // clearance and let the suspension settle it.
+  if (subject != ped)
+    pos[2] += 1.0f;
+
+  // Flying is the exception: putting a helicopter on the ground at 90 knots is
+  // a crash, not a teleport. If the vehicle is well clear of the ground where
+  // it is, arrive at the same altitude -- but never below the destination
+  // ground, which is what the max is for when you fly from a hill to a valley.
+  if (subject != ped) {
+    const float *cur = (const float *)((uintptr_t)subject + VEH_POS);
+    const float ground_here = find_ground_z(cur[0], cur[1]);
+    const float altitude = cur[2] - ground_here;
+    if (altitude > AIRBORNE_MIN) {
+      const float keep = pos[2] + altitude;
+      debugPrintf("MENU: airborne %.1f above ground, arriving at z %.1f\n",
+                  altitude, keep);
+      pos[2] = keep;
+    }
+  }
+
+  debugPrintf("MENU: teleport to %s at %.1f, %.1f, %.1f (%s)%s\n",
+              what, pos[0], pos[1], pos[2], how, riding);
+
+  void *const *vtable = *(void *const **)subject;
+  void *impl = vtable[ENTITY_VT_TELEPORT];
+  if (impl && impl != entity_teleport_stub) {
+    ((ped_teleport_fn)impl)(subject, pos);
+  } else if (world_remove && world_add) {
+    // The stub case: helicopters, planes, trains.
+    debugPrintf("MENU: Teleport slot is the CEntity stub, moving by hand\n");
+    world_remove(subject);
+    float *ep = (float *)((uintptr_t)subject + VEH_POS);
+    ep[0] = pos[0];
+    ep[1] = pos[1];
+    ep[2] = pos[2];
+    world_add(subject);
+  } else {
+    snprintf(toast, sizeof(toast), "Cannot teleport this");
+    toast_pending = 1;
+    return;
+  }
+
+  // The vehicle arrives stationary. Without this it keeps the velocity it had
+  // when you opened the menu and drives off on its own.
+  if (subject != ped) {
+    float *vel = (float *)((uintptr_t)subject + VEH_MOVESPEED);
+    vel[0] = vel[1] = vel[2] = 0.0f;
+  }
+
+  snprintf(toast, sizeof(toast), "Teleported to %s%s", what, riding);
+  toast_pending = 1;
+}
+
+static void menu_teleport_to(int idx) {
+  if (idx < 0 || idx >= MENU_NUM_PLACES)
+    return;
+  menu_teleport_xy(place_x[idx], place_y[idx], 1, place_label[idx]);
+}
+
+static void menu_teleport_to_marker(void) {
+  float x = 0.0f, y = 0.0f;
+  if (!menu_find_marker(&x, &y)) {
+    snprintf(toast, sizeof(toast), "Place a marker on the map first");
+    toast_pending = 1;
+    debugPrintf("MENU: teleport to marker, but no coordinate blip is set\n");
+    return;
+  }
+  menu_teleport_xy(x, y, 0, "the marker");
+}
+
+// ---- watching a spawned vehicle ----
+//
+// If they still vanish, the useful question is *when*: a fixed delay points at
+// something periodic, and an instant one points at the add itself. The pool
+// handle is the safe way to ask -- CPools::GetVehicle checks the slot's flag
+// byte against the handle, so a freed or reused slot answers NULL instead of
+// handing back a dangling pointer to read.
+typedef int (*get_vehicle_ref_fn)(void *veh);
+typedef void *(*get_vehicle_fn)(int ref);
+static get_vehicle_ref_fn pools_get_vehicle_ref = NULL;
+static get_vehicle_fn pools_get_vehicle = NULL;
+
+#define VEH_TRACK_MS 12000   // long enough to see a fall, short enough to read
+// The watchdog that used to live here is gone. It existed to answer *when* a
+// spawned vehicle vanished -- a fixed delay pointing at something periodic, an
+// instant one at the add itself -- and it answered it: they were falling through
+// the map because "fly higher" had been writing floats over VehicleNames, in the
+// middle of the vehicle handling data. Spawning has been correct since, and the
+// watchdog logged position, status and level twice a second for as long as a
+// vehicle lived. `git log` has it if a spawn ever starts disappearing again.
+
+
+// ---- finding what SpawnInModel just made ----
+//
+// SpawnInModel returns nothing, so the vehicle it creates has to be found in
+// the pool. CCarCtrl::RemoveDistantCars shows the layout: entries at +0, the
+// per-slot flag bytes at +8, the count at +16, and a stride of 1968. A flag
+// byte with its top bit set is a free slot.
+//
+// Snapshot which slots are taken, spawn, then look for the one that was not
+// taken before.
+#define VEHPOOL_ENTRIES 0
+#define VEHPOOL_FLAGS   8
+#define VEHPOOL_SIZE    16
+#define VEHPOOL_STRIDE  1968
+#define VEHPOOL_MAX     512
+
+static void **ms_p_vehicle_pool = NULL;
+static uint8_t veh_slot_taken[VEHPOOL_MAX];
+
+static int veh_pool(uint8_t **entries, const int8_t **flags, int *size) {
+  if (!ms_p_vehicle_pool)
+    return 0;
+  const uint8_t *pool = (const uint8_t *)*ms_p_vehicle_pool;
+  if (!pool)
+    return 0;
+
+  *entries = *(uint8_t **)(pool + VEHPOOL_ENTRIES);
+  *flags = *(const int8_t **)(pool + VEHPOOL_FLAGS);
+  *size = *(const int *)(pool + VEHPOOL_SIZE);
+  if (!*entries || !*flags || *size <= 0)
+    return 0;
+  if (*size > VEHPOOL_MAX)
+    *size = VEHPOOL_MAX;
+  return 1;
+}
+
+// Every vehicle currently in the world, recoloured in place. Both colour bytes,
+// because a two-tone car with only its primary changed still is not black.
+// `colour` below zero means "ask the game what this model should be", which is
+// what putting traffic back to normal needs: the original colours are long gone,
+// so the honest substitute is the answer a fresh spawn would have got.
+static int veh_pool_recolour(int colour) {
+  uint8_t *entries;
+  const int8_t *flags;
+  int size;
+  if (!veh_pool(&entries, &flags, &size))
+    return 0;
+
+  int n = 0;
+  for (int i = 0; i < size; i++) {
+    if (flags[i] < 0)          // negative means the slot is free
+      continue;
+    uint8_t *veh = entries + (size_t)i * VEHPOOL_STRIDE;
+
+    if (colour >= 0) {
+      veh[VEH_COLOUR1] = (uint8_t)colour;
+      veh[VEH_COLOUR2] = (uint8_t)colour;
+    } else {
+      if (!choose_vehicle_colour)
+        continue;
+      const uint8_t *info =
+          model_info_for(*(const int16_t *)(veh + ENTITY_MODEL_ID));
+      if (!info)
+        continue;
+      uint8_t c1 = veh[VEH_COLOUR1], c2 = veh[VEH_COLOUR2];
+      choose_vehicle_colour((void *)info, &c1, &c2);
+      veh[VEH_COLOUR1] = c1;
+      veh[VEH_COLOUR2] = c2;
+    }
+    n++;
+  }
+  return n;
+}
+
+static void veh_pool_snapshot(void) {
+  uint8_t *entries;
+  const int8_t *flags;
+  int size;
+  memset(veh_slot_taken, 0, sizeof(veh_slot_taken));
+  if (!veh_pool(&entries, &flags, &size))
+    return;
+  for (int i = 0; i < size; i++)
+    veh_slot_taken[i] = flags[i] >= 0;
+}
+
+static void *veh_pool_find_new(void) {
+  uint8_t *entries;
+  const int8_t *flags;
+  int size;
+  if (!veh_pool(&entries, &flags, &size))
+    return NULL;
+  for (int i = 0; i < size; i++)
+    if (flags[i] >= 0 && !veh_slot_taken[i])
+      return entries + (size_t)i * VEHPOOL_STRIDE;
+  return NULL;
+}
+
+
+
+
+static void menu_spawn_vehicle(int idx) {
+  if (idx < 0 || idx >= vehicles_ready)
+    return;
+  if (!spawn_in_model || !find_player_ped) {
+    snprintf(toast, sizeof(toast), "Spawning unavailable");
+    toast_pending = 1;
+    return;
+  }
+
+  void *ped = find_player_ped();
+  if (!ped)
+    return;
+
+  const menu_veh_entry *v = &veh_list[idx];
+
+  // Just in front of the player. SpawnInModel drops it to the ground itself, so
+  // only x and y matter -- z is handed in below the fallen-car threshold so that
+  // its own FindGroundZForCoord branch is the one that runs.
+  const float *ppos = (const float *)((uintptr_t)ped + PED_POS);
+  const float *fwd = (const float *)((uintptr_t)ped + PED_FORWARD);
+  float pos[3];
+  pos[0] = ppos[0] + fwd[0] * SPAWN_AHEAD;
+  pos[1] = ppos[1] + fwd[1] * SPAWN_AHEAD;
+  pos[2] = -1000.0f;
+
+  // VehicleCheat for anything it can handle, because it demonstrably works:
+  // it is what TankCheat and TrashmasterCheat call, and the cars it spawned in
+  // the earliest builds were solid enough to drive away.
+  //
+  // Replacing it was a mistake. It was replaced for two real reasons -- it
+  // builds a boat as a CAutomobile and kills the game, and it drops the vehicle
+  // on a path node up to 100 units off, which is the "spawned out of view"
+  // complaint -- but the replacement lost the one thing that mattered, which is
+  // that the vehicle sits on the ground instead of falling through it. Neither
+  // hand-building nor SpawnInModel produced a vehicle that collides; both fall
+  // straight down until CWorld::RemoveFallenCars takes them at -100.
+  //
+  // So: the proven path for everything except boats, and SpawnInModel only for
+  // those, since VehicleCheat is the thing that crashes on them. The placement
+  // is the game's choice again, which is a step back in convenience and a step
+  // forward in existing.
+  veh_pool_snapshot();
+  const char *how = "VehicleCheat";
+  if (v->kind == VEH_BOAT && spawn_in_model) {
+    how = "SpawnInModel";
+    spawn_in_model(v->id, pos);
+  } else if (vehicle_cheat) {
+    vehicle_cheat(v->id);
+  } else {
+    return;
+  }
+
+  void *veh = veh_pool_find_new();
+
+  // VehicleCheat places the vehicle on the nearest path node within 100 units
+  // and gives up entirely when there is none, which is why standing away from a
+  // road produced "spawned" and nothing to show for it. SpawnInModel has no such
+  // requirement -- it drops the vehicle at the coordinates it is handed.
+  //
+  // It gets used as the fallback rather than as the default because its
+  // vehicles fell through the world when it was last tried. That turned out to
+  // be the VehicleNames corruption rather than anything about SpawnInModel, but
+  // "probably fine now" is not a reason to replace a path that works.
+  if (!veh && spawn_in_model) {
+    debugPrintf("MENU: VehicleCheat found no path node, falling back\n");
+    how = "SpawnInModel (no road nearby)";
+    spawn_in_model(v->id, pos);
+    veh = veh_pool_find_new();
+  }
+
+  debugPrintf("MENU: spawn %s (model %d) via %s -> %g, %g, vehicle %p\n",
+              v->label, v->id, how, (double)pos[0], (double)pos[1], veh);
+
+  if (!veh) {
+    snprintf(toast, sizeof(toast), "Could not place %s here", v->label);
+    toast_pending = 1;
+    return;
+  }
+
+  if (veh) {
+    // The pool census and the side-by-side dump against a vehicle the game
+    // spawned itself lived here. They settled the falling-vehicle bug -- ours
+    // and the game's were identical, which is what finally pointed away from the
+    // spawn code and at the VehicleNames corruption -- and are in `git log`.
+    }
+
+  snprintf(toast, sizeof(toast), "%s spawned", v->label);
+  toast_pending = 1;
+}
+
+static void menu_spawn_bodyguards(void) {
+  if (!population_add_ped || !choose_gang_occupation || !find_player_ped ||
+      !ped_set_leader) {
+    snprintf(toast, sizeof(toast), "Bodyguards unavailable");
+    toast_pending = 1;
+    return;
+  }
+
+  void *ped = find_player_ped();
+  if (!ped)
+    return;
+
+  // Spread them around the player rather than stacking four peds on one spot.
+  static const float dx[BODYGUARD_COUNT] = { 2.0f, -2.0f,  2.0f, -2.0f };
+  static const float dy[BODYGUARD_COUNT] = { 2.0f,  2.0f, -2.0f, -2.0f };
+
+  const float *ppos = (const float *)((uintptr_t)ped + PED_POS);
+  int spawned = 0;
+
+  for (int i = 0; i < BODYGUARD_COUNT; i++) {
+    const int model = choose_gang_occupation(BODYGUARD_GANG);
+    debugPrintf("MENU: bodyguard %d, gang %d -> ped model %d\n",
+                i, BODYGUARD_GANG, model);
+    if (model < 0) {
+      debugPrintf("MENU: gang %d has no ped model\n", BODYGUARD_GANG);
+      break;
+    }
+
+    // AddPed builds the ped straight away, so the model has to be resident
+    // first. Requesting it was not enough on its own -- the game's own gang
+    // spawner does the same request and then *checks*:
+    //
+    //   info = ms_modelInfoPtrs[model]
+    //   x8 = info->vtable[6]; if (x8(info) == NULL) -> pick something else
+    //
+    // That virtual returns the model's clump, and a null one is what takes the
+    // constructor down. CPopulation::AddPedInCar falls back when it sees a
+    // null; we skip the guard instead, which is the honest thing to do when
+    // there is nothing to fall back to.
+    // Logged step by step. This has crashed three times and each log stopped at
+    // the same place -- right after the model was chosen -- which narrows it to
+    // "one of the next four calls" and no further. Guessing between them has not
+    // worked, so each one now announces itself and the next log will name the
+    // one that does not come back.
+    if (is_in_cd_image && !is_in_cd_image(model)) {
+      debugPrintf("MENU: ped model %d is not in the cd image, skipped\n", model);
+      continue;
+    }
+
+    if (request_model && load_all_models) {
+      request_model(model, 1);
+      load_all_models(0);
+    }
+
+    const uint8_t *pinfo = model_info_for(model);
+    if (!pinfo) {
+      debugPrintf("MENU: ped model %d has no model info, skipped\n", model);
+      continue;
+    }
+    if (!model_has_clump(model)) {
+      debugPrintf("MENU: ped model %d did not load, skipping this bodyguard\n",
+                  model);
+      continue;
+    }
+
+    float pos[3];
+    pos[0] = ppos[0] + dx[i];
+    pos[1] = ppos[1] + dy[i];
+    pos[2] = find_ground_z ? find_ground_z(pos[0], pos[1]) + 1.0f : ppos[2];
+
+    void *guard = population_add_ped(PEDTYPE_GANG1 + BODYGUARD_GANG,
+                                     (unsigned)model, pos, 0, 0);
+    if (!guard) {
+      debugPrintf("MENU: AddPed(model %d) returned NULL\n", model);
+      continue;
+    }
+
+    // NOT SetPlayerToFollow. That is what has been crashing all along, and the
+    // instrumented log finally showed it: AddPed returns a valid ped, and the
+    // next call dies. Its body is
+    //
+    //   ldr   x10, [x19, #1552]
+    //   ldrsh w8,  [x10, #124]     ; and more: ldp q0,q1,[x10,#48] ...
+    //
+    // with no null check on x10. A ped fresh out of AddPed has nothing at
+    // +1552, so it dereferences null immediately. The function expects a ped
+    // the game has already set up, not a new one.
+    //
+    // CPed::SetLeader is the safe equivalent and is what the game's own
+    // CPopulation::PlaceGangMembersInFormation uses to make gang members
+    // follow: one store to +672, a null check, and a reference registration.
+    if (ped_set_leader)
+      ped_set_leader(guard, ped);
+
+    // The weapon type was a guess and never got tested, because the crash came
+    // first. Ask CWeaponInfo whether it is real before handing it over.
+    const int wslot = weapon_slot_of(BODYGUARD_WEAPON);
+    if (wslot >= 0 && ped_give_weapon) {
+      ped_give_weapon(guard, BODYGUARD_WEAPON, AMMO_TOPUP, 1);
+      if (ped_set_current_weapon)
+        ped_set_current_weapon(guard, BODYGUARD_WEAPON);
+    } else {
+      debugPrintf("MENU: weapon type %d has no slot (%d), bodyguard unarmed\n",
+                  BODYGUARD_WEAPON, wslot);
+    }
+
+    debugPrintf("MENU: bodyguard %d model %d weapon %d at %.1f, %.1f, %.1f\n",
+                i, model, BODYGUARD_WEAPON, pos[0], pos[1], pos[2]);
+    spawned++;
+  }
+
+  if (spawned)
+    snprintf(toast, sizeof(toast), "%d bodyguards spawned", spawned);
+  else
+    snprintf(toast, sizeof(toast), "Could not spawn bodyguards");
+  toast_pending = 1;
+}
+
+// ---- making vehicles fly ----
+//
+// LCS already has the flight code, and more of it than it uses. It began as
+// "make the Dodo fly": CAutomobile::ProcessControl matches model 164 by name and
+// hands it CVehicle::FlyingControl with eFlightModel 0 --
+//
+//   4cbb14: ldrh w9, [x19, #124]     the model index
+//   4cbb18: cmp  w9, #0xa4           164 -- the Dodo
+//   4cbbfc: mov  w1, wzr             eFlightModel 0
+//   4cbc6c: bl   CVehicle::FlyingControl
+//
+// -- and model 0 is the one variant that barely lifts anything. Helicopters
+// reach the same function through handling+206 bit 1 and pass 6; the "all cars
+// fly" cheat (CVehicle::bAllDodosCheat, the branch right next to the Dodo's)
+// passes 5. **The flight model number is the whole difference between a Dodo
+// that will not leave the ground and a helicopter that flies well**, so this is
+// one call per frame with a number of our choosing, on whatever is being driven.
+//
+// What the seven models are, read out of FlyingControl's own dispatch:
+//
+//   tst w9, #0x3a   1,3,4,5   winged: reads the stick as pitch and roll
+//   tst w9, #0x44   2,6       helicopter: collective, tilt to accelerate
+//   otherwise       0         the Dodo's own
+//
+// and within the winged set, 4 and 5 scale the control forces down (`cmp w20,#5`
+// -> x0.1, `cmp w20,#4` -> x0.3) while 1 and 3 are full strength but capped low
+// -- 1 tops out at 50 units and 3 at 80 (`cmp w20,#1` / `mov w8,#0x42480000`),
+// which is what makes them the RC models. So the ones worth offering are the two
+// undamped-ceiling winged variants and the helicopter.
+//
+// A helicopter takes off vertically and accelerates by tilting; a plane needs a
+// run-up and holds its speed. That is a real difference in feel and not
+// something to guess at from a disassembly, so the style is **chosen in the
+// menu** rather than picked here.
+#define DODO_MODEL      164
+#define VEH_HANDLING    392
+#define HANDLING_FLAGS  206    // bit 1: the game already flies this vehicle
+
+typedef void (*flying_control_fn)(void *veh, int flight_model);
+static flying_control_fn flying_control = NULL;
+
+// The flight model number is the whole feature: CAutomobile::ProcessControl
+// hands the Dodo eFlightModel 0 by model number and helicopters 6 through
+// handling+206 bit 1, and 6 is the one that flies. So this is one call per frame
+// on whatever is being driven.
+//
+// **The winged models (1, 3, 4, 5) are not offered, after four attempts.** They
+// are selected by `tst w9, #0x3a` inside FlyingControl and they tear a vehicle
+// apart rather than flying it. Ruled out along the way, each by measurement
+// rather than argument:
+//
+//   - the flying handling record at +400: the probe dumped all six, and they are
+//     real and sensibly shaped. The helicopter path reads one field of it (+48)
+//     and the winged path eleven (+4..+44), but the values are fine.
+//   - rotational inertia: scaling the turn mass at +244 from 1400 to 2800 left
+//     the turn speed still pinned at the engine's limit on all three axes.
+//   - amplitude: clamping the turn speed bounded it and no more -- it then sat
+//     *on* the clamp, flipping sign every frame.
+//   - damping: bleeding the turn speed towards zero afterwards did not settle it
+//     either.
+//
+// Oscillation at the frame rate, surviving both a bound and a damping term, is a
+// loop that has to be broken where it closes. These models read the turn speed
+// back through stability terms of 7 and expect CPhysical to have damped it
+// *within the same step*; ProcessControl calls FlyingControl from inside that
+// step and menu_tick cannot. Making them work needs the call to move inside the
+// physics step -- a hook on ProcessControl -- not another constant out here.
+// The helicopter model, and the only one offered.
+#define FLIGHT_MODEL_HELI 6
+
+#define VEH_MASS_FIELD 240
+#define VEH_TURN_MASS  244
+#define VEH_TURN_SPEED 160   // CVector: +160, +164, +168
+
+// ---- vehicle invincibility ----
+//
+// CVehicle::InflictDamage opens with
+//
+//   ldrb w8, [x0, #719] / tbnz w8, #6, <carry on> / <return>
+//
+// so bit 6 of vehicle+719 is "can be damaged", and clearing it makes the whole
+// damage path a no-op -- bullets, collisions, fire, the lot. Health, the fire
+// and the burn timer are pinned alongside it, because a vehicle already alight
+// when the toggle came on would otherwise keep burning down on a timer that
+// damage flags have no say over.
+#define VEH_CAN_BE_DAMAGED_BYTE 719
+#define VEH_CAN_BE_DAMAGED_BIT  (1u << 6)
+#define VEH_BURN_TIMER 1804
+
+static void *veh_inv_patched = NULL;
+
+static void veh_invincible_restore(void) {
+  if (!veh_inv_patched)
+    return;
+  *((uint8_t *)veh_inv_patched + VEH_CAN_BE_DAMAGED_BYTE) |=
+      VEH_CAN_BE_DAMAGED_BIT;
+  debugPrintf("MENU: vehicle %p can be damaged again\n", veh_inv_patched);
+  veh_inv_patched = NULL;
+}
+
+static void veh_invincible_tick(void) {
+  if (!menu_toggle_on[MENU_TOG_VEH_INVINCIBLE] || !find_player_vehicle) {
+    veh_invincible_restore();
+    return;
+  }
+
+  uint8_t *veh = (uint8_t *)find_player_vehicle();
+  if (!veh) {
+    veh_invincible_restore();
+    return;
+  }
+
+  if (veh_inv_patched && veh_inv_patched != veh)
+    veh_invincible_restore();      // changed vehicle: hand the old one back
+
+  if (!veh_inv_patched) {
+    veh_inv_patched = veh;
+    debugPrintf("MENU: vehicle %p is now invincible\n", (void *)veh);
+  }
+
+  veh[VEH_CAN_BE_DAMAGED_BYTE] &= (uint8_t)~VEH_CAN_BE_DAMAGED_BIT;
+  *(float *)(veh + VEH_HEALTH) = VEH_HEALTH_FULL;
+  *(uint32_t *)(veh + VEH_BURN_TIMER) = 0;
+  if (extinguish_car_fire && *(void *const *)(veh + VEH_FIRE))
+    extinguish_car_fire(veh);
+}
+
+// The other half of Invincible: nothing can save you from
+// CVehicle::KillPedsInVehicle, so keep the car you are in above the health at
+// which it catches fire and the call never happens. 300 is the game's own figure
+// -- what ExtinguishCarFire raises health to.
+#define VEH_NO_BURN_HEALTH 300.0f
+
+static void invincible_no_burn_tick(void) {
+  if (!menu_toggle_on[MENU_TOG_INVINCIBLE] || !find_player_vehicle)
+    return;
+
+  uint8_t *veh = (uint8_t *)find_player_vehicle();
+  if (!veh)
+    return;
+
+  float *vh = (float *)(veh + VEH_HEALTH);
+  if (*vh < VEH_NO_BURN_HEALTH) {
+    *vh = VEH_NO_BURN_HEALTH;
+    *(uint32_t *)(veh + VEH_BURN_TIMER) = 0;
+  }
+}
+
+static void fly_any_tick(void) {
+  if (!menu_toggle_on[MENU_TOG_FLY_ANY] || !flying_control ||
+      !find_player_vehicle)
+    return;
+
+  uint8_t *veh = (uint8_t *)find_player_vehicle();
+  if (!veh)
+    return;
+
+  // Leave anything the game already flies alone. Helicopters get FlyingControl
+  // from ProcessControl every frame via handling+206 bit 1, and adding a second
+  // call with a different model would have two flight models fighting over one
+  // matrix -- which is exactly what the hand-rolled Dodo model did, and how it
+  // earned its random control inversions.
+  const uint8_t *handling = *(const uint8_t *const *)(veh + VEH_HANDLING);
+  if (handling && (handling[HANDLING_FLAGS] & 2))
+    return;
+
+  flying_control(veh, FLIGHT_MODEL_HELI);
+}
+
+static void menu_vehicle_edit(int action) {
+  if (!find_player_vehicle) {
+    snprintf(toast, sizeof(toast), "Vehicle editing unavailable");
+    toast_pending = 1;
+    return;
+  }
+
+  uint8_t *veh = (uint8_t *)find_player_vehicle();
+  if (!veh) {
+    snprintf(toast, sizeof(toast), "Get in a vehicle first");
+    toast_pending = 1;
+    return;
+  }
+
+  float *vel = (float *)(veh + VEH_MOVESPEED);
+  float *rows = (float *)(veh + VEH_MATRIX);
+
+  switch (action) {
+    case VEDIT_COLOUR1:
+      veh[VEH_COLOUR1] = (uint8_t)((veh[VEH_COLOUR1] + 1) % VEH_NUM_COLOURS);
+      snprintf(toast, sizeof(toast), "Colour 1: %u", veh[VEH_COLOUR1]);
+      break;
+
+    case VEDIT_COLOUR2:
+      veh[VEH_COLOUR2] = (uint8_t)((veh[VEH_COLOUR2] + 1) % VEH_NUM_COLOURS);
+      snprintf(toast, sizeof(toast), "Colour 2: %u", veh[VEH_COLOUR2]);
+      break;
+
+    case VEDIT_COLOUR_RANDOM: {
+      static unsigned seed = 12345;
+      seed = seed * 1103515245u + 12345u;
+      veh[VEH_COLOUR1] = (uint8_t)((seed >> 16) % VEH_NUM_COLOURS);
+      veh[VEH_COLOUR2] = (uint8_t)((seed >> 8) % VEH_NUM_COLOURS);
+      snprintf(toast, sizeof(toast), "Colours: %u / %u", veh[VEH_COLOUR1],
+               veh[VEH_COLOUR2]);
+      break;
+    }
+
+    case VEDIT_UPRIGHT: {
+      // Rebuild the rotation from the heading it already has, which is what
+      // CPlaceable::SetHeading does: row0 = (cos, sin, 0), row1 = (-sin, cos, 0).
+      float fx = rows[4], fy = rows[5];
+      const float len = __builtin_sqrtf(fx * fx + fy * fy);
+      if (len < 0.0001f) {
+        fx = 0.0f; fy = 1.0f;
+      } else {
+        fx /= len; fy /= len;
+      }
+      rows[0] = fy;  rows[1] = -fx; rows[2] = 0.0f;
+      rows[4] = fx;  rows[5] = fy;  rows[6] = 0.0f;
+      rows[8] = 0.0f; rows[9] = 0.0f; rows[10] = 1.0f;
+      vel[2] = 0.2f;   // a nudge upward so it does not resolve into the ground
+
+      // A car only ends up on its roof by rolling, which means it arrives here
+      // damaged and often already burning -- righting it and watching it
+      // explode a second later is not much of a rescue. Repair comes with it.
+      menu_repair_vehicle(veh);
+      snprintf(toast, sizeof(toast), "Flipped upright and repaired");
+      break;
+    }
+
+    case VEDIT_REPAIR:
+      menu_repair_vehicle(veh);
+      snprintf(toast, sizeof(toast), "Repaired");
+      break;
+
+
+    default:
+      return;
+  }
+
+  toast_pending = 1;
+}
+
+static void menu_clear_wanted(void) {
+  if (!cheat_wanted_level || !find_player_ped)
+    return;
+  void *ped = find_player_ped();
+  if (!ped)
+    return;
+  cheat_wanted_level((void *)((uintptr_t)ped + PED_WANTED_OFFSET), 0);
+  snprintf(toast, sizeof(toast), "Wanted level cleared");
+  toast_pending = 1;
+}
+
+static void menu_activate(void) {
+  if (sub_kind != SUB_NONE) {
+    // Choosing a category drills in rather than doing anything -- except the
+    // map marker, which is an action sitting among the islands.
+    if (sub_cat < 0) {
+      if (sub_kind == SUB_TELEPORT && cat_cursor == TELEPORT_CAT_MARKER) {
+        menu_teleport_to_marker();
+        menu_close();
+        return;
+      }
+      sub_cat = cat_cursor;
+      sub_build_index(sub_cat);
+      sub_cursor = 0;
+      menu_dirty = 1;
+      return;
+    }
+
+    if (sub_cursor < 0 || sub_cursor >= sub_index_count)
+      return;
+    const int item = sub_index[sub_cursor];
+
+    switch (sub_kind) {
+      case SUB_CHEATS:   menu_run_cheat(item);     break;
+      case SUB_TELEPORT: menu_teleport_to(item);   break;
+      case SUB_VEHICLES: menu_spawn_vehicle(item); break;
+
+      // Lists you stay in: closing the menu after every toggle makes turning
+      // three things on a chore.
+      case SUB_PLAYER:
+      case SUB_VEHMOD:
+      case SUB_MISC: {
+        int n = 0;
+        const menu_row *rows = sub_rows(sub_kind, &n);
+        if (!rows || item < 0 || item >= n)
+          return;
+        const menu_row *r = &rows[item];
+
+        if (r->kind == ROW_TOG) {
+          menu_toggle_on[r->id] = !menu_toggle_on[r->id];
+          debugPrintf("MENU: %s -> %s\n", r->name,
+                      menu_toggle_on[r->id] ? "ON" : "OFF");
+          menu_dirty = 1;
+          return;
+        }
+
+        if (r->kind == ROW_SUB) {
+          sub_parent = sub_kind;
+          menu_sub_enter((menu_sub)r->id);
+          return;
+        }
+
+        if (sub_kind == SUB_VEHMOD) {
+          menu_vehicle_edit(r->id);
+        } else if (sub_kind == SUB_PLAYER) {
+          if (r->id == PACT_BODYGUARDS)
+            menu_spawn_bodyguards();
+          else
+            menu_clear_wanted();
+        }
+        break;
+      }
+
+      default: break;
+    }
+    menu_close();
+    return;
+  }
+
+  switch (menu_cursor) {
+    case MENU_ACT_CHEATS:
+      if (cheats_ready)
+        menu_sub_enter(SUB_CHEATS);
+      break;
+    case MENU_ACT_TELEPORT:
+      menu_sub_enter(SUB_TELEPORT);
+      break;
+    case MENU_ACT_VEHICLE:
+      if (vehicles_ready)
+        menu_sub_enter(SUB_VEHICLES);
+      break;
+    case MENU_ACT_PLAYER:
+      menu_sub_enter(SUB_PLAYER);
+      break;
+    case MENU_ACT_VEHMOD:
+      menu_sub_enter(SUB_VEHMOD);
+      break;
+    case MENU_ACT_MISC:
+      menu_sub_enter(SUB_MISC);
+      break;
+    default:
+      break;
+  }
+}
+
+// ---- per-frame ----
+void menu_tick(int in_game) {
+  // Not in menu_apply_toggles: that function is defined above the vehicle field
+  // offsets this needs, and moving the offsets up to meet it would scatter them
+  // away from everything else that uses them.
+  if (in_game)
+    fly_any_tick();
+  veh_invincible_tick();
+  invincible_no_burn_tick();
+
+  if (!menu_ready())
+    return;
+
+  // The help box belongs to the in-game HUD; opening the menu on the front end
+  // or during load would draw through a text system that is not up yet.
+  if (!in_game) {
+    if (menu_open)
+      menu_close();
+    menu_pad_prev = g_menu_pad_down;
+    return;
+  }
+
+  menu_apply_toggles();
+
+  const u64 down = g_menu_pad_down;
+  const u64 pressed = down & ~menu_pad_prev;
+  menu_pad_prev = down;
+
+  // Input suppression must never outlive the menu.
+  if (!menu_open && g_menu_open)
+    g_menu_open = 0;
+
+  if (!menu_open) {
+    if (pressed & HidNpadButton_Minus) {
+      menu_resolve_vehicles();
+      menu_open = 1;
+      g_menu_open = 1;
+      menu_cursor = 0;
+      sub_kind = SUB_NONE;
+      sub_cat = -1;
+      menu_dirty = 1;
+    }
+    return;
+  }
+
+  // B unwinds one level at a time: items to categories, categories to the top,
+  // top to closed.
+  //
+  // Except that a list with a single category never showed that category level
+  // -- menu_sub_enter walks straight past it -- so unwinding into it landed you
+  // on a one-line "Vehicle" screen you never chose and could not have. Those
+  // lists go straight back to wherever they were opened from: the list that
+  // opened them if there was one, otherwise the top.
+  if (pressed & (HidNpadButton_B | HidNpadButton_Minus)) {
+    if (sub_cat >= 0 && sub_num_cats() == 1) {
+      const menu_sub parent = sub_parent;
+      sub_parent = SUB_NONE;
+      if (parent != SUB_NONE) {
+        menu_sub_enter(parent);
+      } else {
+        sub_kind = SUB_NONE;
+        sub_cat = -1;
+      }
+      menu_dirty = 1;
+    } else if (sub_cat >= 0) {
+      sub_cat = -1;
+      menu_dirty = 1;
+    } else if (sub_kind != SUB_NONE) {
+      sub_kind = SUB_NONE;
+      menu_dirty = 1;
+    } else {
+      menu_close();
+    }
+    return;
+  }
+
+  const int count = sub_kind != SUB_NONE ? sub_count() : MENU_TOP_ROWS;
+  int *cursor = sub_kind == SUB_NONE ? &menu_cursor
+                                     : (sub_cat < 0 ? &cat_cursor : &sub_cursor);
+  if (count <= 0)
+    return;
+
+  if (pressed & HidNpadButton_Up) {
+    if (--*cursor < 0)
+      *cursor = count - 1;
+    menu_dirty = 1;
+  }
+  if (pressed & HidNpadButton_Down) {
+    if (++*cursor >= count)
+      *cursor = 0;
+    menu_dirty = 1;
+  }
+  if (pressed & HidNpadButton_A)
+    menu_activate();
+
+  // Re-push on a real change, or when a game tip has taken the help box from us.
+  if (menu_open && (menu_dirty || menu_text_clobbered())) {
+    menu_render();
+    menu_dirty = 0;
+  }
+}
+
+// ---- setup ----
+static uintptr_t need_sym(const char *sym) {
+  const uintptr_t a = so_try_find_addr_rx(&game_mod, sym);
+  if (!a)
+    debugPrintf("MENU: %s not found\n", sym);
+  return a;
+}
+
+void menu_init(void) {
+  // Cached for use at runtime, so they must come from load_virtbase
+  // (so_try_find_addr_rx): after so_finalize remaps the image the load_base
+  // alias is gone. See the note in patch_game.
+  hud_set_help_message = (set_help_msg_fn)need_sym("_ZN4CHud14SetHelpMessageEPtbb");
+  hud_help_forever = (uint8_t *)need_sym("_ZN4CHud27m_HelpMessageDisplayForeverE");
+  hud_help_message = (uint16_t *)need_sym("_ZN4CHud13m_HelpMessageE");
+
+  ped_set_ammo = (set_ammo_fn)need_sym("_ZN4CPed7SetAmmoE11eWeaponTypej");
+  get_weapon_info =
+      (get_weapon_info_fn)need_sym("_ZN11CWeaponInfo13GetWeaponInfoE11eWeaponType");
+  cheat_wanted_level = (cheat_wanted_fn)need_sym("_ZN7CWanted16CheatWantedLevelEi");
+  find_ground_z = (find_ground_z_fn)need_sym("_ZN6CWorld19FindGroundZForCoordEff");
+  find_player_ped = (find_player_ped_fn)need_sym("_Z13FindPlayerPedv");
+  find_player_vehicle =
+      (find_player_vehicle_fn)need_sym("_Z17FindPlayerVehiclev");
+  extinguish_car_fire =
+      (veh_void_fn)need_sym("_ZN8CVehicle17ExtinguishCarFireEv");
+  automobile_fix = (veh_void_fn)need_sym("_ZN11CAutomobile3FixEv");
+  bike_fix = (veh_void_fn)need_sym("_ZN5CBike3FixEv");
+  automobile_teleport = (void *)need_sym("_ZN11CAutomobile8TeleportE7CVector");
+  bike_teleport = (void *)need_sym("_ZN5CBike8TeleportE7CVector");
+  gb_black_cars = (uint8_t *)need_sym("gbBlackCars");
+  gb_pink_cars = (uint8_t *)need_sym("gbPinkCars");
+  choose_vehicle_colour =
+      (choose_colour_fn)need_sym("_ZN17CVehicleModelInfo19ChooseVehicleColourERhS0_");
+  flying_control =
+      (flying_control_fn)need_sym("_ZN8CVehicle13FlyingControlE12eFlightModel");
+  ped_teleport = (ped_teleport_fn)need_sym("_ZN4CPed8TeleportE7CVector");
+  world_remove = (world_entity_fn)need_sym("_ZN6CWorld6RemoveEP7CEntity");
+  world_add = (world_entity_fn)need_sym("_ZN6CWorld3AddEP7CEntity");
+  entity_teleport_stub = (void *)need_sym("_ZN7CEntity8TeleportE7CVector");
+
+  ctext_instance = (void **)need_sym("_ZN5CText10msInstanceE");
+
+  gp_the_zones = (void **)need_sym("gpTheZones");
+  gp_the_paths = (void **)need_sym("gpThePaths");
+  level_from_position =
+      (level_from_pos_fn)need_sym("_ZN9CTheZones20GetLevelFromPositionEPK7CVector");
+  radar_trace = (uint8_t *)need_sym("_ZN6CRadar13ms_RadarTraceE");
+  fly_height_limit = (float *)need_sym("_ZN8CVehicle17rcHeliHeightLimitE");
+  menu_target_on = (uint8_t *)need_sym("_ZN12CMenuManager12m_TargetIsOnE");
+  menu_target_pos = (float *)need_sym("_ZN12CMenuManager12m_fTargetPosE");
+  radar_map_waypoint = (float *)need_sym("_ZN6CRadar11MapWayPointE");
+  gp_radar_map = (void **)need_sym("GRadarMap");
+  menu_target_blip_index =
+      (int *)need_sym("_ZN12CMenuManager17m_TargetBlipIndexE");
+  fly_raise_hard_cap();
+  find_node_closest =
+      (find_node_fn)need_sym("_ZN9CPathFind22FindNodeClosestToCoorsE7CVectorhfbbbb");
+  find_zone_by_label =
+      (find_zone_label_fn)need_sym("_ZN9CTheZones29FindZoneByLabelAndReturnIndexEPc9eZoneType");
+  get_nav_zone = (get_zone_fn)need_sym("_ZN9CTheZones17GetNavigationZoneEt");
+  get_info_zone = (get_zone_fn)need_sym("_ZN9CTheZones11GetInfoZoneEt");
+  get_map_zone = (get_zone_fn)need_sym("_ZN9CTheZones10GetMapZoneEt");
+  zone_translated_name = (zone_name_fn)need_sym("_ZN5CZone17GetTranslatedNameEv");
+  text_get = (text_get_fn)need_sym("_ZN5CText3GetEPKc");
+  ms_model_info_ptrs = (void ***)need_sym("_ZN10CModelInfo16ms_modelInfoPtrsE");
+
+  spawn_in_model = (spawn_in_model_fn)need_sym("_Z12SpawnInModeli7CVector");
+  vehicle_cheat = (vehicle_cheat_fn)need_sym("_Z12VehicleCheati");
+  ms_p_vehicle_pool = (void **)need_sym("_ZN6CPools15ms_pVehiclePoolE");
+  pools_get_vehicle_ref =
+      (get_vehicle_ref_fn)need_sym("_ZN6CPools13GetVehicleRefEP8CVehicle");
+  pools_get_vehicle = (get_vehicle_fn)need_sym("_ZN6CPools10GetVehicleEi");
+  get_model_info =
+      (get_model_info_fn)need_sym("_ZN10CModelInfo12GetModelInfoEPKcPi");
+  request_model = (request_model_fn)need_sym("_ZN10CStreaming12RequestModelEii");
+  load_all_models = (load_all_models_fn)need_sym("_ZN10CStreaming22LoadAllRequestedModelsEb");
+  is_car_model = (is_model_fn)need_sym("_ZN10CModelInfo10IsCarModelEi");
+  is_bike_model = (is_model_fn)need_sym("_ZN10CModelInfo11IsBikeModelEi");
+  is_boat_model = (is_model_fn)need_sym("_ZN10CModelInfo11IsBoatModelEi");
+  is_heli_model = (is_model_fn)need_sym("_ZN10CModelInfo11IsHeliModelEi");
+  num_model_infos = (const int *)need_sym("_ZN10CModelInfo15msNumModelInfosE");
+  is_in_cd_image = (is_model_fn)need_sym("_ZN10CStreaming17IsObjectInCdImageEi");
+
+  population_add_ped =
+      (add_ped_fn)need_sym("_ZN11CPopulation6AddPedE8ePedTypejRK7CVectorib");
+  choose_gang_occupation =
+      (choose_gang_fn)need_sym("_ZN11CPopulation20ChooseGangOccupationEi");
+  ped_set_leader = (set_leader_fn)need_sym("_ZN4CPed9SetLeaderEPS_");
+  ped_give_weapon = (give_weapon_fn)need_sym("_ZN4CPed10GiveWeaponE11eWeaponTypejb");
+  ped_set_current_weapon =
+      (set_current_weapon_fn)need_sym("_ZN4CPed16SetCurrentWeaponE11eWeaponType");
+
+  int kept = 0;
+  for (int i = 0; i < MENU_NUM_CHEATS; i++) {
+    if (!menu_cheats[i].sym) {     // the menu implements this one itself
+      menu_cheats[kept++] = menu_cheats[i];
+      continue;
+    }
+    const uintptr_t a = so_try_find_addr_rx(&game_mod, menu_cheats[i].sym);
+    if (!a) {
+      debugPrintf("MENU: cheat \"%s\" not exported, dropped\n", menu_cheats[i].name);
+      continue;
+    }
+    menu_cheats[kept] = menu_cheats[i];
+    menu_cheats[kept].fn = (void (*)(void))a;
+    kept++;
+  }
+  cheats_ready = kept;
+
+  debugPrintf("MENU: Liberty Menu ready (%d/%d cheats)\n", kept, MENU_NUM_CHEATS);
+}

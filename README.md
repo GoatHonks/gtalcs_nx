@@ -12,18 +12,36 @@ It's basically as if we emulate a minimalist Android environment in which we nat
 ### About this fork
 
 This is an unofficial fork of [NaGaa95/gtalcs_nx](https://github.com/NaGaa95/gtalcs_nx)
-with a set of controller fixes. **All credit for the port itself goes to NaGaa95**,
-and to Andy Nguyen and fgsfds, whose loader it is built on. I did not write the port
-— this fork only changes how controller input reaches the engine.
+with a set of controller fixes and, from `1.0.3+r3`, an in-game mod menu.
+**All credit for the port itself goes to NaGaa95**, and to Andy Nguyen and fgsfds,
+whose loader it is built on. I did not write the port — this fork changes how
+controller input reaches the engine, and adds a menu on top of it.
 
-I am not a developer and know very little programming. The changes here were made
-entirely with [Claude Code](https://claude.com/claude-code). My part was describing
-the problems I ran into while playing and testing the results on hardware. The
-reasoning behind each change is in [CHANGELOG.md](CHANGELOG.md) so anyone can check
-it, and the code comments explain what was found in the game binary and why.
+**I am not a developer and know very little programming. None of the code here was
+written by me.** All of it — the controller fixes and the whole of Liberty Menu —
+was written by [Claude Code](https://claude.com/claude-code). My part was having
+the ideas, saying what I wanted, running every build on hardware and reporting what
+actually happened. A good deal of it was wrong the first time and got fixed because
+a test on real hardware disagreed with the theory. The reasoning behind each change
+is in [CHANGELOG.md](CHANGELOG.md) so anyone can check it, and the code comments
+explain what was found in the game binary and why.
 
 If you hit the same problems I did — the d-pad doing nothing, cheat codes not
 working, ZR sounding the horn while looking right — this should fix them.
+
+### Which release do I want?
+
+Both releases are **the same game** — NaGaa95's port of version 2.4.379. The
+`+rN` suffix is this fork's revision number, not a new version of the game.
+
+| | What it is |
+|---|---|
+| **`1.0.3+r2`** | The controller fixes only. The game exactly as it shipped, playing correctly on a Switch pad. **Choose this if you do not want a mod menu.** |
+| **`1.0.3+r3`** | Everything in `+r2`, plus **Liberty Menu** — an in-game mod menu on the Minus button. |
+
+Same install either way. Nothing in `+r3` happens unless you open the menu and ask
+for it, but if you would rather the option were not there at all, `+r2` is
+unchanged and stays available.
 
 **This fork contains no game files.** You still need your own legally obtained
 copy of the Android APK (version 2.4.379); see the install instructions below.
@@ -100,7 +118,7 @@ name `xbox_layout` still parses and means the same thing.
 | L3 | -- | Horn / toggle siren |
 | R3 | -- | Recentre camera behind car |
 | Plus | Pause menu | Pause menu |
-| Minus | Pause menu (back action) | Pause menu (back action) |
+| Minus | **Open Liberty Menu** | **Open Liberty Menu** |
 
 Deviations from the PSP original, and why:
 
@@ -112,14 +130,61 @@ Deviations from the PSP original, and why:
   button. The d-pad horn still works. This matches the PS2 release, which puts the
   horn on L3. `THUMBL`/`THUMBR` otherwise reach no engine code at all.
 * **R3 = recentre camera** — a spare id that had a reader; not a PSP behaviour.
-* **Minus = pause** — the PSP's Select is Camera Modes, but
-  `CPad::CycleCameraModeJustDown()` has zero callers in this build, so Select would
-  do nothing. Set `key_minus SELECT` if you want it faithful-but-dead.
+* **Minus opens Liberty Menu** (`+r3`). It has no game action bound to it by
+  default, so nothing else fires when the menu appears. The PSP's Select is Camera
+  Modes, but `CPad::CycleCameraModeJustDown()` has zero callers in this build, so
+  Select would do nothing anyway. You *can* bind an action to Minus in
+  `config.txt` if you want one — the menu still opens — but it will trigger at the
+  same moment the menu appears, which is why the default is `NONE`.
 * **Alternate control schemes exist in the engine but are unreachable.** `CPad`
   keeps a control-scheme number that `CPad::GetHandBrake` and `CPad::GetHorn` branch
   on, and on some values the hand brake becomes a Cross + Square combo instead of R.
   This build exposes no Controller Setup option in its menus, so that value never
   changes: the hand brake is R, confirmed on hardware.
+
+## Liberty Menu
+
+**Press Minus during play.** D-pad to move, A to choose, B to go back, Minus or B
+again to close. It draws through the game's own help box, so it looks like part of
+the game rather than an overlay.
+
+It is **entirely native**: no CLEO, no scripts, nothing from anyone else's mod.
+Every entry is a call into a function the game already exports, found by
+disassembling the retail binary — the cheats are literally the game's own cheat
+functions, and the rest is the same idea applied to things the game can do but
+never offered a way to ask for.
+
+```
+Cheats                >  by category: player, wanted level, weather & time,
+                         vehicles, peds
+Teleport              >  every named zone, grouped by island, plus your own
+                         map marker
+Spawn vehicle         >  all 83 land, sea and air vehicles, by name
+Player modifications  >  bodyguards, clear wanted level, invincible,
+                         unlimited ammo, never tired, never wanted
+Vehicle modifications >  colours, repair, flip upright, vehicle invincible,
+                         vehicles fly
+Misc                  >  no height limit
+```
+
+A few notes on the less obvious ones:
+
+* **Teleport → Map marker** goes to the marker *you* placed, and tells you if
+  there isn't one rather than sending you to a stale position. It takes your
+  vehicle with you, and keeps your altitude if you are flying.
+* **Invincible** uses the game's own immunity flag rather than topping your health
+  up each frame, so a single lethal hit no longer kills you. It also keeps the car
+  you are in from burning down, because an exploding car kills its occupants
+  outright with no damage check that any flag can stop.
+* **Unlimited ammo** puts your original ammo back when you switch it off.
+* **Vehicles fly** gives whatever you are driving the game's own helicopter flight
+  model. Vehicles that already fly are left alone.
+* **Normal traffic** exists because the black and white traffic cheats have no
+  off switch in the game — once set, they stay set for the session.
+* **Spawn vehicle** names every vehicle from the game's own text, so the names are
+  the game's, localised, not a hardcoded list.
+
+Everything is off until you turn it on, and nothing is written to your save.
 
 ### Cheats
 
@@ -162,7 +227,7 @@ disabled in this build. They are listed for completeness.
 | Peds Have Weapons | R, R, L, R, R, L, Right, Circle |
 | Peds Riot | L, L, R, L, L, R, Left, Square |
 | Perfect Traction (Down = car hop) | L, Up, Left, R, Triangle, Circle, Down, Cross |
-| Play as Pedestrian | L, L, Left, L, L, Right, Square, Triangle |
+| Play as Pedestrian *(does nothing in this build)* | L, L, Left, L, L, Right, Square, Triangle |
 | Rainy Weather | Up, Down, Square, Up, Down, Circle, L, R |
 | Raise Wanted Level (by 2 stars) | L, R, Square, L, R, Triangle, L, R |
 | Slower Gameplay | R, Triangle, Cross, R, Square, Circle, Left, Right |
@@ -185,8 +250,10 @@ disabled in this build. They are listed for completeness.
 
 ### Support the developer
 
-The Ko-fi below belongs to **NaGaa95**, who made this port — it is not mine. I only
-changed the controls, so if you would like to support the work, support him.
+The Ko-fi below belongs to **NaGaa95**, who made this port — it is not mine, and I
+am not asking for anything. The port is the hard part and it is his; this fork only
+fixes the controls and adds a menu on top. If you would like to support the work,
+support him.
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/D1D1P2MOG)
 

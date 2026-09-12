@@ -29,6 +29,7 @@
 #include "../util.h"
 #include "../so_util.h"
 #include "../hooks.h"
+#include "../menu.h"
 #include "../jni_fake.h"
 
 extern so_module game_mod; // defined in main.c
@@ -619,6 +620,11 @@ void patch_game(void) {
       }
     }
   }
+
+  // Liberty Menu: resolves the game functions its entries call. It needs no
+  // hooks at all -- it ticks from the main loop and draws through the game's
+  // own help box.
+  menu_init();
 
   // The AArch64 stack guard reads its cookie at an offset off TPIDR_EL0, which
   // reads back 0 on the Switch (libnx keeps the real TLS in TPIDRRO_EL0) and

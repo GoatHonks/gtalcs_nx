@@ -16,7 +16,7 @@
 #include "util.h"
 #include "config.h"
 
-#ifdef DEBUG_LOG
+#if defined(DEBUG_LOG) && DEBUG_LOG
 
 static int s_nxlinkSock = -1;
 
@@ -50,20 +50,44 @@ void userAppExit(void) {
 // and this is a no-op. Keeps the log file open for the run (reopening per line
 // on FAT makes boot take minutes); fflush each line to survive an abrupt exit.
 int debugPrintf(char *text, ...) {
-#ifdef DEBUG_LOG
+#if defined(DEBUG_LOG) && DEBUG_LOG
   va_list list;
   static FILE *f = NULL;
   if (!f)
     f = fopen(LOG_NAME, "a");
+
+  // Milliseconds since the first line, stamped at the start of each line. The
+  // log had no clock in it at all, which meant a question as basic as "where
+  // does boot time actually go" could not be answered from it -- the frame
+  // counter only says how many frames passed, not how long they took.
+  static u64 t0 = 0;
+  if (!t0)
+    t0 = armTicksToNs(armGetSystemTick());
+  const unsigned ms =
+      (unsigned)((armTicksToNs(armGetSystemTick()) - t0) / 1000000ull);
+
+  // Formatted first so the stamp can be held back mid-line: the game's own
+  // printf comes through here too and does not always write whole lines.
+  char buf[1024];
+  va_start(list, text);
+  const int n = vsnprintf(buf, sizeof(buf), text, list);
+  va_end(list);
+  if (n < 0)
+    return 0;
+
+  static int at_line_start = 1;
   if (f) {
-    va_start(list, text);
-    vfprintf(f, text, list);
-    va_end(list);
+    if (at_line_start)
+      fprintf(f, "[%6u.%03u] ", ms / 1000, ms % 1000);
+    fputs(buf, f);
     fflush(f);
   }
-  va_start(list, text);
-  vprintf(text, list); // also to nxlink stdout, if a host is connected
-  va_end(list);
+  if (at_line_start)
+    printf("[%6u.%03u] ", ms / 1000, ms % 1000);
+  fputs(buf, stdout);   // also to nxlink stdout, if a host is connected
+
+  const size_t len = strlen(buf);
+  at_line_start = (len && buf[len - 1] == '\n');
 #endif
   return 0;
 }

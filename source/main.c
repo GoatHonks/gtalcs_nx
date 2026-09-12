@@ -20,6 +20,7 @@
 #include <GLES2/gl2.h>
 
 #include "config.h"
+#include "menu.h"
 #include "util.h"
 #include "error.h"
 #include "so_util.h"
@@ -424,6 +425,13 @@ static void update_touch(void) {
 static PadState pad;
 static u64 pad_prev = 0;
 
+// Bridge to Liberty Menu (source/menu.c). The menu ticks from this loop, so the
+// button state is published here rather than polled there. While the menu is
+// open the game gets no input at all, so navigating it cannot shoot, steer or
+// punch.
+volatile u64 g_menu_pad_down = 0;
+volatile int g_menu_open = 0;
+
 // drive one button table into the engine on the press/release edges
 static void send_pad_buttons(const PadMap *map, unsigned n, u64 down, u64 changed) {
   int horn = 0;
@@ -463,8 +471,24 @@ static void update_gamepad(void) {
   const u64 down = padGetButtons(&pad);
   const u64 changed = down ^ pad_prev;
 
-  send_pad_buttons(pad_map, NUM_PAD_MAP, down, changed);
-  pad_prev = down;
+  g_menu_pad_down = down;
+
+  // While the menu is open the game gets no buttons and centred sticks. Do NOT
+  // return early here: the analogue axes are pushed further down, and skipping
+  // them latched the sticks at whatever they read when the menu opened, which
+  // left the player walking on his own.
+  if (g_menu_open) {
+    // Release anything the game still thinks is held, otherwise a button held
+    // as the menu opened stays stuck down.
+    if (pad_prev)
+      send_pad_buttons(pad_map, NUM_PAD_MAP, 0, pad_prev);
+    pad_prev = 0;
+    g_zoom_dir = 0;
+    g_freeaim_combo = 0;
+  } else {
+    send_pad_buttons(pad_map, NUM_PAD_MAP, down, changed);
+    pad_prev = down;
+  }
 
   // D-pad up/down = zoom in/out for scoped weapons (sniper) and the camera. The
   // engine's gamepad zoom (CPad::SniperZoomIn/Out) reads action fields our input
@@ -488,11 +512,13 @@ static void update_gamepad(void) {
   const HidAnalogStickState ls = padGetStickPos(&pad, 0);
   const HidAnalogStickState rs = padGetStickPos(&pad, 1);
   // Android Y axes point down (engine applies its own deadzone of 0.125)
+  // Centred while the menu is open, so nothing keeps moving behind it.
+  const int menu = g_menu_open;
   const float axes[6] = {
-    (float)ls.x * scale, (float)ls.y * -scale,
-    (float)rs.x * scale, (float)rs.y * -scale,
-    (down & HidNpadButton_ZL) ? 1.0f : 0.0f,
-    (down & HidNpadButton_ZR) ? 1.0f : 0.0f,
+    menu ? 0.0f : (float)ls.x * scale, menu ? 0.0f : (float)ls.y * -scale,
+    menu ? 0.0f : (float)rs.x * scale, menu ? 0.0f : (float)rs.y * -scale,
+    (!menu && (down & HidNpadButton_ZL)) ? 1.0f : 0.0f,
+    (!menu && (down & HidNpadButton_ZR)) ? 1.0f : 0.0f,
   };
 
   static float prev_axes[6];
@@ -723,6 +749,11 @@ int main(void) {
 
     update_gamepad();
     update_touch();
+
+    // Liberty Menu ticks here, on the same thread that runs the game frame, so
+    // it can call the game's own functions directly. State 9 is in-game; the
+    // menu stays shut on the front end and during loads.
+    menu_tick(last_app_state == 9);
 
     const u64 now = armGetSystemTick();
     float dt = (float)(now - last_tick) / (float)tick_freq;

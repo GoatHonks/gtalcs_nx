@@ -37,10 +37,16 @@ include $(DEVKITPRO)/libnx/switch_rules
 #   of a homebrew executable (.nro). This is intended to be used for sysmodules.
 #   NACP building is skipped as well.
 #---------------------------------------------------------------------------------
-TARGET		:=	$(notdir $(CURDIR))
+# Fixed rather than $(notdir $(CURDIR)): the output name follows the build
+# directory otherwise, so a checkout in a differently named folder produces a
+# differently named .nro -- and that name is baked into the NRO module field
+# too, not just the filename.
+TARGET		:=	gtalcs_nx
 APP_TITLE	:=	GTA Liberty City Stories
-APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.0.3+r2
+APP_AUTHOR	:=	naga, GoatHonks
+# Still 1.0.3 -- this is the same game, revision 3 of the fork. +r2 is the
+# same port without Liberty Menu.
+APP_VERSION	:=	1.0.3+r3
 BUILD		:=	build
 SOURCES		:=	source source/hooks
 DATA		:=	data

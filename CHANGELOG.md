@@ -6,6 +6,55 @@ All findings below came from disassembling the retail `libGame.so` (ARM64) and
 cross-referencing the engine's own functions. Nothing here is guesswork about what
 the buttons "should" do — each claim is traced to a specific function and field.
 
+## 1.0.3+r3
+
+### Added
+
+**Liberty Menu**, an in-game mod menu on **Minus**. Native throughout: no CLEO, no
+scripts, nothing from anyone else's mod. Every entry calls a function the retail
+binary already exports, found by disassembling it.
+
+* **Cheats** - the game's own cheat functions, by category. The list is checked
+  against the retail button codes rather than the symbol names, which caught real
+  mistakes: "peds have weapons" is `WeaponsForAllCheat`, not
+  `DoChicksWithGunsCheat`; "cars drive on water" is `BackToTheFuture`, which
+  toggles `CVehicle::bHoverCheat`. Cheats no button code can reach - the only
+  reference to each being its own definition - are not listed.
+* **Teleport** - every named zone, read from `gpTheZones` and named by the game's
+  own text, grouped by island; plus the marker you place on the map
+  (`GRadarMap+128`, gated on the is-set byte at `+120`, so a cleared marker is
+  reported rather than teleported to).
+* **Spawn vehicle** - all 83 land, sea and air vehicles, enumerated by walking the
+  model table and named from each model's GXT key, so nothing is hardcoded.
+* **Player** - bodyguards, clear wanted level, invincible, unlimited ammo, never
+  tired, never wanted.
+* **Vehicle** - colours, repair, flip upright, vehicle invincible, vehicles fly.
+* **Misc** - no height limit.
+
+Two of these exist because the game offers no way back: **Normal traffic**, since
+the black and white traffic cheats set a flag nothing clears, and **unlimited
+ammo** restoring your original counts when switched off.
+
+**Invincible** uses the game's own immunity byte rather than topping health up each
+frame, so a single lethal hit no longer kills you. It also keeps the car you are in
+above the health at which it catches fire, because an exploding car kills its
+occupants outright through a path no flag gates.
+
+### Changed
+
+* **`key_minus` defaults to `NONE` instead of being forced to it.** The reason for
+  the default is unchanged - any other binding fires a game action at the moment
+  the menu opens - but `config.txt` can now override it. Overriding a setting the
+  user can see and edit was the wrong call.
+* **New icon.**
+
+### Fixed
+
+* `DEBUG_LOG` is off for release, and its guards now honour the value. Every one
+  was `#ifdef DEBUG_LOG`, which is true for `#define DEBUG_LOG 0` as well, so
+  setting it to zero looked like disabling logging and did nothing.
+
+
 ## 1.0.3+r2
 
 ### Changed

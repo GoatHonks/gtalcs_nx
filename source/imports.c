@@ -264,7 +264,7 @@ void __android_log_assert(const char *cond, const char *tag, const char *fmt, ..
 }
 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
-#ifdef DEBUG_LOG
+#if defined(DEBUG_LOG) && DEBUG_LOG
   va_list list;
   static char string[0x1000];
 
@@ -283,7 +283,7 @@ int __android_log_write(int prio, const char *tag, const char *text) {
 }
 
 int __android_log_vprint(int prio, const char *tag, const char *fmt, va_list va) {
-#ifdef DEBUG_LOG
+#if defined(DEBUG_LOG) && DEBUG_LOG
   static char string[0x1000];
   vsnprintf(string, sizeof(string), fmt, va);
   debugPrintf("%s: %s\n", tag, string);
