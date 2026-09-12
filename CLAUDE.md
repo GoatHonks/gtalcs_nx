@@ -590,51 +590,34 @@ still takes damage and still looks wrecked; it just cannot burn down under you.
 health pin had been in the menu since the beginning and looked like it worked,
 because most damage is not lethal in one hit.
 
-## Why the winged flight models tear a car apart
+## The winged flight models: abandoned, and what ruled each theory out
 
-Not the flying handling record — the probe settled that. All six are real and
-sensibly shaped (field 0 prints as `1.05e-43` because it is the id as an **int**,
-75, read as a float, which incidentally confirms the 88-byte stride).
+`FlyingControl`'s winged models (1, 3, 4, 5, selected by `tst w9, #0x3a`) tear a
+vehicle apart rather than flying it. **Four theories, each killed by measurement
+rather than argument:**
 
-Nor is it rotational inertia. Every torque goes through
-`CPhysical::ApplyTurnForce`, which divides by the **turn mass at `vehicle+244`**
-(`ldr s0,[x19,#244]` / `fdiv s0, s1, s0`), so scaling that up looked like the
-answer. It was not, and the log said so in one line:
+| Theory | What killed it |
+|---|---|
+| the flying handling record at `+400` is wrong | probe dumped all six; real and sensibly shaped |
+| rotational inertia is too low | turn mass 1400 → 2800, turn speed **still** pinned at the limit |
+| amplitude runaway | clamping bounded it; it then sat *on* the clamp, flipping sign every frame |
+| missing damping | bleeding turn speed towards zero did not settle it either |
 
-```
-flying 5 (Plane) ... turn -3.347 3.515 -3.203 mass 1400/2800
-```
+Oscillation at the frame rate that survives both a bound and a damping term is a
+loop that has to be broken **where it closes**. These models read the turn speed
+back through stability terms of `7` and expect `CPhysical` to have damped it
+*within the same step*. `ProcessControl` calls `FlyingControl` from inside that
+step; `menu_tick` runs after it. Making them work needs the call to move inside
+the physics step — a hook on `ProcessControl` — not another constant from out
+here.
 
-Turn mass doubled, turn speed **still pinned at the engine's limit on all three
-axes**, against 0.001–0.007 for the helicopter model. Saturating regardless of
-the divisor is a **feedback loop**, not a torque too large for the inertia: the
-flying records' roll and pitch stability terms are both `7`, they read the turn
-speed back, and nothing damps it between frames — a car's angular damping lives
-in its *ordinary* handling record, which the winged path never touches.
+So the menu offers the helicopter model only, as a plain toggle. The flight
+style submenu is gone with it.
 
-Clamping bounded it without curing it — the next log showed the turn speed
-sitting **on** the limit and changing sign every frame:
-
-```
-turn  0.060  0.060  0.060
-turn -0.060 -0.060 -0.060
-```
-
-Oscillation at exactly the frame rate is a control loop with **no damping**, and
-that is the real difference between our call and the game's. `CPhysical` applies
-the vehicle's angular resistance as part of its own step, and `ProcessControl`
-calls `FlyingControl` from *inside* that step — so the stability terms are damped
-before they are fed back. `menu_tick` runs after the step has finished, so our
-torque lands on a turn speed nothing will damp before the next frame reads it.
-The loop integrates itself, and a bound just makes it ring against the bound.
-
-So the menu clamps **and then bleeds the turn speed towards zero**
-(`PLANE_TURN_DAMP`), standing in for the step we cannot be inside of. If that is
-still not enough, the honest conclusion is that these models want to run within
-the physics step and the winged styles should be dropped rather than tuned
-further. **Print the quantity you are theorising
-about**: both masses in that log line are what turned a plausible story into a
-dead one in a single frame of output.
+**Worth remembering:** each theory was plausible and each was wrong, and the only
+reason that was cheap to discover is that every attempt printed the quantity it
+was about. `mass 1400/2800` in a log line ended the inertia theory in one frame
+of output.
 
 ## Menu shape
 

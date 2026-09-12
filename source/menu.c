@@ -176,11 +176,12 @@ enum {
   CHEAT_CAT_WEATHER,
   CHEAT_CAT_VEHICLE,
   CHEAT_CAT_PEDS,
+  CHEAT_CAT_MISC,
   CHEAT_NUM_CATS
 };
 
 static const char *const cheat_cat_name[CHEAT_NUM_CATS] = {
-  "Player", "Wanted level", "Weather & time", "Vehicles", "Peds",
+  "Player", "Wanted level", "Weather & time", "Vehicles", "Peds", "Misc",
 };
 
 static menu_cheat menu_cheats[] = {
@@ -220,7 +221,31 @@ static menu_cheat menu_cheats[] = {
   { "Mad drivers",      "_Z12MadCarsCheatv",            NULL, 0, CHEAT_CAT_VEHICLE },
   { "Peds riot",        "_Z11MayhemCheatv",             NULL, 0, CHEAT_CAT_PEDS },
   { "Peds attack you",  "_Z27EverybodyAttacksPlayerCheatv",  NULL, 0, CHEAT_CAT_PEDS },
-  { "Peds have weapons","_Z21DoChicksWithGunsCheatv",   NULL, 0, CHEAT_CAT_PEDS },
+  { "Women armed",      "_Z21DoChicksWithGunsCheatv",   NULL, 0, CHEAT_CAT_PEDS },
+
+  // Everything below is a cheat the game exports and the menu simply had not
+  // listed. The retail code list is the check: each of these is one of the
+  // button sequences, matched to the exported function that implements it.
+  //
+  // Two naming corrections came out of that comparison. "Peds have weapons" is
+  // WeaponsForAllCheat, not DoChicksWithGuns -- that one arms women only, and is
+  // now labelled as such. And SlowClockCheat is a separate cheat from
+  // SlowTimeCheat, which is why both are here.
+  { "Commit suicide",   "_Z12SuicideCheatv",            NULL, 0, CHEAT_CAT_PLAYER },
+  { "Play as pedestrian","_Z17ChangePlayerCheatv",      NULL, 0, CHEAT_CAT_PLAYER },
+  { "Media attention",  "_Z20DoShowChaseStatCheatv",    NULL, 0, CHEAT_CAT_WANTED },
+  { "Slower clock",     "_Z14SlowClockCheatv",          NULL, 0, CHEAT_CAT_WEATHER },
+  { "Perfect traction", "_Z15StrongGripCheatv",         NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Cars drive on water","_Z15FlyingFishCheatv",       NULL, 0, CHEAT_CAT_VEHICLE },
+  { "All green lights", "_Z18TrafficLightsCheatv",      NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Invisible cars",   "_Z21OnlyRenderWheelsCheatv",   NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Peds have weapons","_Z18WeaponsForAllCheatv",      NULL, 0, CHEAT_CAT_PEDS },
+  { "Peds follow you",  "_Z16FannyMagnetCheatv",        NULL, 0, CHEAT_CAT_PEDS },
+  { "Peds enter your car","_Z17PickUpChicksCheatv",     NULL, 0, CHEAT_CAT_PEDS },
+  { "Unlock multiplayer 1","_Z23MultiplayerUnlockCheat1v", NULL, 0, CHEAT_CAT_MISC },
+  { "Unlock multiplayer 2","_Z23MultiplayerUnlockCheat2v", NULL, 0, CHEAT_CAT_MISC },
+  { "Unlock multiplayer 3","_Z23MultiplayerUnlockCheat3v", NULL, 0, CHEAT_CAT_MISC },
+  { "Unlock multiplayer 4","_Z23MultiplayerUnlockCheat4v", NULL, 0, CHEAT_CAT_MISC },
 };
 #define MENU_NUM_CHEATS ((int)(sizeof(menu_cheats) / sizeof(menu_cheats[0])))
 
@@ -441,6 +466,7 @@ typedef enum {
   MENU_TOG_NEVER_WANTED,
   MENU_TOG_FLY_HIGHER,
   MENU_TOG_VEH_INVINCIBLE,
+  MENU_TOG_FLY_ANY,
   MENU_NUM_TOGGLES
 } menu_toggle;
 
@@ -1497,11 +1523,6 @@ static int menu_cursor = 0;
 static int menu_dirty = 0;
 static u64  menu_pad_prev = 0;
 
-// The flight submenu's rows live with the flight code further down; these let
-// the tables below reach them without moving that code up here.
-static const char *fly_row_label(int row);
-static int fly_row_count(void);
-
 // The second level. One piece of state covers all three lists rather than a flag
 // per list, so adding a fourth is a table entry instead of another branch.
 typedef enum {
@@ -1511,8 +1532,7 @@ typedef enum {
   SUB_VEHICLES,
   SUB_PLAYER,
   SUB_VEHMOD,
-  SUB_MISC,
-  SUB_FLY
+  SUB_MISC
 } menu_sub;
 
 // A row in one of the plain lists: run something, flip something, or open
@@ -1539,7 +1559,7 @@ static const menu_row vehmod_rows[] = {
   { ROW_ACT, VEDIT_REPAIR,        "Repair" },
   { ROW_ACT, VEDIT_UPRIGHT,       "Flip upright" },
   { ROW_TOG, MENU_TOG_VEH_INVINCIBLE, "Vehicle invincible" },
-  { ROW_SUB, SUB_FLY,             "Vehicles fly" },
+  { ROW_TOG, MENU_TOG_FLY_ANY,    "Vehicles fly" },
 };
 
 static const menu_row misc_rows[] = {
@@ -1598,8 +1618,7 @@ static int sub_num_cats(void) {
     case SUB_VEHICLES: return VEH_NUM_CATS;
     case SUB_PLAYER:
     case SUB_VEHMOD:
-    case SUB_MISC:
-    case SUB_FLY:      return 1;   // flat lists, entered straight away
+    case SUB_MISC:     return 1;   // flat lists, entered straight away
     default:           return 0;
   }
 }
@@ -1613,7 +1632,6 @@ static const char *sub_cat_label(int i) {
     case SUB_PLAYER:   return "Player";
     case SUB_VEHMOD:   return "Vehicle";
     case SUB_MISC:     return "Misc";
-    case SUB_FLY:      return "Flight";
     default:           return "";
   }
 }
@@ -1630,7 +1648,6 @@ static int sub_total(void) {
       (void)sub_rows(sub_kind, &n);
       return n;
     }
-    case SUB_FLY:      return fly_row_count();
     default:           return 0;
   }
 }
@@ -1643,8 +1660,7 @@ static int sub_item_cat(int i) {
     case SUB_VEHICLES: return veh_list[i].cat;
     case SUB_PLAYER:
     case SUB_VEHMOD:
-    case SUB_MISC:
-    case SUB_FLY:      return 0;
+    case SUB_MISC:     return 0;
     default:           return -1;
   }
 }
@@ -1664,7 +1680,6 @@ static const char *sub_item_label(int i) {
         return "";
       return row_label(&rows[i], buf, sizeof(buf));
     }
-    case SUB_FLY:      return fly_row_label(i);
     default:           return "";
   }
 }
@@ -1677,7 +1692,6 @@ static const char *sub_title(void) {
     case SUB_PLAYER:   return "PLAYER";
     case SUB_VEHMOD:   return "VEHICLE";
     case SUB_MISC:     return "MISC";
-    case SUB_FLY:      return "VEHICLES FLY";
     default:           return "";
   }
 }
@@ -2455,118 +2469,38 @@ static void menu_spawn_bodyguards(void) {
 typedef void (*flying_control_fn)(void *veh, int flight_model);
 static flying_control_fn flying_control = NULL;
 
-// Helicopter first because it is the one confirmed to fly properly. The two
-// winged models launch the vehicle instead of flying it -- velocity pinned at
-// the game's own 4.0 clamp on all three axes -- and the reason is visible in
-// what FlyingControl reads from the flying handling record at +400:
+// The flight model number is the whole feature: CAutomobile::ProcessControl
+// hands the Dodo eFlightModel 0 by model number and helicopters 6 through
+// handling+206 bit 1, and 6 is the one that flies. So this is one call per frame
+// on whatever is being driven.
 //
-//   heli path (2,6):    ldr s0,[x8,#48]          one field
-//   winged path (1,3,4,5): +4 +8 +12 +16 +20 +24 +28 +32 +36 +40 +44
+// **The winged models (1, 3, 4, 5) are not offered, after four attempts.** They
+// are selected by `tst w9, #0x3a` inside FlyingControl and they tear a vehicle
+// apart rather than flying it. Ruled out along the way, each by measurement
+// rather than argument:
 //
-// The record every ordinary vehicle gets is GetFlyingPointer's **fallback**,
-// which is sane where the helicopter path looks and evidently not where the
-// winged path does. So a plane needs a genuine winged record, not a different
-// model number on the same one. fly_probe_records() below dumps all six so the
-// right one can be picked from data instead of another guess.
-static const struct { int model; const char *name; } fly_style[] = {
-  { 6, "Helicopter" },   // what 213-215 fly on; confirmed good
-  { 5, "Plane" },        // the "all cars fly" cheat's model -- see above
-  { 4, "Plane (sharp)" },
-};
-#define NUM_FLY_STYLES ((int)(sizeof(fly_style) / sizeof(fly_style[0])))
+//   - the flying handling record at +400: the probe dumped all six, and they are
+//     real and sensibly shaped. The helicopter path reads one field of it (+48)
+//     and the winged path eleven (+4..+44), but the values are fine.
+//   - rotational inertia: scaling the turn mass at +244 from 1400 to 2800 left
+//     the turn speed still pinned at the engine's limit on all three axes.
+//   - amplitude: clamping the turn speed bounded it and no more -- it then sat
+//     *on* the clamp, flipping sign every frame.
+//   - damping: bleeding the turn speed towards zero afterwards did not settle it
+//     either.
+//
+// Oscillation at the frame rate, surviving both a bound and a damping term, is a
+// loop that has to be broken where it closes. These models read the turn speed
+// back through stability terms of 7 and expect CPhysical to have damped it
+// *within the same step*; ProcessControl calls FlyingControl from inside that
+// step and menu_tick cannot. Making them work needs the call to move inside the
+// physics step -- a hook on ProcessControl -- not another constant out here.
+// The helicopter model, and the only one offered.
+#define FLIGHT_MODEL_HELI 6
 
-static int fly_style_idx = 0;
-static int fly_enabled = 0;
-
-// CPhysical::ApplyTurnForce divides every torque by the turn mass.
 #define VEH_MASS_FIELD 240
 #define VEH_TURN_MASS  244
 #define VEH_TURN_SPEED 160   // CVector: +160, +164, +168
-// The helicopter model works within 0.007, so this leaves room to manoeuvre
-// while cutting the runaway off two orders of magnitude below where it sat.
-#define PLANE_TURN_LIMIT 0.06f
-
-// Stands in for the angular resistance CPhysical would have applied had the call
-// come from inside its step. Anything below 1 removes energy from the loop; this
-// leaves enough authority to fly with.
-#define PLANE_TURN_DAMP 0.45f
-
-// Row 0 is the on/off switch, then one row per style. The labels are built
-// rather than fixed because they carry state -- which style is chosen, and
-// whether the whole thing is on.
-static int fly_row_count(void) { return 1 + NUM_FLY_STYLES; }
-
-static const char *fly_row_label(int row) {
-  static char buf[NUM_FLY_STYLES + 1][40];
-
-  if (row == 0) {
-    snprintf(buf[0], sizeof(buf[0]), "Enabled [%s]", fly_enabled ? "ON" : "OFF");
-    return buf[0];
-  }
-
-  const int i = row - 1;
-  if (i < 0 || i >= NUM_FLY_STYLES)
-    return "";
-  snprintf(buf[row], sizeof(buf[row]), "%s%s", fly_style[i].name,
-           i == fly_style_idx ? " [Selected]" : "");
-  return buf[row];
-}
-
-static void fly_row_activate(int row) {
-  if (row == 0) {
-    fly_enabled = !fly_enabled;
-    debugPrintf("MENU: vehicles fly -> %s\n", fly_enabled ? "ON" : "OFF");
-    return;
-  }
-
-  const int i = row - 1;
-  if (i < 0 || i >= NUM_FLY_STYLES)
-    return;
-  fly_style_idx = i;
-  debugPrintf("MENU: flight style -> %d (%s)\n", fly_style[i].model,
-              fly_style[i].name);
-}
-
-// One-shot dump of every flying handling record, so the winged models can be
-// fixed from data. GetFlyingPointer is `idx = id - 75; idx < 6 ? base + idx*88 :
-// base`, so there are exactly six, 88 bytes each, and the handling id that
-// selects one lives at model info +102.
-typedef void *(*get_flying_ptr_fn)(void *mgr, unsigned char handling_id);
-static get_flying_ptr_fn get_flying_pointer = NULL;
-static void **pmod_handling_manager = NULL;
-
-static void fly_probe_records(void) {
-  static int done = 0;
-  if (done || !get_flying_pointer || !pmod_handling_manager ||
-      !*pmod_handling_manager)
-    return;
-  done = 1;
-
-  // Which record each of these ends up on, and whether any of them is in range.
-  static const int of_interest[] = { 164, 214, 213, 130, 168 };
-  for (int i = 0; i < (int)(sizeof(of_interest) / sizeof(of_interest[0])); i++) {
-    const uint8_t *info = model_info_for(of_interest[i]);
-    if (!info)
-      continue;
-    const unsigned char hid = info[MODELINFO_HANDLING_ID];
-    debugPrintf("MENU: model %d handling id %u -> flying record %p\n",
-                of_interest[i], hid,
-                get_flying_pointer(*pmod_handling_manager, hid));
-  }
-
-  for (int id = 75; id < 81; id++) {
-    const float *r =
-        (const float *)get_flying_pointer(*pmod_handling_manager,
-                                          (unsigned char)id);
-    if (!r)
-      continue;
-    debugPrintf("MENU: flying record %d @%p: %g %g %g %g %g %g %g %g %g %g %g %g %g\n",
-                id, (const void *)r, (double)r[0], (double)r[1], (double)r[2],
-                (double)r[3], (double)r[4], (double)r[5], (double)r[6],
-                (double)r[7], (double)r[8], (double)r[9], (double)r[10],
-                (double)r[11], (double)r[12]);
-  }
-}
 
 // ---- vehicle invincibility ----
 //
@@ -2574,16 +2508,11 @@ static void fly_probe_records(void) {
 //
 //   ldrb w8, [x0, #719] / tbnz w8, #6, <carry on> / <return>
 //
-// so **bit 6 of vehicle+719 is "can be damaged"**, and clearing it makes the
-// whole damage path a no-op -- bullets, collisions, fire, the lot. That is also
-// the answer to dying when your car explodes with Invincible on: the ped's own
-// InflictDamage has no equivalent early-out to flip, and pinning health after
-// the fact does not undo being dead. A car that cannot be damaged never
-// explodes, so the question does not arise.
-//
-// Health, the fire and the burn timer are pinned alongside it, because a vehicle
-// that was already alight when the toggle came on would otherwise keep burning
-// down on a timer that damage flags have no say over.
+// so bit 6 of vehicle+719 is "can be damaged", and clearing it makes the whole
+// damage path a no-op -- bullets, collisions, fire, the lot. Health, the fire
+// and the burn timer are pinned alongside it, because a vehicle already alight
+// when the toggle came on would otherwise keep burning down on a timer that
+// damage flags have no say over.
 #define VEH_CAN_BE_DAMAGED_BYTE 719
 #define VEH_CAN_BE_DAMAGED_BIT  (1u << 6)
 #define VEH_BURN_TIMER 1804
@@ -2597,27 +2526,6 @@ static void veh_invincible_restore(void) {
       VEH_CAN_BE_DAMAGED_BIT;
   debugPrintf("MENU: vehicle %p can be damaged again\n", veh_inv_patched);
   veh_inv_patched = NULL;
-}
-
-// The other half of Invincible: see the note beside PED_CAN_BE_DAMAGED. Nothing
-// can save you from CVehicle::KillPedsInVehicle, so keep the car you are in
-// above the health at which it catches fire and the call never happens. 300 is
-// the game's own figure -- what ExtinguishCarFire raises health to.
-#define VEH_NO_BURN_HEALTH 300.0f
-
-static void invincible_no_burn_tick(void) {
-  if (!menu_toggle_on[MENU_TOG_INVINCIBLE] || !find_player_vehicle)
-    return;
-
-  uint8_t *veh = (uint8_t *)find_player_vehicle();
-  if (!veh)
-    return;
-
-  float *vh = (float *)(veh + VEH_HEALTH);
-  if (*vh < VEH_NO_BURN_HEALTH) {
-    *vh = VEH_NO_BURN_HEALTH;
-    *(uint32_t *)(veh + VEH_BURN_TIMER) = 0;
-  }
 }
 
 static void veh_invincible_tick(void) {
@@ -2647,8 +2555,30 @@ static void veh_invincible_tick(void) {
     extinguish_car_fire(veh);
 }
 
+// The other half of Invincible: nothing can save you from
+// CVehicle::KillPedsInVehicle, so keep the car you are in above the health at
+// which it catches fire and the call never happens. 300 is the game's own figure
+// -- what ExtinguishCarFire raises health to.
+#define VEH_NO_BURN_HEALTH 300.0f
+
+static void invincible_no_burn_tick(void) {
+  if (!menu_toggle_on[MENU_TOG_INVINCIBLE] || !find_player_vehicle)
+    return;
+
+  uint8_t *veh = (uint8_t *)find_player_vehicle();
+  if (!veh)
+    return;
+
+  float *vh = (float *)(veh + VEH_HEALTH);
+  if (*vh < VEH_NO_BURN_HEALTH) {
+    *vh = VEH_NO_BURN_HEALTH;
+    *(uint32_t *)(veh + VEH_BURN_TIMER) = 0;
+  }
+}
+
 static void fly_any_tick(void) {
-  if (!fly_enabled || !flying_control || !find_player_vehicle)
+  if (!menu_toggle_on[MENU_TOG_FLY_ANY] || !flying_control ||
+      !find_player_vehicle)
     return;
 
   uint8_t *veh = (uint8_t *)find_player_vehicle();
@@ -2664,54 +2594,9 @@ static void fly_any_tick(void) {
   if (handling && (handling[HANDLING_FLAGS] & 2))
     return;
 
-  const int model = fly_style[fly_style_idx].model;
-
-  // Lending the vehicle an aircraft's turn mass was the wrong fix, and the log
-  // said so plainly: with the mass scaled 1400 -> 2800 the turn speed still came
-  // back pinned at the engine's limit on every axis --
-  //
-  //   flying 5 (Plane) ... turn -3.347 3.515 -3.203 mass 1400/2800
-  //   flying 4 (Plane (sharp)) ... turn 3.668 4.000 2.771 mass 1400/2800
-  //
-  // -- against 0.001..0.007 for the helicopter model. Saturating on all three
-  // axes whatever the divisor is a feedback loop, not a torque merely too large
-  // for the inertia: the flying record's roll and pitch stability terms (both 7)
-  // read the turn speed back, and nothing damps it between frames, because a
-  // car's angular damping lives in its ordinary handling record and the winged
-  // path never touches that.
-  //
-  // Clamping alone bounded it without curing it. The next log showed the turn
-  // speed sitting **on** the limit and changing sign every single frame:
-  //
-  //   turn  0.060  0.060  0.060
-  //   turn -0.060 -0.060 -0.060
-  //   turn  0.060  0.060  0.060
-  //
-  // Oscillation at exactly the frame rate is the signature of a control loop
-  // with no damping in it, and that is precisely the difference between our call
-  // and the game's. `CPhysical` applies the vehicle's angular resistance to the
-  // turn speed as part of its own step; `ProcessControl` calls `FlyingControl`
-  // from *inside* that step, so the stability terms are damped before they are
-  // fed back. `menu_tick` runs after the step has finished, so our torque lands
-  // on a turn speed nothing will damp before the next frame reads it -- the loop
-  // integrates itself, and with a bound it just rings against the bound instead.
-  //
-  // So supply the missing damping: clamp, then bleed the turn speed towards zero
-  // the way the physics step would have. This is emulating a step we cannot be
-  // inside of, not tuning a constant.
-  const int winged = (model != 2 && model != 6);
-  const float real_turn_mass = *(const float *)(veh + VEH_TURN_MASS);
+  const int model = FLIGHT_MODEL_HELI;
 
   flying_control(veh, model);
-
-  if (winged) {
-    float *turn = (float *)(veh + VEH_TURN_SPEED);
-    for (int i = 0; i < 3; i++) {
-      if (turn[i] > PLANE_TURN_LIMIT)  turn[i] = PLANE_TURN_LIMIT;
-      if (turn[i] < -PLANE_TURN_LIMIT) turn[i] = -PLANE_TURN_LIMIT;
-      turn[i] *= PLANE_TURN_DAMP;
-    }
-  }
 
   static u64 next = 0;
   const u64 ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
@@ -2722,12 +2607,12 @@ static void fly_any_tick(void) {
     const float *t = (const float *)(veh + VEH_TURN_SPEED);
     debugPrintf("MENU: flying %d (%s) model %d z %.1f vel %.3f %.3f %.3f "
                 "turn %.3f %.3f %.3f mass %.0f/%.0f\n",
-                model, fly_style[fly_style_idx].name,
+                model, "Helicopter",
                 (int)*(const int16_t *)(veh + ENTITY_MODEL_ID),
                 (double)p[2], (double)v[0], (double)v[1], (double)v[2],
                 (double)t[0], (double)t[1], (double)t[2],
                 (double)*(const float *)(veh + VEH_MASS_FIELD),
-                (double)real_turn_mass);
+                (double)*(const float *)(veh + VEH_TURN_MASS));
   }
 }
 
@@ -2842,14 +2727,8 @@ static void menu_activate(void) {
       case SUB_TELEPORT: menu_teleport_to(item);   break;
       case SUB_VEHICLES: menu_spawn_vehicle(item); break;
 
-      // Lists you stay in. Picking a flight style and switching it on are two
-      // presses, and closing the menu after every toggle makes turning three
-      // things on a chore.
-      case SUB_FLY:
-        fly_row_activate(item);
-        menu_dirty = 1;
-        return;
-
+      // Lists you stay in: closing the menu after every toggle makes turning
+      // three things on a chore.
       case SUB_PLAYER:
       case SUB_VEHMOD:
       case SUB_MISC: {
@@ -2925,7 +2804,6 @@ void menu_tick(int in_game) {
     fly_any_tick();
   veh_invincible_tick();
   invincible_no_burn_tick();
-  fly_probe_records();
 
   if (!menu_ready())
     return;
@@ -3052,9 +2930,6 @@ void menu_init(void) {
   bike_teleport = (void *)need_sym("_ZN5CBike8TeleportE7CVector");
   flying_control =
       (flying_control_fn)need_sym("_ZN8CVehicle13FlyingControlE12eFlightModel");
-  get_flying_pointer =
-      (get_flying_ptr_fn)need_sym("_ZN16cHandlingDataMgr16GetFlyingPointerEh");
-  pmod_handling_manager = (void **)need_sym("pmod_HandlingManager");
   ped_teleport = (ped_teleport_fn)need_sym("_ZN4CPed8TeleportE7CVector");
   world_remove = (world_entity_fn)need_sym("_ZN6CWorld6RemoveEP7CEntity");
   world_add = (world_entity_fn)need_sym("_ZN6CWorld3AddEP7CEntity");
