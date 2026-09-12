@@ -1561,7 +1561,7 @@ static const menu_row *sub_rows(menu_sub k, int *count) {
 static const char *row_label(const menu_row *r, char *buf, size_t n) {
   if (r->kind == ROW_TOG)
     snprintf(buf, n, "%s [%s]", r->name,
-             menu_toggle_on[r->id] ? "ON" : "off");
+             menu_toggle_on[r->id] ? "ON" : "OFF");
   else if (r->kind == ROW_SUB)
     snprintf(buf, n, "%s >", r->name);
   else
@@ -2486,6 +2486,11 @@ static int fly_enabled = 0;
 // while cutting the runaway off two orders of magnitude below where it sat.
 #define PLANE_TURN_LIMIT 0.06f
 
+// Stands in for the angular resistance CPhysical would have applied had the call
+// come from inside its step. Anything below 1 removes energy from the loop; this
+// leaves enough authority to fly with.
+#define PLANE_TURN_DAMP 0.45f
+
 // Row 0 is the on/off switch, then one row per style. The labels are built
 // rather than fixed because they carry state -- which style is chosen, and
 // whether the whole thing is on.
@@ -2495,7 +2500,7 @@ static const char *fly_row_label(int row) {
   static char buf[NUM_FLY_STYLES + 1][40];
 
   if (row == 0) {
-    snprintf(buf[0], sizeof(buf[0]), "Enabled [%s]", fly_enabled ? "ON" : "off");
+    snprintf(buf[0], sizeof(buf[0]), "Enabled [%s]", fly_enabled ? "ON" : "OFF");
     return buf[0];
   }
 
@@ -2510,7 +2515,7 @@ static const char *fly_row_label(int row) {
 static void fly_row_activate(int row) {
   if (row == 0) {
     fly_enabled = !fly_enabled;
-    debugPrintf("MENU: vehicles fly -> %s\n", fly_enabled ? "ON" : "off");
+    debugPrintf("MENU: vehicles fly -> %s\n", fly_enabled ? "ON" : "OFF");
     return;
   }
 
@@ -2675,9 +2680,25 @@ static void fly_any_tick(void) {
   // car's angular damping lives in its ordinary handling record and the winged
   // path never touches that.
   //
-  // So break the loop where it is measurable: clamp the turn speed after the
-  // call, well above the helicopter model's working range and far below the
-  // runaway.
+  // Clamping alone bounded it without curing it. The next log showed the turn
+  // speed sitting **on** the limit and changing sign every single frame:
+  //
+  //   turn  0.060  0.060  0.060
+  //   turn -0.060 -0.060 -0.060
+  //   turn  0.060  0.060  0.060
+  //
+  // Oscillation at exactly the frame rate is the signature of a control loop
+  // with no damping in it, and that is precisely the difference between our call
+  // and the game's. `CPhysical` applies the vehicle's angular resistance to the
+  // turn speed as part of its own step; `ProcessControl` calls `FlyingControl`
+  // from *inside* that step, so the stability terms are damped before they are
+  // fed back. `menu_tick` runs after the step has finished, so our torque lands
+  // on a turn speed nothing will damp before the next frame reads it -- the loop
+  // integrates itself, and with a bound it just rings against the bound instead.
+  //
+  // So supply the missing damping: clamp, then bleed the turn speed towards zero
+  // the way the physics step would have. This is emulating a step we cannot be
+  // inside of, not tuning a constant.
   const int winged = (model != 2 && model != 6);
   const float real_turn_mass = *(const float *)(veh + VEH_TURN_MASS);
 
@@ -2688,6 +2709,7 @@ static void fly_any_tick(void) {
     for (int i = 0; i < 3; i++) {
       if (turn[i] > PLANE_TURN_LIMIT)  turn[i] = PLANE_TURN_LIMIT;
       if (turn[i] < -PLANE_TURN_LIMIT) turn[i] = -PLANE_TURN_LIMIT;
+      turn[i] *= PLANE_TURN_DAMP;
     }
   }
 
@@ -2840,7 +2862,7 @@ static void menu_activate(void) {
         if (r->kind == ROW_TOG) {
           menu_toggle_on[r->id] = !menu_toggle_on[r->id];
           debugPrintf("MENU: %s -> %s\n", r->name,
-                      menu_toggle_on[r->id] ? "ON" : "off");
+                      menu_toggle_on[r->id] ? "ON" : "OFF");
           menu_dirty = 1;
           return;
         }

@@ -612,8 +612,27 @@ flying records' roll and pitch stability terms are both `7`, they read the turn
 speed back, and nothing damps it between frames — a car's angular damping lives
 in its *ordinary* handling record, which the winged path never touches.
 
-So the menu clamps the turn speed after the call (`PLANE_TURN_LIMIT`), which
-breaks the loop where it is measurable. **Print the quantity you are theorising
+Clamping bounded it without curing it — the next log showed the turn speed
+sitting **on** the limit and changing sign every frame:
+
+```
+turn  0.060  0.060  0.060
+turn -0.060 -0.060 -0.060
+```
+
+Oscillation at exactly the frame rate is a control loop with **no damping**, and
+that is the real difference between our call and the game's. `CPhysical` applies
+the vehicle's angular resistance as part of its own step, and `ProcessControl`
+calls `FlyingControl` from *inside* that step — so the stability terms are damped
+before they are fed back. `menu_tick` runs after the step has finished, so our
+torque lands on a turn speed nothing will damp before the next frame reads it.
+The loop integrates itself, and a bound just makes it ring against the bound.
+
+So the menu clamps **and then bleeds the turn speed towards zero**
+(`PLANE_TURN_DAMP`), standing in for the step we cannot be inside of. If that is
+still not enough, the honest conclusion is that these models want to run within
+the physics step and the winged styles should be dropped rather than tuned
+further. **Print the quantity you are theorising
 about**: both masses in that log line are what turned a plausible story into a
 dead one in a single frame of output.
 
