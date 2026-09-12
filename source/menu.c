@@ -1892,11 +1892,11 @@ static void menu_sub_enter(menu_sub kind) {
 //
 // The flag is the game's cheat and stays exactly as it is. This just walks the
 // pool afterwards so the change is visible now rather than eventually.
-static int veh_pool_recolour(uint8_t colour);   // with the pool code below
+static int veh_pool_recolour(int colour);   // with the pool code below
 
-static void menu_recolour_traffic(uint8_t colour) {
+static void menu_recolour_traffic(int colour) {
   const int n = veh_pool_recolour(colour);
-  debugPrintf("MENU: recoloured %d vehicles to %u\n", n, colour);
+  debugPrintf("MENU: recoloured %d vehicles (colour %d)\n", n, colour);
 }
 
 static void menu_run_cheat(int idx) {
@@ -2120,7 +2120,10 @@ static int veh_pool(uint8_t **entries, const int8_t **flags, int *size) {
 
 // Every vehicle currently in the world, recoloured in place. Both colour bytes,
 // because a two-tone car with only its primary changed still is not black.
-static int veh_pool_recolour(uint8_t colour) {
+// `colour` below zero means "ask the game what this model should be", which is
+// what putting traffic back to normal needs: the original colours are long gone,
+// so the honest substitute is the answer a fresh spawn would have got.
+static int veh_pool_recolour(int colour) {
   uint8_t *entries;
   const int8_t *flags;
   int size;
@@ -2132,8 +2135,22 @@ static int veh_pool_recolour(uint8_t colour) {
     if (flags[i] < 0)          // negative means the slot is free
       continue;
     uint8_t *veh = entries + (size_t)i * VEHPOOL_STRIDE;
-    veh[VEH_COLOUR1] = colour;
-    veh[VEH_COLOUR2] = colour;
+
+    if (colour >= 0) {
+      veh[VEH_COLOUR1] = (uint8_t)colour;
+      veh[VEH_COLOUR2] = (uint8_t)colour;
+    } else {
+      if (!choose_vehicle_colour)
+        continue;
+      const uint8_t *info =
+          model_info_for(*(const int16_t *)(veh + ENTITY_MODEL_ID));
+      if (!info)
+        continue;
+      uint8_t c1 = veh[VEH_COLOUR1], c2 = veh[VEH_COLOUR2];
+      choose_vehicle_colour((void *)info, &c1, &c2);
+      veh[VEH_COLOUR1] = c1;
+      veh[VEH_COLOUR2] = c2;
+    }
     n++;
   }
   return n;
