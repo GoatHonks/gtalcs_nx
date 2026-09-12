@@ -532,24 +532,6 @@ at `+1804` are pinned alongside the flag, because a vehicle already alight when
 the toggle came on would otherwise keep burning down on a timer that damage
 flags have no say over.
 
-## The winged flight models need a winged handling record
-
-Flight models 4 and 5 do not fly a vehicle, they launch it — velocity pinned at
-the game's own 4.0 clamp on all three axes. The reason is in what `FlyingControl`
-reads from the flying handling record at `+400`:
-
-```
-heli path (2,6):        ldr s0,[x8,#48]                      one field
-winged path (1,3,4,5):  +4 +8 +12 +16 +20 +24 +28 +32 +36 +40 +44
-```
-
-Every ordinary vehicle gets `GetFlyingPointer`'s **fallback** record, which is
-evidently sane where the helicopter path looks and not where the winged path
-does. **A plane is not a different model number on the same record** — it needs a
-genuine winged record. There are exactly six (handling ids 75–80, 88 bytes each);
-`fly_probe_records()` dumps all of them, and which record each interesting model
-resolves to, so the choice can come from data rather than a fourth guess.
-
 ## Real invincibility is a flag, not a health pin
 
 Pinning health every frame restores you *after* the hit, so anything lethal in
@@ -634,10 +616,54 @@ it landed on a one-line "Vehicle" screen the user never chose and could not have
 chosen. Those lists return to whatever opened them — `sub_parent`, one level,
 which is all anything here nests.
 
-## The flight submenu
 
-"Vehicles fly" is a submenu, not a toggle: row 0 is `Enabled [ON/off]` and the
-rest are the styles, with `[Selected]` against the current one. It is **the only
-list that does not close the menu on activation** — choosing a style and turning
-it on are two presses, and closing in between is tedious. Labels are built at
-render time because they carry state.
+## The cheat list is checked against the retail button codes, not the symbols
+
+Comparing the menu's list to the real code list found fifteen cheats the game
+exports and the menu had never listed, and **two names that were wrong because
+they came from the symbol rather than the cheat**: "peds have weapons" is
+`WeaponsForAllCheat`, while `DoChicksWithGunsCheat` arms women only.
+
+Dropped after testing each by entering its button code by hand:
+
+| Cheat | Why |
+|---|---|
+| `ChangePlayerCheat` | does nothing in this build, code entered manually too |
+| `SlowClockCheat` | not a cheat in LCS; no button code exists for it |
+| `MultiplayerUnlockCheat1..4` | nothing to unlock in the port |
+
+**The traffic colour cheats look broken and are not.** `BlackCarsCheat` sets
+`gbBlackCars`, and the only readers are `CVehicleModelInfo::ChooseVehicleColour`
+and `AvoidSameVehicleColour` — both of which run when a vehicle is **created**.
+So the cheat recolours traffic as it spawns and leaves the street alone, which
+reads as nothing happening. The menu now walks the vehicle pool afterwards and
+recolours what is already there, so the result is visible immediately. The flag
+itself is untouched; that part is still the game's cheat.
+
+`FlyingFishCheat` ("cars drive on water") is a **toggle** — `ldrb` / `eor #1` /
+`strb` on `CVehicle::bCheat8` — so pressing it twice puts it back. Worth knowing
+before concluding it does nothing.
+
+`CPad::ResetCheats` has **no callers** in this build, so nothing clears a cheat
+flag once set.
+
+## The height limit
+
+Two things cap altitude and both have to move. `CVehicle::rcHeliHeightLimit` is
+the variable the CLEO script wrote 8000.0 to, but above it `FlyingControl` takes
+a *different* branch, so raising it alone changes nothing — it has to be pushed
+far enough out of the way that the branch never runs. The real ceiling is a pair
+of MOVZ immediates at `FlyingControl+0x69c` / `+0x6ac`, patched at init.
+
+**MOVZ with a high-half shift only encodes floats whose low 16 bits are zero**,
+which is why the patched values are powers of two rather than round decimals:
+`0x4600 << 16` is 8192.0. The map is about 3000 units across, so that is a
+ceiling in name only, which is the point.
+
+## Logging for release
+
+`DEBUG_LOG` stays on, but everything per-frame is gone: the flight telemetry, the
+spawn watchdog, the pool census and side-by-side dump, the staged bodyguard
+tracing, the vehicle and zone enumeration. What is left is event-driven — a
+press, a toggle, a boot-time summary — which is what is still needed to chase the
+remaining unknowns without burying them.
