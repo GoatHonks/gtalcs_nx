@@ -671,8 +671,19 @@ block that only clears the buffer.
 **Matching a cheat to a name in a list is not matching it to the function behind
 that name. Find the reader of the flag it sets.**
 
-`CPad::ResetCheats` has **no callers** in this build, so nothing clears a cheat
-flag once set.
+`CPad::ResetCheats` has **no callers** in this build, so **nothing clears a cheat
+flag once set** — which is not a curiosity, it is a missing feature.
+`BlackCarsCheat` sets `gbBlackCars` and clears `gbPinkCars`; `PinkCarsCheat` does
+the reverse; neither clears both. So once traffic is black it is black for the
+rest of the session, newly spawned cars included, and the game offers no way
+back. "Normal traffic" is the menu's own entry for that: it clears both flags —
+exactly what `ResetCheats` would do — and then walks the pool asking
+`CVehicleModelInfo::ChooseVehicleColour` for each vehicle's colours, which is the
+same call a fresh spawn makes. The originals are long gone; the honest substitute
+is the answer the game itself would have given.
+
+A `NULL` `sym` in the cheat table marks an entry the menu implements rather than
+one of the game's, and the resolver keeps those instead of dropping them.
 
 ## The height limit
 

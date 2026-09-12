@@ -214,6 +214,12 @@ static menu_cheat menu_cheats[] = {
   { "Chromed cars",     "_Z14GlassCarsCheatv",          NULL, 0, CHEAT_CAT_VEHICLE },
   { "Black traffic",    "_Z14BlackCarsCheatv",          NULL, 0, CHEAT_CAT_VEHICLE },
   { "White traffic",    "_Z13PinkCarsCheatv",           NULL, 0, CHEAT_CAT_VEHICLE },
+  // Not a cheat of the game's: there is no way back from the two above. They
+  // set gbBlackCars / gbPinkCars and nothing clears them -- CPad::ResetCheats
+  // would, but it has no callers in this build -- so once traffic is black it is
+  // black for the rest of the session, newly spawned cars included. A NULL
+  // symbol marks an entry the menu implements itself.
+  { "Normal traffic",   NULL,                           NULL, 0, CHEAT_CAT_VEHICLE },
   { "Tiny bike wheels",      "_Z15BikeWheelsCheatv",         NULL, 0, CHEAT_CAT_VEHICLE },
   { "Big heads",        "_Z13BigHeadsCheatv",           NULL, 0, CHEAT_CAT_PEDS },
   { "Blow up cars",     "_Z15BlowUpCarsCheatv",         NULL, 0, CHEAT_CAT_VEHICLE },
@@ -271,6 +277,14 @@ static menu_cheat menu_cheats[] = {
 #define MENU_NUM_CHEATS ((int)(sizeof(menu_cheats) / sizeof(menu_cheats[0])))
 
 static int cheats_ready = 0;
+
+// The two traffic-colour flags, and the routine the game itself uses to pick a
+// vehicle's colours, so putting traffic back means asking for the same answer a
+// fresh spawn would have got rather than inventing one.
+static uint8_t *gb_black_cars = NULL;
+static uint8_t *gb_pink_cars = NULL;
+typedef void (*choose_colour_fn)(void *modelinfo, uint8_t *c1, uint8_t *c2);
+static choose_colour_fn choose_vehicle_colour = NULL;
 
 // ---- the flying ceiling, second attempt ----
 //
@@ -1450,6 +1464,7 @@ static set_current_weapon_fn ped_set_current_weapon = NULL;
 // is per-vehicle on purpose: the handling record at +392 is **shared by every
 // vehicle of that model**, so editing "speed" there would change every Banshee
 // in the city, not the one you are sitting in.
+#define ENTITY_MODEL_ID 124   // int16, proven by the pool census logging
 #define VEH_COLOUR1   576
 #define VEH_COLOUR2   577
 #define VEH_MOVESPEED 144
@@ -1889,6 +1904,19 @@ static void menu_run_cheat(int idx) {
     return;
 
   debugPrintf("MENU: cheat %s\n", menu_cheats[idx].name);
+
+  // The menu's own entry, not one of the game's. Clearing both flags is exactly
+  // what CPad::ResetCheats does to them; the pool walk then puts the cars that
+  // are already out there back, since clearing the flag alone only changes what
+  // spawns next.
+  if (!menu_cheats[idx].sym) {
+    if (gb_black_cars) *gb_black_cars = 0;
+    if (gb_pink_cars) *gb_pink_cars = 0;
+    menu_recolour_traffic(-1);
+    snprintf(toast, sizeof(toast), "Traffic back to normal");
+    toast_pending = 1;
+    return;
+  }
   if (menu_cheats[idx].arg) {
     void (*fn1)(unsigned char) = (void (*)(unsigned char))menu_cheats[idx].fn;
     fn1(1);
@@ -2379,7 +2407,6 @@ static void menu_spawn_bodyguards(void) {
 // run-up and holds its speed. That is a real difference in feel and not
 // something to guess at from a disassembly, so the style is **chosen in the
 // menu** rather than picked here.
-#define ENTITY_MODEL_ID 124    // int16, proven by the pool census logging
 #define DODO_MODEL      164
 #define VEH_HANDLING    392
 #define HANDLING_FLAGS  206    // bit 1: the game already flies this vehicle
@@ -2826,6 +2853,10 @@ void menu_init(void) {
   bike_fix = (veh_void_fn)need_sym("_ZN5CBike3FixEv");
   automobile_teleport = (void *)need_sym("_ZN11CAutomobile8TeleportE7CVector");
   bike_teleport = (void *)need_sym("_ZN5CBike8TeleportE7CVector");
+  gb_black_cars = (uint8_t *)need_sym("gbBlackCars");
+  gb_pink_cars = (uint8_t *)need_sym("gbPinkCars");
+  choose_vehicle_colour =
+      (choose_colour_fn)need_sym("_ZN17CVehicleModelInfo19ChooseVehicleColourERhS0_");
   flying_control =
       (flying_control_fn)need_sym("_ZN8CVehicle13FlyingControlE12eFlightModel");
   ped_teleport = (ped_teleport_fn)need_sym("_ZN4CPed8TeleportE7CVector");
@@ -2887,6 +2918,10 @@ void menu_init(void) {
 
   int kept = 0;
   for (int i = 0; i < MENU_NUM_CHEATS; i++) {
+    if (!menu_cheats[i].sym) {     // the menu implements this one itself
+      menu_cheats[kept++] = menu_cheats[i];
+      continue;
+    }
     const uintptr_t a = so_try_find_addr_rx(&game_mod, menu_cheats[i].sym);
     if (!a) {
       debugPrintf("MENU: cheat \"%s\" not exported, dropped\n", menu_cheats[i].name);
