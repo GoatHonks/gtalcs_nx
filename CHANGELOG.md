@@ -2,7 +2,7 @@
 
 Unofficial controls fix, on top of [NaGaa95/gtalcs_nx](https://github.com/NaGaa95/gtalcs_nx).
 
-## 1.0.4 — Liberty Menu
+## 1.0.3+r3 — Liberty Menu
 
 An in-game mod menu on **Minus**. Native throughout: no CLEO, no scripts, nothing
 from anyone else's mod. Every entry calls a function the retail binary already

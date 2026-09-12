@@ -44,8 +44,9 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	gtalcs_nx
 APP_TITLE	:=	GTA Liberty City Stories
 APP_AUTHOR	:=	naga, GoatHonks
-# 1.0.4 is the Liberty Menu release. 1.0.3+r2 is the same port without it.
-APP_VERSION	:=	1.0.4
+# Still 1.0.3 -- this is the same game, revision 3 of the fork. +r2 is the
+# same port without Liberty Menu.
+APP_VERSION	:=	1.0.3+r3
 BUILD		:=	build
 SOURCES		:=	source source/hooks
 DATA		:=	data

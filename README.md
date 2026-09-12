@@ -12,7 +12,7 @@ It's basically as if we emulate a minimalist Android environment in which we nat
 ### About this fork
 
 This is an unofficial fork of [NaGaa95/gtalcs_nx](https://github.com/NaGaa95/gtalcs_nx)
-with a set of controller fixes and, from 1.0.4, an in-game mod menu.
+with a set of controller fixes and, from `1.0.3+r3`, an in-game mod menu.
 **All credit for the port itself goes to NaGaa95**, and to Andy Nguyen and fgsfds,
 whose loader it is built on. I did not write the port — this fork changes how
 controller input reaches the engine, and adds a menu on top of it.
@@ -31,14 +31,17 @@ working, ZR sounding the horn while looking right — this should fix them.
 
 ### Which release do I want?
 
+Both releases are **the same game** — NaGaa95's port of version 2.4.379. The
+`+rN` suffix is this fork's revision number, not a new version of the game.
+
 | | What it is |
 |---|---|
-| **1.0.3+r2** | The controller fixes only. The game exactly as it shipped, playing correctly on a Switch pad. **Choose this if you do not want a mod menu.** |
-| **1.0.4** | Everything in 1.0.3+r2, plus **Liberty Menu** — an in-game mod menu on the Minus button. |
+| **`1.0.3+r2`** | The controller fixes only. The game exactly as it shipped, playing correctly on a Switch pad. **Choose this if you do not want a mod menu.** |
+| **`1.0.3+r3`** | Everything in `+r2`, plus **Liberty Menu** — an in-game mod menu on the Minus button. |
 
-Both are the same port and the same install. Nothing in 1.0.4 happens unless you
-open the menu and ask for it, but if you would rather the option were not there at
-all, 1.0.3+r2 is unchanged and stays available.
+Same install either way. Nothing in `+r3` happens unless you open the menu and ask
+for it, but if you would rather the option were not there at all, `+r2` is
+unchanged and stays available.
 
 **This fork contains no game files.** You still need your own legally obtained
 copy of the Android APK (version 2.4.379); see the install instructions below.
@@ -124,7 +127,7 @@ Deviations from the PSP original, and why:
   button. The d-pad horn still works. This matches the PS2 release, which puts the
   horn on L3. `THUMBL`/`THUMBR` otherwise reach no engine code at all.
 * **R3 = recentre camera** — a spare id that had a reader; not a PSP behaviour.
-* **Minus opens Liberty Menu** (1.0.4). It has no game action bound to it by
+* **Minus opens Liberty Menu** (`+r3`). It has no game action bound to it by
   default, so nothing else fires when the menu appears. The PSP's Select is Camera
   Modes, but `CPad::CycleCameraModeJustDown()` has zero callers in this build, so
   Select would do nothing anyway. You *can* bind an action to Minus in
