@@ -176,12 +176,11 @@ enum {
   CHEAT_CAT_WEATHER,
   CHEAT_CAT_VEHICLE,
   CHEAT_CAT_PEDS,
-  CHEAT_CAT_MISC,
   CHEAT_NUM_CATS
 };
 
 static const char *const cheat_cat_name[CHEAT_NUM_CATS] = {
-  "Player", "Wanted level", "Weather & time", "Vehicles", "Peds", "Misc",
+  "Player", "Wanted level", "Weather & time", "Vehicles", "Peds",
 };
 
 static menu_cheat menu_cheats[] = {
@@ -201,9 +200,9 @@ static menu_cheat menu_cheats[] = {
   { "Cloudy",           "_Z18CloudyWeatherCheatv",      NULL, 0, CHEAT_CAT_WEATHER },
   { "Rainy",            "_Z17RainyWeatherCheatv",       NULL, 0, CHEAT_CAT_WEATHER },
   { "Foggy",            "_Z17FoggyWeatherCheatv",       NULL, 0, CHEAT_CAT_WEATHER },
-  { "Faster time",      "_Z13FastTimeCheatv",           NULL, 0, CHEAT_CAT_WEATHER },
-  { "Slower time",      "_Z13SlowTimeCheatv",           NULL, 0, CHEAT_CAT_WEATHER },
-  { "Faster weather",   "_Z16FastWeatherCheatv",        NULL, 0, CHEAT_CAT_WEATHER },
+  { "Faster gameplay",  "_Z13FastTimeCheatv",           NULL, 0, CHEAT_CAT_WEATHER },
+  { "Slower gameplay",  "_Z13SlowTimeCheatv",           NULL, 0, CHEAT_CAT_WEATHER },
+  { "Faster clock",     "_Z16FastWeatherCheatv",        NULL, 0, CHEAT_CAT_WEATHER },
   // TankCheat is not "spawn a tank". It walks a counter over the whole vehicle
   // model range (130..216) and hands whatever it lands on to VehicleCheat, so it
   // spawns a different vehicle every time -- which is exactly the random cars
@@ -213,8 +212,8 @@ static menu_cheat menu_cheats[] = {
   { "Random vehicle",   "_Z9TankCheatv",                NULL, 0, CHEAT_CAT_VEHICLE },
   { "Trashmaster",      "_Z16TrashmasterCheatv",        NULL, 0, CHEAT_CAT_VEHICLE },
   { "Chromed cars",     "_Z14GlassCarsCheatv",          NULL, 0, CHEAT_CAT_VEHICLE },
-  { "Black cars",       "_Z14BlackCarsCheatv",          NULL, 0, CHEAT_CAT_VEHICLE },
-  { "Pink cars",        "_Z13PinkCarsCheatv",           NULL, 0, CHEAT_CAT_VEHICLE },
+  { "Black traffic",    "_Z14BlackCarsCheatv",          NULL, 0, CHEAT_CAT_VEHICLE },
+  { "White traffic",    "_Z13PinkCarsCheatv",           NULL, 0, CHEAT_CAT_VEHICLE },
   { "Tiny bike wheels",      "_Z15BikeWheelsCheatv",         NULL, 0, CHEAT_CAT_VEHICLE },
   { "Big heads",        "_Z13BigHeadsCheatv",           NULL, 0, CHEAT_CAT_PEDS },
   { "Blow up cars",     "_Z15BlowUpCarsCheatv",         NULL, 0, CHEAT_CAT_VEHICLE },
@@ -223,18 +222,21 @@ static menu_cheat menu_cheats[] = {
   { "Peds attack you",  "_Z27EverybodyAttacksPlayerCheatv",  NULL, 0, CHEAT_CAT_PEDS },
   { "Women armed",      "_Z21DoChicksWithGunsCheatv",   NULL, 0, CHEAT_CAT_PEDS },
 
-  // Everything below is a cheat the game exports and the menu simply had not
-  // listed. The retail code list is the check: each of these is one of the
-  // button sequences, matched to the exported function that implements it.
+  // Everything below is a cheat the game exports that the menu had not listed.
+  // The retail button-code list is the check: each is one of those sequences,
+  // matched to the exported function that implements it, and the names now come
+  // from that list rather than from the symbol.
   //
-  // Two naming corrections came out of that comparison. "Peds have weapons" is
-  // WeaponsForAllCheat, not DoChicksWithGuns -- that one arms women only, and is
-  // now labelled as such. And SlowClockCheat is a separate cheat from
-  // SlowTimeCheat, which is why both are here.
+  // Not listed, and why -- all confirmed by entering the button code by hand:
+  //
+  //   ChangePlayerCheat ("play as pedestrian")  does nothing in this build
+  //   SlowClockCheat                            not a cheat in LCS at all
+  //   MultiplayerUnlockCheat1..4                nothing to unlock in the port
+  //
+  // "Peds have weapons" is WeaponsForAllCheat, not DoChicksWithGuns -- that one
+  // arms women only and is labelled as such above.
   { "Commit suicide",   "_Z12SuicideCheatv",            NULL, 0, CHEAT_CAT_PLAYER },
-  { "Play as pedestrian","_Z17ChangePlayerCheatv",      NULL, 0, CHEAT_CAT_PLAYER },
   { "Media attention",  "_Z20DoShowChaseStatCheatv",    NULL, 0, CHEAT_CAT_WANTED },
-  { "Slower clock",     "_Z14SlowClockCheatv",          NULL, 0, CHEAT_CAT_WEATHER },
   { "Perfect traction", "_Z15StrongGripCheatv",         NULL, 0, CHEAT_CAT_VEHICLE },
   { "Cars drive on water","_Z15FlyingFishCheatv",       NULL, 0, CHEAT_CAT_VEHICLE },
   { "All green lights", "_Z18TrafficLightsCheatv",      NULL, 0, CHEAT_CAT_VEHICLE },
@@ -242,10 +244,6 @@ static menu_cheat menu_cheats[] = {
   { "Peds have weapons","_Z18WeaponsForAllCheatv",      NULL, 0, CHEAT_CAT_PEDS },
   { "Peds follow you",  "_Z16FannyMagnetCheatv",        NULL, 0, CHEAT_CAT_PEDS },
   { "Peds enter your car","_Z17PickUpChicksCheatv",     NULL, 0, CHEAT_CAT_PEDS },
-  { "Unlock multiplayer 1","_Z23MultiplayerUnlockCheat1v", NULL, 0, CHEAT_CAT_MISC },
-  { "Unlock multiplayer 2","_Z23MultiplayerUnlockCheat2v", NULL, 0, CHEAT_CAT_MISC },
-  { "Unlock multiplayer 3","_Z23MultiplayerUnlockCheat3v", NULL, 0, CHEAT_CAT_MISC },
-  { "Unlock multiplayer 4","_Z23MultiplayerUnlockCheat4v", NULL, 0, CHEAT_CAT_MISC },
 };
 #define MENU_NUM_CHEATS ((int)(sizeof(menu_cheats) / sizeof(menu_cheats[0])))
 
@@ -293,8 +291,12 @@ static int cheats_ready = 0;
 #define MOVZ_W8_HI(imm16) (0x52a00000u | ((uint32_t)(imm16) << 5) | 8u)
 #define FLY_CAP_STOCK   MOVZ_W8_HI(0x42a0)   //   80.0
 #define FLY_FLOOR_STOCK MOVZ_W8_HI(0xc28c)   //  -70.0
-#define FLY_CAP_HIGH    MOVZ_W8_HI(0x4396)   //  300.0
-#define FLY_FLOOR_HIGH  MOVZ_W8_HI(0xc391)   // -290.0
+// MOVZ with a high-half shift can only encode floats whose low 16 bits are zero,
+// which is why these are powers of two rather than round decimals. 300 was
+// timid: this is the real ceiling, twenty-seven times higher, and the map is
+// only about 3000 units across.
+#define FLY_CAP_HIGH    MOVZ_W8_HI(0x4600)   //  8192.0
+#define FLY_FLOOR_HIGH  MOVZ_W8_HI(0xc600)   // -8192.0
 
 // Runs from menu_init, while the image is still only mapped at load_base.
 static void fly_raise_hard_cap(void) {
@@ -314,10 +316,12 @@ static void fly_raise_hard_cap(void) {
   }
   *cap = FLY_CAP_HIGH;
   *floor_ = FLY_FLOOR_HIGH;
-  debugPrintf("MENU: flying cap 80 -> 300 (only reached while Fly higher is on)\n");
+  debugPrintf("MENU: flying cap 80 -> 8192 (reached only with No height limit on)\n");
 }
 
-#define FLY_LIMIT_HIGH 8000.0f
+// Has to stay clear above the patched cap, or the branch it exists to push
+// out of the way comes back into play at altitude.
+#define FLY_LIMIT_HIGH 60000.0f
 
 static float *fly_height_limit = NULL;
 static float fly_height_stock = 0.0f;
@@ -1322,8 +1326,6 @@ static void menu_resolve_vehicles(void) {
     else
       cat = VEH_CAT_LAND;
 
-    debugPrintf("MENU: model %3d  %-10s  %-5s  %s\n",
-                id, veh_kind_name[kind], veh_cat_name[cat], label);
     veh_add(id, (veh_kind)kind, cat, label);
   }
 
@@ -1342,8 +1344,6 @@ static void menu_resolve_vehicles(void) {
   // Every unnamed entry, so the numbers can be matched up in game and turned
   // into real names in the table above.
   for (int i = named; i < vehicles_ready; i++)
-    debugPrintf("MENU: unnamed %s, model %d\n",
-                veh_kind_name[veh_list[i].kind], veh_list[i].id);
 
   // Vehicles said to exist in LCS but not normally reachable. The spawn list is
   // built by walking the model table and keeping whatever the Is*Model
@@ -1845,6 +1845,22 @@ static void menu_sub_enter(menu_sub kind) {
 }
 
 // ---- actions ----
+// The traffic colour cheats set gbBlackCars / gbPinkCars, and the only things
+// that read those are CVehicleModelInfo::ChooseVehicleColour and
+// AvoidSameVehicleColour -- both of which run when a vehicle is **created**. So
+// the cheat recolours traffic as it spawns and leaves what is already on the
+// street alone, which is why it reads as doing nothing: you have to drive around
+// until the old cars have been streamed out.
+//
+// The flag is the game's cheat and stays exactly as it is. This just walks the
+// pool afterwards so the change is visible now rather than eventually.
+static int veh_pool_recolour(uint8_t colour);   // with the pool code below
+
+static void menu_recolour_traffic(uint8_t colour) {
+  const int n = veh_pool_recolour(colour);
+  debugPrintf("MENU: recoloured %d vehicles to %u\n", n, colour);
+}
+
 static void menu_run_cheat(int idx) {
   if (idx < 0 || idx >= cheats_ready)
     return;
@@ -1856,6 +1872,13 @@ static void menu_run_cheat(int idx) {
   } else {
     menu_cheats[idx].fn();
   }
+
+  // Black is colour 0 and white is 1 in the game's palette, the same two the
+  // cheats hand to ChooseVehicleColour.
+  if (!strcmp(menu_cheats[idx].name, "Black traffic"))
+    menu_recolour_traffic(0);
+  else if (!strcmp(menu_cheats[idx].name, "White traffic"))
+    menu_recolour_traffic(1);
 
   snprintf(toast, sizeof(toast), "%s cheat activated", menu_cheats[idx].name);
   toast_pending = 1;
@@ -2000,66 +2023,14 @@ static get_vehicle_ref_fn pools_get_vehicle_ref = NULL;
 static get_vehicle_fn pools_get_vehicle = NULL;
 
 #define VEH_TRACK_MS 12000   // long enough to see a fall, short enough to read
-static int veh_track_ref = 0;
-static u64 veh_track_t0 = 0;
-static u64 veh_track_next_report = 0;
-static char veh_track_label[28];
+// The watchdog that used to live here is gone. It existed to answer *when* a
+// spawned vehicle vanished -- a fixed delay pointing at something periodic, an
+// instant one at the add itself -- and it answered it: they were falling through
+// the map because "fly higher" had been writing floats over VehicleNames, in the
+// middle of the vehicle handling data. Spawning has been correct since, and the
+// watchdog logged position, status and level twice a second for as long as a
+// vehicle lived. `git log` has it if a spawn ever starts disappearing again.
 
-static void veh_track_begin(void *veh, const char *label) {
-  if (!pools_get_vehicle_ref || !pools_get_vehicle)
-    return;
-  veh_track_ref = pools_get_vehicle_ref(veh);
-  veh_track_t0 = armTicksToNs(armGetSystemTick());
-  veh_track_next_report = 0;
-  snprintf(veh_track_label, sizeof(veh_track_label), "%s", label);
-  debugPrintf("MENU: watching %s, pool ref %d\n", veh_track_label, veh_track_ref);
-}
-
-static void veh_track_tick(void) {
-  if (!veh_track_ref || !pools_get_vehicle)
-    return;
-
-  const u64 ms = (armTicksToNs(armGetSystemTick()) - veh_track_t0) / 1000000ull;
-
-  void *veh = pools_get_vehicle(veh_track_ref);
-  if (!veh) {
-    debugPrintf("MENU: %s was removed from the pool after %llu ms\n",
-                veh_track_label, (unsigned long long)ms);
-    veh_track_ref = 0;
-    return;
-  }
-
-  // Where it is, twice a second, while it still exists.
-  //
-  // Every spawn so far has been removed after a remarkably consistent 3.4-3.7
-  // seconds. CCarCtrl::PossiblyRemoveVehicle only removes at a distance (its
-  // thresholds are 190 and 70 units, and these sit five away), but
-  // CWorld::RemoveFallenCars deletes anything below z = -100, and falling from
-  // ground level to -100 takes about that long. If these numbers march
-  // downwards, the vehicle is falling through the map and the fix belongs at
-  // the spawn, not in whatever deletes it afterwards.
-  // Twice a second, but not forever: this ran for a hundred seconds on a car
-  // that had been parked and working the whole time, and buried everything
-  // else in the log. The question it answers is whether a fresh spawn falls,
-  // and that is settled within a few seconds either way.
-  if (ms > VEH_TRACK_MS) {
-    debugPrintf("MENU: %s still alive at %llu ms, no longer watching\n",
-                veh_track_label, (unsigned long long)ms);
-    veh_track_ref = 0;
-    return;
-  }
-
-  if (ms >= veh_track_next_report) {
-    veh_track_next_report = ms + 500;
-    const float *p = (const float *)((uintptr_t)veh + VEH_POS);
-    const uint64_t flags = *(const uint64_t *)((uintptr_t)veh + VEH_FLAGS);
-    debugPrintf("MENU: %s at %llu ms: %.1f, %.1f, %.1f  status %u  level %u\n",
-                veh_track_label, (unsigned long long)ms,
-                p[0], p[1], p[2],
-                (unsigned)((flags & VEH_STATUS_MASK) >> 4),
-                *(const uint8_t *)((uintptr_t)veh + ENTITY_LEVEL));
-  }
-}
 
 // ---- finding what SpawnInModel just made ----
 //
@@ -2096,6 +2067,27 @@ static int veh_pool(uint8_t **entries, const int8_t **flags, int *size) {
   return 1;
 }
 
+// Every vehicle currently in the world, recoloured in place. Both colour bytes,
+// because a two-tone car with only its primary changed still is not black.
+static int veh_pool_recolour(uint8_t colour) {
+  uint8_t *entries;
+  const int8_t *flags;
+  int size;
+  if (!veh_pool(&entries, &flags, &size))
+    return 0;
+
+  int n = 0;
+  for (int i = 0; i < size; i++) {
+    if (flags[i] < 0)          // negative means the slot is free
+      continue;
+    uint8_t *veh = entries + (size_t)i * VEHPOOL_STRIDE;
+    veh[VEH_COLOUR1] = colour;
+    veh[VEH_COLOUR2] = colour;
+    n++;
+  }
+  return n;
+}
+
 static void veh_pool_snapshot(void) {
   uint8_t *entries;
   const int8_t *flags;
@@ -2119,87 +2111,8 @@ static void *veh_pool_find_new(void) {
   return NULL;
 }
 
-// Dumps the fields a vehicle is made of, so ours can be held next to one the
-// game made.
-//
-// Every theory so far has been wrong: it is not the status word, not the island
-// byte, not the construction path (SpawnInModel is the game's own and its
-// vehicles fall too), and not the matrix -- the rows logged as a clean rotation,
-// (0.67 0.74 0)(-0.74 0.67 0)(0 0 1). What is left is that ours does not collide
-// with the world while the traffic parked around it does, so the difference is
-// in a field, and the fastest way to find a difference is to print both.
-static void veh_dump(const char *what, const uint8_t *veh) {
-  if (!veh) {
-    debugPrintf("MENU: %-8s vehicle: none\n", what);
-    return;
-  }
-  const float *pos = (const float *)(veh + VEH_POS);
-  debugPrintf("MENU: %-8s model %d  flags88 %016llx  rwobj %p  col %p\n",
-              what, (int)*(const int16_t *)(veh + 124),
-              (unsigned long long)*(const uint64_t *)(veh + VEH_FLAGS),
-              *(void *const *)(veh + 112),
-              (void *)(model_info_for(*(const int16_t *)(veh + 124))
-                           ? *(void *const *)(model_info_for(
-                                                  *(const int16_t *)(veh + 124)) +
-                                              MODELINFO_COL_MODEL)
-                           : NULL));
-  debugPrintf("MENU: %-8s w717 %08x  lvl390 %u  lvl126 %u  status784 %d  "
-              "pos %.1f %.1f %.1f\n",
-              what, *(const uint32_t *)(veh + 717), veh[390], veh[126],
-              *(const int *)(veh + 784), pos[0], pos[1], pos[2]);
-}
 
-// Any vehicle that was already in the pool before we spawned ours -- i.e. one
-// the game itself put there.
-static const uint8_t *veh_pool_find_existing(const void *skip) {
-  uint8_t *entries;
-  const int8_t *flags;
-  int size;
-  if (!veh_pool(&entries, &flags, &size))
-    return NULL;
-  for (int i = 0; i < size; i++) {
-    uint8_t *e = entries + (size_t)i * VEHPOOL_STRIDE;
-    if (flags[i] < 0 || (const void *)e == skip)
-      continue;
-    // An in-use slot is not necessarily a vehicle: the first comparison came
-    // back model 0, no clump, position 0,0,0. Insist on something real.
-    if (*(const int16_t *)(e + 124) <= 0 || !*(void *const *)(e + 112))
-      continue;
-    return e;
-  }
-  return NULL;
-}
 
-// How much traffic exists at all.
-//
-// The interesting question is no longer "why does our vehicle fall" but "does
-// anything else in this world stay up". The video shows a street with
-// pedestrians on it and not one moving car, and the first attempt to compare
-// against a game-made vehicle found none to compare with. If the pool is empty
-// apart from ours, then vehicles falling through the map is the port's problem
-// and not the menu's, and no amount of changing how the menu spawns them will
-// help.
-static void veh_pool_census(void) {
-  uint8_t *entries;
-  const int8_t *flags;
-  int size;
-  if (!veh_pool(&entries, &flags, &size)) {
-    debugPrintf("MENU: vehicle pool unavailable\n");
-    return;
-  }
-
-  int used = 0, real = 0;
-  for (int i = 0; i < size; i++) {
-    if (flags[i] < 0)
-      continue;
-    used++;
-    const uint8_t *e = entries + (size_t)i * VEHPOOL_STRIDE;
-    if (*(const int16_t *)(e + 124) > 0 && *(void *const *)(e + 112))
-      real++;
-  }
-  debugPrintf("MENU: vehicle pool: %d slots, %d in use, %d with a model\n",
-              size, used, real);
-}
 
 static void menu_spawn_vehicle(int idx) {
   if (idx < 0 || idx >= vehicles_ready)
@@ -2281,21 +2194,11 @@ static void menu_spawn_vehicle(int idx) {
   }
 
   if (veh) {
-    // Nothing is written to it. The matrix theory is dead -- the rows logged
-    // last time were a clean rotation, (0.67 0.74 0)(-0.74 0.67 0)(0 0 1), and
-    // it still fell. VehicleCheat sets up its own vehicle correctly, so the one
-    // useful thing to do with it is look, not touch.
-    const float *m = (const float *)((uintptr_t)veh + VEH_MATRIX);
-    const float *p = (const float *)((uintptr_t)veh + VEH_POS);
-    debugPrintf("MENU: %s rows (%.2f %.2f %.2f)(%.2f %.2f %.2f)(%.2f %.2f %.2f) "
-                "pos %.1f %.1f %.1f\n",
-                v->label, m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10],
-                p[0], p[1], p[2]);
-    veh_pool_census();
-    veh_dump("ours", (const uint8_t *)veh);
-    veh_dump("game's", veh_pool_find_existing(veh));
-    veh_track_begin(veh, v->label);
-  }
+    // The pool census and the side-by-side dump against a vehicle the game
+    // spawned itself lived here. They settled the falling-vehicle bug -- ours
+    // and the game's were identical, which is what finally pointed away from the
+    // spawn code and at the VehicleNames corruption -- and are in `git log`.
+    }
 
   snprintf(toast, sizeof(toast), "%s spawned", v->label);
   toast_pending = 1;
@@ -2350,16 +2253,12 @@ static void menu_spawn_bodyguards(void) {
       continue;
     }
 
-    debugPrintf("MENU: ped %d: requesting model\n", model);
     if (request_model && load_all_models) {
       request_model(model, 1);
-      debugPrintf("MENU: ped %d: requested, loading\n", model);
       load_all_models(0);
-      debugPrintf("MENU: ped %d: loaded\n", model);
     }
 
     const uint8_t *pinfo = model_info_for(model);
-    debugPrintf("MENU: ped %d: model info %p\n", model, (const void *)pinfo);
     if (!pinfo) {
       debugPrintf("MENU: ped model %d has no model info, skipped\n", model);
       continue;
@@ -2369,18 +2268,14 @@ static void menu_spawn_bodyguards(void) {
                   model);
       continue;
     }
-    debugPrintf("MENU: ped %d: clump present\n", model);
 
     float pos[3];
     pos[0] = ppos[0] + dx[i];
     pos[1] = ppos[1] + dy[i];
     pos[2] = find_ground_z ? find_ground_z(pos[0], pos[1]) + 1.0f : ppos[2];
 
-    debugPrintf("MENU: ped %d: AddPed(type %d) at %.1f, %.1f, %.1f\n",
-                model, PEDTYPE_GANG1 + BODYGUARD_GANG, pos[0], pos[1], pos[2]);
     void *guard = population_add_ped(PEDTYPE_GANG1 + BODYGUARD_GANG,
                                      (unsigned)model, pos, 0, 0);
-    debugPrintf("MENU: ped %d: AddPed returned %p\n", model, guard);
     if (!guard) {
       debugPrintf("MENU: AddPed(model %d) returned NULL\n", model);
       continue;
@@ -2594,26 +2489,7 @@ static void fly_any_tick(void) {
   if (handling && (handling[HANDLING_FLAGS] & 2))
     return;
 
-  const int model = FLIGHT_MODEL_HELI;
-
-  flying_control(veh, model);
-
-  static u64 next = 0;
-  const u64 ms = armTicksToNs(armGetSystemTick()) / 1000000ull;
-  if (ms >= next) {
-    next = ms + 1000;
-    const float *p = (const float *)(veh + VEH_POS);
-    const float *v = (const float *)(veh + VEH_MOVESPEED);
-    const float *t = (const float *)(veh + VEH_TURN_SPEED);
-    debugPrintf("MENU: flying %d (%s) model %d z %.1f vel %.3f %.3f %.3f "
-                "turn %.3f %.3f %.3f mass %.0f/%.0f\n",
-                model, "Helicopter",
-                (int)*(const int16_t *)(veh + ENTITY_MODEL_ID),
-                (double)p[2], (double)v[0], (double)v[1], (double)v[2],
-                (double)t[0], (double)t[1], (double)t[2],
-                (double)*(const float *)(veh + VEH_MASS_FIELD),
-                (double)*(const float *)(veh + VEH_TURN_MASS));
-  }
+  flying_control(veh, FLIGHT_MODEL_HELI);
 }
 
 static void menu_vehicle_edit(int action) {
@@ -2818,7 +2694,6 @@ void menu_tick(int in_game) {
   }
 
   menu_apply_toggles();
-  veh_track_tick();
 
   const u64 down = g_menu_pad_down;
   const u64 pressed = down & ~menu_pad_prev;
