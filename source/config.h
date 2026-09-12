@@ -26,9 +26,15 @@
 // backing store for the engine's get/setAppLocalValue key/value pairs
 #define APPSTATE_NAME "appstate.txt"
 
-// Define to write debug.log and nxlink stdout. Off for release (debugPrintf
-// becomes a no-op).
-#define DEBUG_LOG 1
+// 1 writes debug.log and nxlink stdout; 0 compiles debugPrintf away to a no-op.
+// **Off for release.** Every line is fflush'd to the SD card and the game's own
+// printf comes through the same function, so it costs real boot time.
+//
+// The guards on this were `#ifdef`, which is true for `#define DEBUG_LOG 0` as
+// well -- setting it to zero looked like turning logging off and did nothing.
+// They are `#if defined(DEBUG_LOG) && DEBUG_LOG` now, so the value means what it
+// appears to mean.
+#define DEBUG_LOG 0
 
 // actual screen size
 extern int screen_width;

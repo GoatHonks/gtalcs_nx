@@ -43,10 +43,9 @@ include $(DEVKITPRO)/libnx/switch_rules
 # too, not just the filename.
 TARGET		:=	gtalcs_nx
 APP_TITLE	:=	GTA Liberty City Stories
-APP_AUTHOR	:=	naga
-# This tree is the CLEO build and is NOT what the fork releases, so it carries
-# its own revision to keep the two apart in hbmenu.
-APP_VERSION	:=	1.0.3+r3
+APP_AUTHOR	:=	naga, GoatHonks
+# 1.0.4 is the Liberty Menu release. 1.0.3+r2 is the same port without it.
+APP_VERSION	:=	1.0.4
 BUILD		:=	build
 SOURCES		:=	source source/hooks
 DATA		:=	data

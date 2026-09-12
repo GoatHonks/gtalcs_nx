@@ -575,7 +575,7 @@ static int is_fake_file(const void *f) {
 
 size_t fwrite_fake(const void *ptr, size_t size, size_t n, FILE *f) {
   if (is_fake_file(f)) {
-#ifdef DEBUG_LOG
+#if defined(DEBUG_LOG) && DEBUG_LOG
     static char buf[0x400];
     const size_t total = size * n < sizeof(buf) - 1 ? size * n : sizeof(buf) - 1;
     memcpy(buf, ptr, total);
@@ -636,7 +636,7 @@ int fprintf_fake(FILE *f, const char *fmt, ...) {
   va_start(va, fmt);
   int ret;
   if (is_fake_file(f)) {
-#ifdef DEBUG_LOG
+#if defined(DEBUG_LOG) && DEBUG_LOG
     static char buf[0x400];
     ret = vsnprintf(buf, sizeof(buf), fmt, va);
     debugPrintf("stdio: %s", buf);
@@ -652,7 +652,7 @@ int fprintf_fake(FILE *f, const char *fmt, ...) {
 
 int vfprintf_fake(FILE *f, const char *fmt, va_list va) {
   if (is_fake_file(f)) {
-#ifdef DEBUG_LOG
+#if defined(DEBUG_LOG) && DEBUG_LOG
     static char buf[0x400];
     int ret = vsnprintf(buf, sizeof(buf), fmt, va);
     debugPrintf("stdio: %s", buf);

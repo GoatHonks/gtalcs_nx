@@ -16,7 +16,7 @@
 #include "util.h"
 #include "config.h"
 
-#ifdef DEBUG_LOG
+#if defined(DEBUG_LOG) && DEBUG_LOG
 
 static int s_nxlinkSock = -1;
 
@@ -50,7 +50,7 @@ void userAppExit(void) {
 // and this is a no-op. Keeps the log file open for the run (reopening per line
 // on FAT makes boot take minutes); fflush each line to survive an abrupt exit.
 int debugPrintf(char *text, ...) {
-#ifdef DEBUG_LOG
+#if defined(DEBUG_LOG) && DEBUG_LOG
   va_list list;
   static FILE *f = NULL;
   if (!f)

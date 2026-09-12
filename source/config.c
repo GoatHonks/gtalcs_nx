@@ -136,7 +136,7 @@ static void config_set_defaults(Config *c) {
   c->key_lstick = GPAD_BUTTON_HORN;
   c->key_rstick = GPAD_ACTION_CAM_CENTER;
   c->key_plus = GPAD_BUTTON_START;
-  c->key_minus = GPAD_BUTTON_BACK; // preserves the old hardcoded behaviour
+  c->key_minus = GPAD_BUTTON_NONE; // Liberty Menu's button; see read_config
 }
 
 static void config_resolve_faces(Config *c) {
@@ -176,11 +176,12 @@ int read_config(const char *file) {
     fclose(f);
   }
 
-  // Minus opens Liberty Menu and nothing else. It is forced here rather than
-  // merely defaulted, because any other binding would fire the game action at
-  // the same time the menu opened -- and the port's default for it (BACK) is
-  // already a duplicate of Plus, so nothing is lost by reserving it.
-  config.key_minus = GPAD_BUTTON_NONE;
+  // Minus opens Liberty Menu. The default is NONE so that pressing it does not
+  // also fire a game action at the same moment the menu appears -- and the
+  // port's own default for it (BACK) is a duplicate of Plus anyway, so nothing
+  // is lost. It used to be *forced* to NONE here, overriding config.txt
+  // outright; that is now the user's call, which is what a setting they can see
+  // in the file ought to mean.
 
   // resolve any face button not set explicitly in config.txt, from psp_layout
   // ids 0/1/2/3 are the engine's Cross/Circle/Square/Triangle -- confirmed by the
@@ -259,8 +260,12 @@ int write_config(const char *file) {
   CONFIG_BUTTON_LINE(key_rstick);
   CONFIG_BUTTON_LINE(key_plus);
 
-  fprintf(f, "\n# Minus is reserved for Liberty Menu and cannot be remapped; it is\n"
-             "# listed here only so the file shows the full set.\n");
+  fprintf(f,
+          "\n# Minus opens Liberty Menu. You can bind a game action to it as\n"
+          "# well, but NONE is recommended and is the default: anything else\n"
+          "# fires that action at the same moment the menu opens. The port's\n"
+          "# own default here was BACK, which duplicates Plus, so leaving it\n"
+          "# at NONE costs nothing.\n");
   CONFIG_BUTTON_LINE(key_minus);
 
   #undef CONFIG_BUTTON_LINE

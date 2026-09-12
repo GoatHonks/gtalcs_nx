@@ -2,6 +2,39 @@
 
 Unofficial controls fix, on top of [NaGaa95/gtalcs_nx](https://github.com/NaGaa95/gtalcs_nx).
 
+## 1.0.4 — Liberty Menu
+
+An in-game mod menu on **Minus**. Native throughout: no CLEO, no scripts, nothing
+from anyone else's mod. Every entry calls a function the retail binary already
+exports, found by disassembling it.
+
+* **Cheats** — the game's own cheat functions, by category. The list is checked
+  against the retail button codes rather than against the symbol names, which
+  caught real mistakes: "peds have weapons" is `WeaponsForAllCheat`, not
+  `DoChicksWithGunsCheat`; "cars drive on water" is `BackToTheFuture`, which
+  toggles `CVehicle::bHoverCheat`. Cheats that no button code can reach — the only
+  reference to each being its own definition — are not listed.
+* **Teleport** — every named zone, from `gpTheZones` and named by the game's own
+  text, grouped by island; plus the marker you place on the map
+  (`GRadarMap+128`, gated on the is-set byte at `+120`).
+* **Spawn vehicle** — all 83 land, sea and air vehicles, enumerated by walking the
+  model table and named from each model's GXT key, so nothing is hardcoded.
+* **Player** — bodyguards, clear wanted level, invincible, unlimited ammo (which
+  restores your original ammo when switched off), never tired, never wanted.
+* **Vehicle** — colours, repair, flip upright, vehicle invincible, vehicles fly.
+* **Misc** — no height limit.
+
+Two things the game does not otherwise offer a way back from: **Normal traffic**,
+because the black and white traffic cheats set a flag nothing clears, and
+**unlimited ammo** putting the original counts back.
+
+`Minus` now defaults to `NONE` rather than being forced to it, so it can be
+rebound in `config.txt` if you want — the menu still opens either way. The
+recommendation to leave it at `NONE` is in the file itself.
+
+Everything is off until asked for, nothing is written to the save, and
+`debug.log` is off in release builds.
+
 All findings below came from disassembling the retail `libGame.so` (ARM64) and
 cross-referencing the engine's own functions. Nothing here is guesswork about what
 the buttons "should" do — each claim is traced to a specific function and field.
